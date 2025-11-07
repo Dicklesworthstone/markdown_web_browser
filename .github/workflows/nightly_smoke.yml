@@ -1,0 +1,74 @@
+name: Nightly Smoke
+
+on:
+  schedule:
+    - cron: '30 2 * * *'
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v2
+        with:
+          python-version: '3.13'
+
+      - name: Compute run date
+        id: dates
+        run: echo "today=$(date -u +%F)" >> "$GITHUB_OUTPUT"
+
+      - name: Write .env for automation
+        env:
+          API_BASE_URL: ${{ secrets.MDWB_API_BASE_URL }}
+          MDWB_API_KEY: ${{ secrets.MDWB_API_KEY }}
+          OLMOCR_SERVER: ${{ secrets.OLMOCR_SERVER }}
+          OLMOCR_API_KEY: ${{ secrets.OLMOCR_API_KEY }}
+        run: |
+          cat <<'EOF' > .env
+          API_BASE_URL=${API_BASE_URL:-https://mdwb.example.com}
+          MDWB_API_KEY=${MDWB_API_KEY}
+          OLMOCR_SERVER=${OLMOCR_SERVER:-https://ai2endpoints.cirrascale.ai/api}
+          OLMOCR_API_KEY=${OLMOCR_API_KEY}
+          OLMOCR_MODEL=olmOCR-2-7B-1025-FP8
+          OCR_USE_FP8=true
+          TILE_LONG_SIDE_PX=1288
+          TILE_OVERLAP_PX=120
+          VIEWPORT_OVERLAP_PX=120
+          CAPTURE_VIEWPORT_WIDTH=1280
+          CAPTURE_VIEWPORT_HEIGHT=2000
+          CAPTURE_DEVICE_SCALE_FACTOR=2
+          CAPTURE_COLOR_SCHEME=light
+          CFT_VERSION=chrome-130.0.6723.69
+          CFT_LABEL=Stable-1
+          PLAYWRIGHT_CHANNEL=cft
+          PLAYWRIGHT_TRANSPORT=cdp
+          OCR_MIN_CONCURRENCY=2
+          OCR_MAX_CONCURRENCY=8
+          CACHE_ROOT=.cache
+          RUNS_DB_PATH=runs.db
+          PROMETHEUS_PORT=9000
+          HTMX_SSE_HEARTBEAT_MS=4000
+          EOF
+
+      - name: Install Playwright browsers
+        run: uv run playwright install --with-deps chromium
+
+      - name: Run nightly smoke
+        env:
+          RUN_DATE: ${{ steps.dates.outputs.today }}
+        run: |
+          uv run python scripts/run_smoke.py --date "$RUN_DATE"
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-smoke-${{ steps.dates.outputs.today }}
+          path: benchmarks/production/${{ steps.dates.outputs.today }}

@@ -1,3 +1,91 @@
 {
-  "description": "Placeholder Grafana dashboard definitions will land here."
+  "description": "Grafana dashboard definitions for Markdown Web Browser ops",
+  "dashboards": [
+    {
+      "title": "Capture & OCR Latency",
+      "panels": [
+        {
+          "id": "capture-latency-p95",
+          "type": "timeseries",
+          "metrics": [
+            {
+              "query": "histogram_quantile(0.95, sum(rate(capture_duration_seconds_bucket{job=\"mdwb\"}[5m])) by (le))",
+              "label": "capture p95"
+            },
+            {
+              "query": "histogram_quantile(0.95, sum(rate(ocr_duration_seconds_bucket{job=\"mdwb\"}[5m])) by (le))",
+              "label": "ocr p95"
+            }
+          ],
+          "thresholds": [
+            {"value_ms": 25000, "label": "docs/articles budget"},
+            {"value_ms": 45000, "label": "dashboards/apps budget"}
+          ]
+        },
+        {
+          "id": "tiling-runtime",
+          "type": "stat",
+          "metrics": [
+            {
+              "query": "sum(rate(tiles_processed_total{job=\"mdwb\"}[5m]))",
+              "label": "tiles/sec"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "title": "Smoke Run Health",
+      "panels": [
+        {
+          "id": "smoke-success",
+          "type": "table",
+          "metrics": [
+            {
+              "query": "sum(increase(smoke_jobs_total{status=\"success\"}[1d])) by (category)",
+              "label": "success"
+            },
+            {
+              "query": "sum(increase(smoke_jobs_total{status=\"failed\"}[1d])) by (category)",
+              "label": "failed"
+            }
+          ],
+          "notes": "Smoke job counters exported via scripts/run_smoke.py uploader once API endpoints land."
+        },
+        {
+          "id": "weekly-summary-json",
+          "type": "text",
+          "content": "Link to latest benchmarks/production/weekly_summary.json artifact for manual review."
+        }
+      ]
+    },
+    {
+      "title": "SSE & Frontend",
+      "panels": [
+        {
+          "id": "sse-heartbeat",
+          "type": "timeseries",
+          "metrics": [
+            {
+              "query": "rate(htmx_sse_heartbeat_gap_seconds_sum[5m]) / rate(htmx_sse_heartbeat_gap_seconds_count[5m])",
+              "label": "avg gap"
+            }
+          ],
+          "thresholds": [
+            {"value_ms": 12000, "label": "max gap"}
+          ]
+        },
+        {
+          "id": "blocklist-hits",
+          "type": "bar-gauge",
+          "metrics": [
+            {
+              "query": "sum(increase(blocklist_injections_total[1h])) by (domain)",
+              "label": "injections/hr"
+            }
+          ]
+        }
+      ]
+    }
+  ]
 }

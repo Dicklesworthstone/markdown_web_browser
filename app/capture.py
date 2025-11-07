@@ -16,7 +16,7 @@ from app.blocklist import (
     cached_blocklist,
     detect_overlay_warnings,
 )
-from app.settings import get_settings
+from app.settings import WarningSettings, get_settings
 from app.tiler import TileSlice, slice_into_tiles
 
 LOGGER = logging.getLogger(__name__)
@@ -70,6 +70,7 @@ class CaptureManifest:
     viewport_width: int
     viewport_height: int
     device_scale_factor: int
+    long_side_px: int
     capture_ms: int
     tiles_total: int
     scroll_policy: ScrollPolicy
@@ -96,6 +97,7 @@ async def capture_tiles(config: CaptureConfig) -> CaptureResult:
     start = time.perf_counter()
 
     blocklist_cfg = cached_blocklist(str(settings.browser.blocklist_path))
+    warning_cfg = settings.warnings
 
     async with async_playwright() as playwright:
         browser = await _launch_browser(playwright, settings.browser.playwright_channel)
@@ -112,6 +114,7 @@ async def capture_tiles(config: CaptureConfig) -> CaptureResult:
                 mask_selectors=settings.browser.screenshot_mask_selectors,
                 shrink_retry_limit=settings.browser.shrink_retry_limit,
                 blocklist_config=blocklist_cfg,
+                warning_settings=warning_cfg,
             )
         finally:
             await context.close()
@@ -130,6 +133,7 @@ async def capture_tiles(config: CaptureConfig) -> CaptureResult:
         viewport_width=config.viewport_width,
         viewport_height=config.viewport_height,
         device_scale_factor=config.device_scale_factor,
+        long_side_px=settings.browser.long_side_px,
         capture_ms=capture_ms,
         tiles_total=len(tiles),
         scroll_policy=ScrollPolicy(
@@ -161,6 +165,7 @@ async def _perform_viewport_sweeps(
     mask_selectors: Sequence[str],
     shrink_retry_limit: int,
     blocklist_config: BlocklistConfig,
+    warning_settings: WarningSettings,
 ) -> tuple[List[TileSlice], SweepStats, str, dict[str, int], list[str]]:
     page = await context.new_page()
     await _mask_automation(page)
@@ -168,7 +173,11 @@ async def _perform_viewport_sweeps(
 
     await page.goto(config.url, wait_until="networkidle")
     blocklist_hits = await apply_blocklist(page, url=config.url, config=blocklist_config)
-    overlay_warnings = await detect_overlay_warnings(page)
+    overlay_warnings = await detect_overlay_warnings(
+        page,
+        canvas_threshold=warning_settings.canvas_warning_threshold,
+        video_threshold=warning_settings.video_warning_threshold,
+    )
     await page.evaluate("window.scrollTo(0, 0)")
     await page.wait_for_timeout(settle_ms)
     sweep_count = 0

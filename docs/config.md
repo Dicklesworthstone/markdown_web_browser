@@ -36,6 +36,8 @@ print(settings.ocr.server_url)
 | `CAPTURE_VIEWPORT_HEIGHT` | `2000` | Pixel height for captures + manifest `viewport.height`. |
 | `CAPTURE_DEVICE_SCALE_FACTOR` | `2` | DSF used for capture; feeds screenshot style hash + manifest viewport block. |
 | `CAPTURE_COLOR_SCHEME` | `light` | Color scheme forced during capture (manifest `viewport.color_scheme`). |
+| `CANVAS_WARNING_THRESHOLD` | `3` | Canvas element count that emits a `canvas-heavy` capture warning. |
+| `VIDEO_WARNING_THRESHOLD` | `2` | Video element count that emits a `video-heavy` capture warning. |
 | `BLOCKLIST_PATH` | `config/blocklist.json` | JSON selectors injected during capture; recorded via `manifest.blocklist_version`. |
 | `VIEWPORT_OVERLAP_PX` | `120` | Pixels of overlap between viewport sweeps (Plan §19.2). |
 | `TILE_LONG_SIDE_PX` | `1288` | Tile longest side enforced by pyvips tiler + CLI defaults. |
@@ -47,6 +49,8 @@ print(settings.ocr.server_url)
 | `SCREENSHOT_STYLE_HASH` | auto-derived if blank | Hash of viewport/mask settings included in manifests & bug reports. |
 | `PROMETHEUS_PORT` | `9000` | Port for the Prometheus metrics endpoint. |
 | `HTMX_SSE_HEARTBEAT_MS` | `4000` | Interval (ms) for SSE heartbeat events streamed to the UI. |
+| `CANVAS_WARNING_THRESHOLD` | `3` | Number of `<canvas>` nodes before we emit a `canvas_heavy` warning. |
+| `VIDEO_WARNING_THRESHOLD` | `2` | Number of `<video>` nodes before we emit a `video_overlay` warning. |
 
 Add any new variables to `.env.example`, document them here, and update the
 manifest schema if they need to be echoed downstream.
@@ -62,6 +66,7 @@ in `app/schemas.py` (see `ManifestEnvironment`, `ManifestTimings`, and
 * Browser transport (CDP vs BiDi)
 * Viewport + overlap metadata (width/height/DSF, long-side policy, settle timers, mask selectors)
 * Screenshot style hash for the masked/blocked CSS bundle
+* Warning entries (canvas/video-heavy) with counts + thresholds so Ops can escalate overlays
 * OCR model + FP8 status + concurrency window
 * Timing metrics (`capture_ms`, `ocr_ms`, `stitch_ms`, `total_ms`) once stages
   execute

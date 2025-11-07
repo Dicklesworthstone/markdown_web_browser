@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Sequence
+from typing import List
 
 from playwright.async_api import Page
 
@@ -16,6 +16,8 @@ class WarningStats:
 
     canvas_count: int
     video_count: int
+    sticky_count: int
+    dialog_count: int
 
 
 @dataclass(slots=True)
@@ -32,44 +34,66 @@ async def collect_warning_stats(page: Page) -> WarningStats:
     """Inspect the DOM and return counts that drive warning decisions."""
 
     result = await page.evaluate(
-        """() => ({
-            canvasCount: document.querySelectorAll('canvas').length,
-            videoCount: document.querySelectorAll('video').length
-        })"""
+        """
+        () => {
+            const stickySelectors =
+                "[style*='position:fixed'],[style*='position: sticky'],header[style*='position']";
+            const sticky = document.querySelectorAll(stickySelectors).length;
+            const canvas = document.querySelectorAll('canvas').length;
+            const video = document.querySelectorAll('video').length;
+            const dialog = document.querySelectorAll('[role=\"dialog\"], [aria-modal=\"true\"]').length;
+            return { sticky, canvas, video, dialog };
+        }
+        """
     )
     return WarningStats(
-        canvas_count=int(result.get("canvasCount", 0)),
-        video_count=int(result.get("videoCount", 0)),
+        canvas_count=int(result.get("canvas", 0)),
+        video_count=int(result.get("video", 0)),
+        sticky_count=int(result.get("sticky", 0)),
+        dialog_count=int(result.get("dialog", 0)),
     )
 
 
 def build_warnings(
     stats: WarningStats,
     *,
-    canvas_threshold: int,
-    video_threshold: int,
+    settings: WarningSettings,
+    sticky_threshold: int = 3,
+    dialog_threshold: int = 1,
 ) -> List[CaptureWarningEntry]:
     """Convert DOM stats into structured warnings."""
 
     warnings: List[CaptureWarningEntry] = []
 
-    if canvas_threshold > 0 and stats.canvas_count >= canvas_threshold:
+    if settings.canvas_warning_threshold > 0 and stats.canvas_count >= settings.canvas_warning_threshold:
         warnings.append(
             CaptureWarningEntry(
                 code="canvas-heavy",
-                message="High canvas count may hide chart labels or overlays.",
+                message="High canvas count may hide chart labels or overlay content.",
                 count=stats.canvas_count,
-                threshold=canvas_threshold,
+                threshold=settings.canvas_warning_threshold,
             )
         )
 
-    if video_threshold > 0 and stats.video_count >= video_threshold:
+    if settings.video_warning_threshold > 0 and stats.video_count >= settings.video_warning_threshold:
         warnings.append(
             CaptureWarningEntry(
                 code="video-heavy",
-                message="Multiple video elements detected; screenshots may blur frames.",
+                message="Multiple video elements detected; screenshots may capture transient frames.",
                 count=stats.video_count,
-                threshold=video_threshold,
+                threshold=settings.video_warning_threshold,
+            )
+        )
+
+    sticky_condition = stats.sticky_count >= sticky_threshold
+    dialog_condition = stats.dialog_count >= dialog_threshold
+    if sticky_condition or dialog_condition:
+        warnings.append(
+            CaptureWarningEntry(
+                code="sticky-chrome",
+                message="Detected fixed or modal overlays that can occlude content.",
+                count=stats.sticky_count + stats.dialog_count,
+                threshold=sticky_threshold,
             )
         )
 
@@ -80,8 +104,4 @@ async def collect_capture_warnings(page: Page, settings: WarningSettings) -> Lis
     """Gather DOM stats and produce warning entries using configured thresholds."""
 
     stats = await collect_warning_stats(page)
-    return build_warnings(
-        stats,
-        canvas_threshold=settings.canvas_warning_threshold,
-        video_threshold=settings.video_warning_threshold,
-    )
+    return build_warnings(stats, settings=settings)

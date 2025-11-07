@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+from app.embeddings import EMBEDDING_DIM
 
 
 class JobCreateRequest(BaseModel):
@@ -60,6 +62,15 @@ class ManifestEnvironment(BaseModel):
     ocr_concurrency: ConcurrencyWindow = Field(description="Concurrency envelope for OCR requests")
 
 
+class ManifestWarning(BaseModel):
+    """Structured warning emitted during capture."""
+
+    code: str = Field(description="Stable identifier (e.g., canvas-heavy)")
+    message: str = Field(description="Human-friendly details")
+    count: int = Field(ge=0, description="Observed count triggering the warning")
+    threshold: int = Field(ge=0, description="Configured threshold for the warning")
+
+
 class ManifestTimings(BaseModel):
     """Timing metrics captured for each job."""
 
@@ -74,3 +85,36 @@ class ManifestMetadata(BaseModel):
 
     environment: ManifestEnvironment
     timings: ManifestTimings = Field(default_factory=ManifestTimings)
+
+
+class EmbeddingSearchRequest(BaseModel):
+    """Payload for querying sqlite-vec section embeddings."""
+
+    vector: list[float] = Field(description="Normalized embedding vector", min_length=EMBEDDING_DIM, max_length=EMBEDDING_DIM)
+    top_k: int = Field(default=5, ge=1, le=50)
+
+    @field_validator("vector")
+    @classmethod
+    def _validate_vector(cls, value: list[float]) -> list[float]:
+        if len(value) != EMBEDDING_DIM:
+            msg = f"Expected embedding length {EMBEDDING_DIM}, received {len(value)}"
+            raise ValueError(msg)
+        return value
+
+
+class SectionEmbeddingMatch(BaseModel):
+    """Single section similarity result."""
+
+    section_id: str
+    tile_start: int | None = None
+    tile_end: int | None = None
+    similarity: float
+    distance: float
+
+
+class EmbeddingSearchResponse(BaseModel):
+    """Response envelope for embeddings jump-to-section queries."""
+
+    total_sections: int
+    matches: list[SectionEmbeddingMatch]
+    warnings: list[ManifestWarning] = Field(default_factory=list)

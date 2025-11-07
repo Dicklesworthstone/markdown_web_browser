@@ -7,21 +7,52 @@ import json
 from pathlib import Path
 from typing import AsyncGenerator
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from app.dom_links import (
-    blend_dom_with_ocr,
-    demo_dom_links,
-    demo_ocr_links,
-    serialize_links,
+from app.dom_links import blend_dom_with_ocr, demo_dom_links, demo_ocr_links, serialize_links
+from app.schemas import (
+    EmbeddingSearchRequest,
+    EmbeddingSearchResponse,
+    SectionEmbeddingMatch,
 )
+from app.store import build_store
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 WEB_ROOT = BASE_DIR / "web"
 
 app = FastAPI(title="Markdown Web Browser")
 app.mount("/static", StaticFiles(directory=WEB_ROOT), name="static")
+store = build_store()
+
+
+def _demo_manifest_payload() -> dict:
+    return {
+        "job_id": "demo",
+        "cft_version": "chrome-130.0.6723.69",
+        "cft_label": "Stable-1",
+        "playwright_version": "1.55.0",
+        "device_scale_factor": 2,
+        "long_side_px": 1288,
+        "tiles_total": 12,
+        "capture_ms": 11234,
+        "ocr_ms": 20987,
+        "stitch_ms": 1289,
+    }
+
+
+def _demo_snapshot() -> dict:
+    snapshot = {
+        "id": "demo",
+        "url": "https://example.com/article",
+        "state": "CAPTURING",
+        "progress": {"done": 4, "total": 12},
+        "manifest": _demo_manifest_payload(),
+    }
+    snapshot["links"] = serialize_links(
+        blend_dom_with_ocr(dom_links=demo_dom_links(), ocr_links=demo_ocr_links())
+    )
+    return snapshot
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -38,11 +69,19 @@ async def healthcheck() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/jobs/demo")
+async def demo_job_snapshot() -> dict:
+    """Return a deterministic demo job snapshot."""
+
+    return _demo_snapshot()
+
+
 @app.get("/jobs/demo/stream")
 async def demo_job_stream(request: Request) -> StreamingResponse:
     """Emit a deterministic SSE stream so the frontend can exercise UI wiring."""
 
     async def event_generator() -> AsyncGenerator[str, None]:
+        manifest_payload = _demo_manifest_payload()
         updates = [
             ("state", "<span class=\"badge badge--info\">CAPTURING</span>"),
             ("progress", "4 / 12 tiles"),
@@ -57,19 +96,7 @@ async def demo_job_stream(request: Request) -> StreamingResponse:
             ),
             (
                 "manifest",
-                json.dumps(
-                    {
-                        "job_id": "demo",
-                        "cft_version": "Stable-1 (130.0.6723.69)",
-                        "playwright_version": "1.55.0",
-                        "device_scale_factor": 2,
-                        "long_side_px": 1288,
-                        "tiles_total": 12,
-                        "capture_ms": 11234,
-                        "ocr_ms": 20987,
-                        "stitch_ms": 1289,
-                    }
-                ),
+                json.dumps(manifest_payload),
             ),
             (
                 "links",

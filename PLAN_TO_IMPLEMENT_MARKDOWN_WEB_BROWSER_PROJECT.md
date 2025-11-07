@@ -235,6 +235,8 @@ mdwb fetch https://example.com \
   --ocr.server $OLMOCR_URL --ocr.key $OLMOCR_KEY --ocr.model olmOCR-2-7B-1025-FP8
 ```
 
+_2025-11-08 — PurpleDog (bd-dwf) added the initial Typer/Rich CLI scaffold (`scripts/mdwb_cli.py`) with demo `snapshot/links/stream` commands powered by the `/jobs/demo/*` endpoints; fetch/watch/replay commands will replace the stubs once `/jobs` lands._
+
 ### 9.2 Agent JSON Contract
 ```
 POST /jobs { url, options }
@@ -499,6 +501,7 @@ Below is a focused, pragmatic list of near-term upgrades. They map to the sectio
 ### 19.6 Caching, Indexing, Retrieval Quality
 
 > **Progress — 2025-11-08 (BlackPond):** Implementation for bead `markdown_web_browser-9s3` is underway. `app/store.py`, `app/embeddings.py`, `docs/config.md`, and `docs/architecture.md` now track the content-addressed cache layout, sqlite/sqlite-vec schema, manifest contract, and tar bundle export helpers described in this section.
+> _Status 2025-11-08 — FuchsiaPond (bd: markdown_web_browser-t82) integrated the capture pipeline with `Store`, so manifests + tiles are written to cache directories and RunRecord metadata updates automatically once captures finish._
 - Add sqlite-vec section embeddings keyed by `(run_id, section_id, tile_range)` for instant "jump to section" queries.
 - Content-address caches by `(normalized_url, cft_version, viewport, deviceScaleFactor, model_name, model_rev)`.
 - Offer tar.zst bundle downloads of `artifact/`, `out.md`, `links.json`, `manifest.json` using Zstandard.
@@ -675,7 +678,7 @@ Use these snippets as scaffolding for docs, onboarding, and regression verificat
 ## 22. Production Smoke Set & Latency Tracking
 
 _2025-11-08 — PinkCreek (bd-ug0) spinning up nightly smoke + weekly latency automation and wiring manifests/log storage per this section._
-- `scripts/run_smoke.py` orchestrates nightly captures per `benchmarks/production_set.json` (writing `manifest_index.json` under `benchmarks/production/<date>/` and refreshing `weekly_summary.json`).
+- `scripts/run_smoke.py` orchestrates nightly captures per `benchmarks/production_set.json` (writing `manifest_index.json` under `benchmarks/production/<date>/` and refreshing `weekly_summary.json`). See `docs/ops.md` for the runbook + verification checklist.
 
 Focus on a curated set of real customer-style URLs instead of synthetic benchmarks. Maintain `benchmarks/production_set.json` listing each URL, category, and target latency.
 

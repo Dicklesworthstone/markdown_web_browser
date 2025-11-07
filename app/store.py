@@ -9,7 +9,7 @@ import hashlib
 import json
 import re
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Mapping
+from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 import tarfile
 
@@ -18,7 +18,9 @@ import zstandard as zstd
 from sqlalchemy import event, text
 from sqlmodel import Field, Session, SQLModel, create_engine
 
-from .embeddings import EMBEDDING_DIM
+from app.tiler import TileSlice
+
+from .embeddings import EMBEDDING_DIM, EmbeddingMatch, search_embeddings
 from .jobs import JobState
 from .settings import load_config
 
@@ -202,6 +204,36 @@ class Store:
             session.commit()
             return manifest_path
 
+    def write_tiles(self, *, job_id: str, tiles: Sequence[TileSlice]) -> list[dict[str, Any]]:
+        if not tiles:
+            return []
+        record = self.fetch_run(job_id)
+        if not record:
+            raise KeyError(f"Run {job_id} not found")
+        paths = RunPaths.from_record(record)
+        paths.ensure_directories()
+        artifacts: list[dict[str, Any]] = []
+        for tile in tiles:
+            tile_path = paths.tiles_dir / f"tile_{tile.index:04d}.png"
+            tile_path.write_bytes(tile.png_bytes)
+            artifacts.append(
+                {
+                    "index": tile.index,
+                    "path": str(tile_path.relative_to(paths.root)),
+                    "sha256": tile.sha256,
+                    "width": tile.width,
+                    "height": tile.height,
+                    "scale": tile.scale,
+                    "source_y_offset": tile.source_y_offset,
+                    "viewport_y_offset": tile.viewport_y_offset,
+                    "overlap_px": tile.overlap_px,
+                    "top_overlap_sha256": tile.top_overlap_sha256,
+                    "bottom_overlap_sha256": tile.bottom_overlap_sha256,
+                }
+            )
+
+        return artifacts
+
     def insert_links(self, *, job_id: str, links: Iterable[Mapping[str, str]]) -> None:
         records = [
             LinkRecord(
@@ -253,6 +285,16 @@ class Store:
                 with tarfile.open(mode="w|", fileobj=zstd_stream) as tar:
                     tar.add(paths.root, arcname=arcname, filter=_filter)
         return bundle_path
+
+    def search_section_embeddings(
+        self,
+        *,
+        job_id: str,
+        vector: Sequence[float],
+        top_k: int,
+    ) -> tuple[int, list[EmbeddingMatch]]:
+        with self.session() as session:
+            return search_embeddings(session=session, run_id=job_id, query_vector=vector, top_k=top_k)
 
 
 def build_store(config: StorageConfig | None = None) -> Store:

@@ -95,7 +95,12 @@ def _host_matches_pattern(host: str, pattern: str) -> bool:
     return host == pattern
 
 
-async def detect_overlay_warnings(page: Page) -> list[str]:
+async def detect_overlay_warnings(
+    page: Page,
+    *,
+    canvas_threshold: int = 3,
+    video_threshold: int = 2,
+) -> list[str]:
     """Return coarse warnings about canvas/video/sticky overlays."""
 
     stats = await page.evaluate(
@@ -111,9 +116,9 @@ async def detect_overlay_warnings(page: Page) -> list[str]:
         """,
     )
     warnings: list[str] = []
-    if stats["canvas"] >= 3:
+    if stats["canvas"] >= canvas_threshold:
         warnings.append("canvas_heavy")
-    if stats["video"] >= 2:
+    if stats["video"] >= video_threshold:
         warnings.append("video_overlay")
     if stats["sticky"] >= 3 or stats["dialog"] >= 1:
         warnings.append("sticky_chrome")
