@@ -67,37 +67,92 @@ def fetch(url: str = typer.Argument(..., help="URL to capture")) -> None:
 
 
 @demo_cli.command("snapshot")
-def demo_snapshot(api_base: str = typer.Option("http://localhost:8000", help="API base URL")) -> None:
+def demo_snapshot(
+    api_base: str = typer.Option("http://localhost:8000", help="API base URL"),
+    json_output: bool = typer.Option(False, "--json", help="Print raw JSON instead of tables."),
+) -> None:
     """Fetch the demo job snapshot from /jobs/demo."""
 
     client = _client(api_base)
     response = client.get("/jobs/demo")
     response.raise_for_status()
     data = response.json()
-    _print_job(data)
-    if links := data.get("links"):
-        _print_links(links)
+    if json_output:
+        console.print_json(data=data)
+    else:
+        _print_job(data)
+        if links := data.get("links"):
+            _print_links(links)
 
 
 @demo_cli.command("links")
-def demo_links(api_base: str = typer.Option("http://localhost:8000", help="API base URL")) -> None:
+def demo_links(
+    api_base: str = typer.Option("http://localhost:8000", help="API base URL"),
+    json_output: bool = typer.Option(False, "--json", help="Print raw JSON."),
+) -> None:
     """Fetch the demo links JSON."""
 
     client = _client(api_base)
     response = client.get("/jobs/demo/links.json")
     response.raise_for_status()
-    _print_links(response.json())
+    data = response.json()
+    if json_output:
+        console.print_json(data=data)
+    else:
+        _print_links(data)
+
+
+def _log_event(event: str, payload: str) -> None:
+    if event == "state":
+        console.print(f"[cyan]{payload}[/]")
+    elif event == "progress":
+        console.print(f"[magenta]{payload}[/]")
+    else:
+        console.print(f"[bold]{event}[/]: {payload}")
 
 
 @demo_cli.command("stream")
-def demo_stream(api_base: str = typer.Option("http://localhost:8000", help="API base URL")) -> None:
+def demo_stream(
+    api_base: str = typer.Option("http://localhost:8000", help="API base URL"),
+    raw: bool = typer.Option(False, "--raw", help="Print raw event payloads instead of colored labels."),
+) -> None:
     """Tail the demo SSE stream."""
 
     with httpx.Client(base_url=api_base, timeout=None) as client:
         with client.stream("GET", "/jobs/demo/stream") as response:
             response.raise_for_status()
             for event, payload in _iter_sse(response):
-                console.print(f"[bold]{event}[/]: {payload}")
+                if raw:
+                    console.print(f"{event}\t{payload}")
+                else:
+                    _log_event(event, payload)
+
+
+@demo_cli.command("watch")
+def demo_watch(api_base: str = typer.Option("http://localhost:8000", help="API base URL")) -> None:
+    """Convenience alias for `demo stream`."""
+
+    demo_stream(api_base=api_base)
+
+
+@demo_cli.command("events")
+def demo_events(
+    api_base: str = typer.Option("http://localhost:8000", help="API base URL"),
+    output: typer.FileTextWrite = typer.Option(
+        "-", "--output", "-o", help="File to append JSON events to (default stdout)."
+    ),
+) -> None:
+    """Emit demo SSE events as JSON lines (automation-friendly)."""
+
+    import json as jsonlib
+
+    with httpx.Client(base_url=api_base, timeout=None) as client:
+        with client.stream("GET", "/jobs/demo/stream") as response:
+            response.raise_for_status()
+            for event, payload in _iter_sse(response):
+                jsonlib.dump({"event": event, "data": payload}, output)
+                output.write("\n")
+                output.flush()
 
 
 def main() -> None:

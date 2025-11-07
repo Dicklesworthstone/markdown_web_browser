@@ -20,7 +20,8 @@ uv run python scripts/run_smoke.py \
 - Stores outputs under `benchmarks/production/<DATE>/<category>/<timestamp_slug>/`.
   Each directory contains `manifest.json`, `out.md`, `links.json`, and the tile
   PNGs under `artifact/`.
-- Writes a daily `manifest_index.json` aggregating the job IDs, budgets, and timing data.
+- Writes a daily `manifest_index.json` aggregating the job IDs, budgets, and timing data,
+  plus `summary.md` (Markdown table with per-category budgets vs. observed p95 capture/total).
 
 ### Prerequisites
 - `/jobs` API available on `API_BASE_URL` with credentials in `.env`.

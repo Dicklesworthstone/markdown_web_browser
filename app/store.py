@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import re
+from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 
@@ -21,8 +22,9 @@ from sqlmodel import Field, Session, SQLModel, create_engine
 from app.tiler import TileSlice
 
 from .embeddings import EMBEDDING_DIM, EmbeddingMatch, search_embeddings
-from .jobs import JobState
 from .settings import load_config
+
+DEFAULT_JOB_STATE = "BROWSER_STARTING"
 
 _TIMESTAMP_FORMAT = "%Y-%m-%d_%H%M%S"
 _SLUG_PATTERN = re.compile(r"[^a-z0-9]+")
@@ -37,7 +39,7 @@ class RunRecord(SQLModel, table=True):
     url: str
     started_at: datetime
     finished_at: datetime | None = None
-    status: str = Field(default=JobState.BROWSER_STARTING.value)
+    status: str = Field(default=DEFAULT_JOB_STATE)
     cache_path: str
     manifest_path: str
     ocr_provider: str | None = None
@@ -178,14 +180,14 @@ class Store:
         self,
         *,
         job_id: str,
-        status: JobState,
+        status: str | Enum,
         finished_at: datetime | None = None,
     ) -> None:
         with self.session() as session:
             record = session.get(RunRecord, job_id)
             if not record:
                 raise KeyError(f"Run {job_id} not found")
-            record.status = status.value
+            record.status = _coerce_state(status)
             if finished_at:
                 record.finished_at = finished_at
             session.add(record)
@@ -398,6 +400,12 @@ def _coerce_int(value: Any) -> int | None:
         return int(str(value))
     except (TypeError, ValueError):
         return None
+
+
+def _coerce_state(value: str | Enum) -> str:
+    if isinstance(value, Enum):
+        return value.value
+    return str(value)
 
 
 __all__ = [

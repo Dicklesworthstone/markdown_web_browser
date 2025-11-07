@@ -30,7 +30,7 @@ Structure:
 2. `app.capture` calls `apply_blocklist(page, url=..., config=...)` after navigation, which:
    - Injects CSS via `page.add_style_tag` to hide selectors.
    - Returns per-selector hit counts by running `document.querySelectorAll()`.
-3. Capture manifests record `blocklist_hits` + warnings when selectors matched (surfaced in UI/ops dashboards).
+3. Capture manifests record `blocklist_hits` plus structured warnings (`canvas-heavy`, `video-heavy`, `sticky-chrome`) emitted by `app.capture_warnings`.
 4. Blocklist hits also emit SSE warnings (`event:warning`) so the UI can highlight when overlays were removed.
 
 ## Editing Workflow

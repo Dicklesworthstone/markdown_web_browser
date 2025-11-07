@@ -67,6 +67,7 @@ guarded hyphenation, table seam rules)
 - `out.md` with `<!-- source: tile_i, y=..., sha256=..., scale=... -->`
 - `links.json` (anchors/forms/headings/meta/landmarks)
 - `manifest.json` (CfT label+build, DPR, viewport, policies, timings, hashes)
+- `section_embeddings` (sqlite-vec vectors) exposed via `/jobs/{id}/embeddings/search`
 
 ## Persistence & Bundles (Plan §§2, 10, 19.4, 19.6)
 
@@ -77,7 +78,8 @@ guarded hyphenation, table seam rules)
   label/build, screenshot style hash, OCR policy, concurrency window, and timing
   metrics for dashboards. The `section_embeddings` virtual table (sqlite-vec) stores
   1536-dim vectors keyed by `(run_id, section_id, tile_start, tile_end)` so agents can
-  jump directly to relevant Markdown spans.
+  jump directly to relevant Markdown spans via `Store.search_section_embeddings()` and
+  the `/jobs/{id}/embeddings/search` API.
 - **Tar bundles** — `Store.build_bundle` streams each run directory through a
   `tarfile` + `zstandard` writer, producing `bundle.tar.zst` next to the artifacts.
   Use this for incident attachments or dataset exports (Plan §19.6).

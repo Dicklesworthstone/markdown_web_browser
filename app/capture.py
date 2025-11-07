@@ -10,12 +10,8 @@ from typing import Any, List, Optional, Sequence
 
 from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 
-from app.blocklist import (
-    BlocklistConfig,
-    apply_blocklist,
-    cached_blocklist,
-    detect_overlay_warnings,
-)
+from app.blocklist import BlocklistConfig, apply_blocklist, cached_blocklist
+from app.capture_warnings import CaptureWarningEntry, collect_capture_warnings
 from app.settings import WarningSettings, get_settings
 from app.tiler import TileSlice, slice_into_tiles
 
@@ -79,7 +75,7 @@ class CaptureManifest:
     shrink_retry_limit: int
     blocklist_version: str
     blocklist_hits: dict[str, int]
-    warnings: list[str]
+    warnings: list[CaptureWarningEntry]
 
 
 @dataclass(slots=True)
@@ -166,18 +162,14 @@ async def _perform_viewport_sweeps(
     shrink_retry_limit: int,
     blocklist_config: BlocklistConfig,
     warning_settings: WarningSettings,
-) -> tuple[List[TileSlice], SweepStats, str, dict[str, int], list[str]]:
+) -> tuple[List[TileSlice], SweepStats, str, dict[str, int], list[CaptureWarningEntry]]:
     page = await context.new_page()
     await _mask_automation(page)
     mask_locators = [page.locator(selector) for selector in mask_selectors]
 
     await page.goto(config.url, wait_until="networkidle")
     blocklist_hits = await apply_blocklist(page, url=config.url, config=blocklist_config)
-    overlay_warnings = await detect_overlay_warnings(
-        page,
-        canvas_threshold=warning_settings.canvas_warning_threshold,
-        video_threshold=warning_settings.video_warning_threshold,
-    )
+    overlay_warnings = await collect_capture_warnings(page, warning_settings)
     await page.evaluate("window.scrollTo(0, 0)")
     await page.wait_for_timeout(settle_ms)
     sweep_count = 0

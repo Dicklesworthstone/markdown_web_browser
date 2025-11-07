@@ -235,7 +235,7 @@ mdwb fetch https://example.com \
   --ocr.server $OLMOCR_URL --ocr.key $OLMOCR_KEY --ocr.model olmOCR-2-7B-1025-FP8
 ```
 
-_2025-11-08 — PurpleDog (bd-dwf) added the initial Typer/Rich CLI scaffold (`scripts/mdwb_cli.py`) with demo `snapshot/links/stream` commands powered by the `/jobs/demo/*` endpoints; fetch/watch/replay commands will replace the stubs once `/jobs` lands._
+_2025-11-08 — PurpleDog (bd-dwf) added the initial Typer/Rich CLI scaffold (`scripts/mdwb_cli.py`) with demo `snapshot/links/stream/watch/events` commands powered by the `/jobs/demo/*` endpoints (including `--json`/`--raw` output); fetch/watch/replay commands will replace the stubs once `/jobs` lands._
 
 ### 9.2 Agent JSON Contract
 ```
@@ -500,7 +500,7 @@ Below is a focused, pragmatic list of near-term upgrades. They map to the sectio
 
 ### 19.6 Caching, Indexing, Retrieval Quality
 
-> **Progress — 2025-11-08 (BlackPond):** Implementation for bead `markdown_web_browser-9s3` is underway. `app/store.py`, `app/embeddings.py`, `docs/config.md`, and `docs/architecture.md` now track the content-addressed cache layout, sqlite/sqlite-vec schema, manifest contract, and tar bundle export helpers described in this section.
+> **Progress — 2025-11-08 (BlackPond):** Persistence layer + embeddings search endpoints are live. `app/store.py`, `app/embeddings.py`, and `app/main.py` now expose sqlite-vec backed upsert/search helpers plus `/jobs/{id}/embeddings/search`, with docs/config updated to match.
 > _Status 2025-11-08 — FuchsiaPond (bd: markdown_web_browser-t82) integrated the capture pipeline with `Store`, so manifests + tiles are written to cache directories and RunRecord metadata updates automatically once captures finish._
 - Add sqlite-vec section embeddings keyed by `(run_id, section_id, tile_range)` for instant "jump to section" queries.
 - Content-address caches by `(normalized_url, cft_version, viewport, deviceScaleFactor, model_name, model_rev)`.

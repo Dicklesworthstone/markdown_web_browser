@@ -157,3 +157,34 @@ async def demo_links() -> list[dict[str, str]]:
 
     blended = blend_dom_with_ocr(dom_links=demo_dom_links(), ocr_links=demo_ocr_links())
     return serialize_links(blended)
+
+
+@app.post("/jobs/{job_id}/embeddings/search", response_model=EmbeddingSearchResponse)
+async def embeddings_search(job_id: str, payload: EmbeddingSearchRequest) -> EmbeddingSearchResponse:
+    """Search section embeddings for a capture run using cosine similarity."""
+
+    try:
+        total, matches = await asyncio.to_thread(
+            store.search_section_embeddings,
+            job_id=job_id,
+            vector=payload.vector,
+            top_k=payload.top_k,
+        )
+    except KeyError as exc:  # pragma: no cover - run not found
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return EmbeddingSearchResponse(
+        total_sections=total,
+        matches=[
+            SectionEmbeddingMatch(
+                section_id=match.section_id,
+                tile_start=match.tile_start,
+                tile_end=match.tile_end,
+                similarity=match.similarity,
+                distance=match.distance,
+            )
+            for match in matches
+        ],
+    )

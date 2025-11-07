@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -95,9 +96,10 @@ def _manifest_metrics(manifest_path: Path) -> tuple[int | None, int | None, dict
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     timings = manifest.get("timings") or {}
     capture_ms = timings.get("capture_ms")
-    total_ms = timings.get("total_ms") or sum(
-        part for key in ("capture_ms", "ocr_ms", "stitch_ms") if (part := timings.get(key))
-    )
+    total_ms = timings.get("total_ms")
+    if total_ms is None:
+        partials = [timings.get(key) for key in ("capture_ms", "ocr_ms", "stitch_ms")]
+        total_ms = sum(value for value in partials if value is not None)
     return capture_ms, total_ms, timings
 
 
@@ -166,6 +168,52 @@ def write_manifest_index(date_dir: Path, records: list[RunRecord]) -> Path:
     index_path = date_dir / "manifest_index.json"
     index_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return index_path
+
+
+def write_summary_markdown(date_dir: Path, records: list[RunRecord]) -> Path:
+    lines: list[str] = [f"# Nightly Smoke — {date_dir.name}", ""]
+    grouped: dict[str, list[RunRecord]] = defaultdict(list)
+    for record in records:
+        grouped[record.category].append(record)
+
+    lines.append("| Category | Budget (ms) | Jobs | p95 capture (ms) | p95 total (ms) | Status |")
+    lines.append("| --- | --- | --- | --- | --- | --- |")
+
+    for category in sorted(grouped):
+        cat_records = grouped[category]
+        capture_values = [r.capture_ms for r in cat_records if r.capture_ms is not None]
+        total_values = [r.total_ms for r in cat_records if r.total_ms is not None]
+        p95_capture = _percentile(capture_values, 0.95)
+        p95_total = _percentile(total_values, 0.95)
+        budget = cat_records[0].budget_ms
+        status = "OK"
+        if budget and p95_total and p95_total > budget:
+            status = "⚠️ over budget"
+        lines.append(
+            "| {category} | {budget} | {jobs} | {p95_cap:.0f} | {p95_tot:.0f} | {status} |".format(
+                category=category,
+                budget=budget or "—",
+                jobs=len(cat_records),
+                p95_cap=p95_capture or 0,
+                p95_tot=p95_total or 0,
+                status=status,
+            )
+        )
+
+    lines.append("")
+    for category in sorted(grouped):
+        lines.append(f"## {category}")
+        lines.append("| URL | job_id | capture_ms | total_ms |")
+        lines.append("| --- | --- | --- | --- |")
+        for record in grouped[category]:
+            lines.append(
+                f"| {record.url} | `{record.job_id}` | {record.capture_ms or '—'} | {record.total_ms or '—'} |"
+            )
+        lines.append("")
+
+    summary_path = date_dir / "summary.md"
+    summary_path.write_text("\n".join(lines), encoding="utf-8")
+    return summary_path
 
 
 def _collect_history(days: int) -> list[Path]:
@@ -253,6 +301,7 @@ def main() -> None:
         all_records.extend(records)
 
     write_manifest_index(date_dir, all_records)
+    write_summary_markdown(date_dir, all_records)
     update_weekly_summary(config)
     print(f"Smoke run complete for {run_date}; artifacts under {date_dir}")
 

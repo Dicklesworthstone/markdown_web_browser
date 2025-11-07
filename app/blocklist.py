@@ -94,32 +94,3 @@ def _host_matches_pattern(host: str, pattern: str) -> bool:
         return host.endswith(suffix)
     return host == pattern
 
-
-async def detect_overlay_warnings(
-    page: Page,
-    *,
-    canvas_threshold: int = 3,
-    video_threshold: int = 2,
-) -> list[str]:
-    """Return coarse warnings about canvas/video/sticky overlays."""
-
-    stats = await page.evaluate(
-        """
-        () => {
-            const stickySelectors = "[style*='position:fixed'],[style*='position: sticky'],header[style*='position']";
-            const sticky = document.querySelectorAll(stickySelectors).length;
-            const canvas = document.querySelectorAll('canvas').length;
-            const video = document.querySelectorAll('video').length;
-            const dialog = document.querySelectorAll('[role="dialog"], [aria-modal="true"]').length;
-            return { sticky, canvas, video, dialog };
-        }
-        """,
-    )
-    warnings: list[str] = []
-    if stats["canvas"] >= canvas_threshold:
-        warnings.append("canvas_heavy")
-    if stats["video"] >= video_threshold:
-        warnings.append("video_overlay")
-    if stats["sticky"] >= 3 or stats["dialog"] >= 1:
-        warnings.append("sticky_chrome")
-    return warnings

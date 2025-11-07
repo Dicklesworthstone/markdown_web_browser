@@ -31,7 +31,7 @@ jobs:
           OLMOCR_SERVER: ${{ secrets.OLMOCR_SERVER }}
           OLMOCR_API_KEY: ${{ secrets.OLMOCR_API_KEY }}
         run: |
-          cat <<'EOF' > .env
+          cat <<EOF > .env
           API_BASE_URL=${API_BASE_URL:-https://mdwb.example.com}
           MDWB_API_KEY=${MDWB_API_KEY}
           OLMOCR_SERVER=${OLMOCR_SERVER:-https://ai2endpoints.cirrascale.ai/api}

@@ -10,6 +10,7 @@ from typing import Sequence
 
 import sqlite_vec
 from sqlmodel import Session
+from sqlalchemy import text
 
 
 EMBEDDING_DIM = 1536
