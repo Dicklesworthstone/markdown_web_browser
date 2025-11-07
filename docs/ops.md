@@ -13,14 +13,19 @@ uv run python scripts/run_smoke.py \
   --http2 \
   --poll-interval 1.0 \
   --timeout 900 \
-  --seed 0
+  --seed 0 \
+  --category docs_articles \
+  --category dashboards_apps
 ```
 
-Add `--dry-run` when you want to exercise the pipeline without hitting `/jobs`
-(useful before the API is live or when secrets are unavailable). Pair it with
-`--seed <int>` (defaults to 0) so synthetic manifests remain deterministic.
-Dry runs still write manifests, summary markdown, and weekly stats so downstream
-tooling can be tested.
+- Add `--dry-run` when you want to exercise the pipeline without hitting `/jobs`
+  (useful before the API is live or when secrets are unavailable). Pair it with
+  `--seed <int>` (defaults to 0) so synthetic manifests remain deterministic.
+  Dry runs still write manifests, summary markdown, and weekly stats so downstream
+  tooling can be tested.
+- Use `--category <name>` (repeatable) to scope the run to specific categories from
+  `benchmarks/production_set.json`. This is useful when a particular slice is flaky
+  and you want to rerun it without exercising the entire set.
 
 - Loads `benchmarks/production_set.json` (docs/articles, dashboards/apps,
   lightweight pages) and runs each URL via `scripts/olmocr_cli.py`.

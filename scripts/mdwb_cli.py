@@ -145,17 +145,6 @@ def _watch_job_events(
         client.close()
 
 
-def _stream_events(job_id: str, settings: APISettings, output: typer.FileTextWrite) -> None:
-    with httpx.Client(base_url=settings.base_url, timeout=None, headers=_auth_headers(settings)) as client:
-        with client.stream("GET", f"/jobs/{job_id}/events") as response:
-            response.raise_for_status()
-            for line in response.iter_lines():
-                if not line:
-                    continue
-                output.write(line + "\n")
-                output.flush()
-
-
 def _poll_snapshots(
     *,
     job_id: str,
@@ -244,14 +233,17 @@ def stream(
 def events(
     job_id: str = typer.Argument(..., help="Job identifier"),
     api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
+    since: Optional[str] = typer.Option(None, help="ISO timestamp cursor for incremental polling."),
+    follow: bool = typer.Option(False, "--follow/--no-follow", help="Continue polling for new events."),
+    interval: float = typer.Option(2.0, "--interval", help="Polling interval in seconds when following."),
     output: typer.FileTextWrite = typer.Option(
         "-", "--output", "-o", help="File to append NDJSON events to (default stdout)."
     ),
 ) -> None:
-    """Tail `/jobs/{id}/events` (NDJSON feed)."""
+    """Fetch newline-delimited job events (JSONL)."""
 
     settings = _resolve_settings(api_base)
-    _stream_events(job_id, settings, output=output)
+    _watch_job_events(job_id, settings, cursor=since, follow=follow, interval=interval, output=output)
 
 
 @demo_cli.command("snapshot")
@@ -396,3 +388,18 @@ def dom_links(
         return
     _print_links(data)
  
+@jobs_cli.command("watch")
+def jobs_watch(
+    job_id: str = typer.Argument(..., help="Job identifier"),
+    api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
+    since: Optional[str] = typer.Option(None, help="Resume from this ISO timestamp."),
+    interval: float = typer.Option(2.0, "--interval", help="Polling interval (seconds) when following."),
+    follow: bool = typer.Option(True, "--follow/--once", help="Stream continuously (default) or exit after one batch."),
+    output: typer.FileTextWrite = typer.Option(
+        "-", "--output", "-o", help="File to append NDJSON events to (default stdout)."
+    ),
+) -> None:
+    """Continuously tail the `/jobs/{id}/events` NDJSON feed."""
+
+    settings = _resolve_settings(api_base)
+    _watch_job_events(job_id, settings, cursor=since, follow=follow, interval=interval, output=output)

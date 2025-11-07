@@ -699,7 +699,7 @@ Use these snippets as scaffolding for docs, onboarding, and regression verificat
 
 _2025-11-08 — PinkCreek (bd-ug0) spinning up nightly smoke + weekly latency automation and wiring manifests/log storage per this section._
 - `scripts/run_smoke.py` orchestrates nightly captures per `benchmarks/production_set.json` (writing `manifest_index.json` under `benchmarks/production/<date>/` and refreshing `weekly_summary.json`). See `docs/ops.md` for the runbook + verification checklist.
-- Use `--dry-run` to exercise the smoke pipeline without hitting `/jobs`; pair with `--seed` (defaults to `0`) to keep synthetic manifests deterministic so dashboard diffs stay stable. The script also mirrors the latest run into `benchmarks/production/latest_{manifest_index,summary}.json|md` so dashboards can read a stable path.
+- Use `--dry-run` to exercise the smoke pipeline without hitting `/jobs`; pair with `--seed` (defaults to `0`) to keep synthetic manifests deterministic so dashboard diffs stay stable. Scope to targeted slices with `--category <name>` (repeatable) when only certain sets need reruns. The script also mirrors the latest run into `benchmarks/production/latest_{manifest_index,summary}.json|md` so dashboards can read a stable path.
 
 Focus on a curated set of real customer-style URLs instead of synthetic benchmarks. Maintain `benchmarks/production_set.json` listing each URL, category, and target latency.
 

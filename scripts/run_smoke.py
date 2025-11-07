@@ -357,11 +357,23 @@ def main() -> None:
     parser.add_argument("--timeout", type=float, default=900.0)
     parser.add_argument("--dry-run", action=argparse.BooleanOptionalAction, default=False, help="Skip API calls and emit synthetic records.")
     parser.add_argument("--seed", type=int, help="Optional RNG seed for --dry-run mode (default deterministic)")
+    parser.add_argument(
+        "--category",
+        action="append",
+        dest="categories",
+        help="Only run the named category (repeatable). Defaults to all categories.",
+    )
     args = parser.parse_args()
 
     run_date = args.date or datetime.now(timezone.utc).date().isoformat()
     config = _load_production_set()
     categories = _parse_categories(config)
+    if args.categories:
+        selected = {name.strip() for name in args.categories if name.strip()}
+        categories = [cat for cat in categories if cat.name in selected]
+        missing = selected - {cat.name for cat in categories}
+        if missing:
+            raise SystemExit(f"Unknown categories requested: {', '.join(sorted(missing))}")
     settings = olmocr_cli.load_settings()
     date_dir = _ensure_date_dir(run_date)
 

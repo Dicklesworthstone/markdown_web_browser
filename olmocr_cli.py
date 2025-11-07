@@ -383,7 +383,7 @@ def run(
     )
     extra_args = extra_args if extra_args is not None else config_defaults.get("extra_args")
     server_url = server_url if server_url is not None else config_defaults.get("server_url")
-    server_model = server_model or config_defaults.get("server_model", "olmocr")
+    server_model or config_defaults.get("server_model", "olmocr")
     resume = resume if resume is not None else config_defaults.get("resume", True)
     visible_gpus = visible_gpus if visible_gpus is not None else config_defaults.get("visible_gpus")
 
@@ -485,7 +485,7 @@ def run(
     if use_external_server:
         server_for_cli = cast(str, detected_server)
         base_cmd.extend(["--server", server_for_cli])
-        base_cmd.extend(["--model", server_model])
+        base_cmd.extend(["--model", server_model_name])
         metrics = _fetch_server_metrics(server_for_cli)
         if metrics:
             running, waiting = metrics
