@@ -96,3 +96,4 @@ guarded hyphenation, table seam rules)
 - `GET /jobs/{id}/stream` — SSE feed emitting `state`, `progress`, `manifest`, `warnings`, and `artifacts` events; used by the HTMX UI and agent tooling.
 - Artifact endpoints: `/jobs/{id}/manifest.json`, `/jobs/{id}/links.json`, `/jobs/{id}/result.md`, and `/jobs/{id}/artifact/{path}` expose persisted outputs for CLI/automation and demos.
 - `/jobs/{id}/embeddings/search` — cosine similarity search on sqlite-vec section embeddings (used by the Embeddings tab + agents).
+- `/warnings` (internal) — warning/blocklist incidents append to `ops/warnings.jsonl`; the `mdwb warnings tail` CLI command reads this log so ops can review capture anomalies without crawling manifests.

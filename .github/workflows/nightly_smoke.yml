@@ -60,6 +60,9 @@ jobs:
       - name: Install Playwright browsers
         run: uv run playwright install --with-deps chromium
 
+      - name: Check environment completeness
+        run: uv run python scripts/check_env.py --env .env
+
       - name: Run nightly smoke
         env:
           RUN_DATE: ${{ steps.dates.outputs.today }}

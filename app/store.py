@@ -95,6 +95,7 @@ class RunPaths:
     manifest_path: Path
     markdown_path: Path
     links_path: Path
+    dom_snapshot_path: Path
 
     @classmethod
     def from_url(cls, *, url: str, started_at: datetime, config: StorageConfig) -> RunPaths:
@@ -110,6 +111,7 @@ class RunPaths:
             manifest_path=run_root / "manifest.json",
             markdown_path=run_root / "out.md",
             links_path=run_root / "links.json",
+            dom_snapshot_path=artifacts / "dom.html",
         )
 
     def ensure_directories(self) -> None:
@@ -128,6 +130,7 @@ class RunPaths:
             manifest_path=Path(record.manifest_path),
             markdown_path=root / "out.md",
             links_path=root / "links.json",
+            dom_snapshot_path=root / "artifact" / "dom.html",
         )
 
 
@@ -175,6 +178,15 @@ class Store:
             session.add(record)
             session.commit()
         return paths
+
+    def dom_snapshot_path(self, *, job_id: str) -> Path:
+        """Return the filesystem path for a run's DOM snapshot."""
+
+        with self.session() as session:
+            record = session.get(RunRecord, job_id)
+            if not record:
+                raise KeyError(f"Run {job_id} not found")
+            return RunPaths.from_record(record).dom_snapshot_path
 
     def update_status(
         self,

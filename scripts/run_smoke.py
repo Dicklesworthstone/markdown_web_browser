@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import re
 from collections import defaultdict
 from dataclasses import dataclass
@@ -148,6 +149,65 @@ def run_category(
     return results
 
 
+def run_category_dry(category: Category, out_dir: Path, seed: int | None = None) -> list[RunRecord]:
+    rng = random.Random(seed)
+    results: list[RunRecord] = []
+    category_dir = out_dir / category.name
+    category_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%H%M%S")
+
+    for url_entry in category.urls:
+        slug = _slug_from_url(url_entry)
+        url = url_entry["url"]
+        job_id = f"dry-{category.name}-{slug}-{stamp}"
+        job_dir = category_dir / f"{slug}-{stamp}"
+        job_dir.mkdir(parents=True, exist_ok=True)
+
+        capture_ms = int(rng.uniform(6_000, 18_000))
+        ocr_ms = int(rng.uniform(8_000, 22_000))
+        stitch_ms = int(rng.uniform(500, 2_000))
+        manifest: dict[str, Any] = {
+            "job_id": job_id,
+            "url": url,
+            "timings": {
+                "capture_ms": capture_ms,
+                "ocr_ms": ocr_ms,
+                "stitch_ms": stitch_ms,
+                "total_ms": capture_ms + ocr_ms + stitch_ms,
+            },
+            "environment": {
+                "cft_version": "dry-run",
+                "playwright_channel": "cft",
+            },
+            "warnings": [],
+            "blocklist_hits": {},
+        }
+        (job_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        (job_dir / "out.md").write_text("# Dry Run\n\nNo real capture was executed.", encoding="utf-8")
+        (job_dir / "links.json").write_text("[]", encoding="utf-8")
+
+        timings_value = manifest.get("timings")
+        if not isinstance(timings_value, dict):
+            timings_value = None
+
+        results.append(
+            RunRecord(
+                category=category.name,
+                budget_ms=category.budget_ms,
+                slug=slug,
+                url=url,
+                job_id=job_id,
+                run_dir=job_dir,
+                manifest_path=job_dir / "manifest.json",
+                capture_ms=capture_ms,
+                total_ms=capture_ms + ocr_ms + stitch_ms,
+                timings=timings_value,
+            )
+        )
+
+    return results
+
+
 def write_manifest_index(date_dir: Path, records: list[RunRecord]) -> Path:
     payload = [
         {
@@ -281,6 +341,8 @@ def main() -> None:
     parser.add_argument("--http2", action=argparse.BooleanOptionalAction, default=True, help="Toggle HTTP/2")
     parser.add_argument("--poll-interval", type=float, default=1.0)
     parser.add_argument("--timeout", type=float, default=900.0)
+    parser.add_argument("--dry-run", action=argparse.BooleanOptionalAction, default=False, help="Skip API calls and emit synthetic records.")
+    parser.add_argument("--seed", type=int, help="Optional RNG seed for --dry-run mode (default deterministic)")
     args = parser.parse_args()
 
     run_date = args.date or datetime.now(timezone.utc).date().isoformat()
@@ -291,14 +353,17 @@ def main() -> None:
 
     all_records: list[RunRecord] = []
     for category in categories:
-        records = run_category(
-            category,
-            date_dir,
-            settings=settings,
-            http2=args.http2,
-            poll_interval=args.poll_interval,
-            timeout_s=args.timeout,
-        )
+        if args.dry_run:
+            records = run_category_dry(category, date_dir, seed=args.seed or 0)
+        else:
+            records = run_category(
+                category,
+                date_dir,
+                settings=settings,
+                http2=args.http2,
+                poll_interval=args.poll_interval,
+                timeout_s=args.timeout,
+            )
         all_records.extend(records)
 
     write_manifest_index(date_dir, all_records)

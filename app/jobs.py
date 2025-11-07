@@ -1,4 +1,4 @@
-"""Job state machine and capture orchestration helpers."""
+"""Job orchestration helpers for capture requests."""
 
 from __future__ import annotations
 
@@ -16,9 +16,9 @@ from app.settings import Settings, settings as global_settings
 from app.store import Store, build_store
 from app.warning_log import append_warning_log
 
-try:  # Playwright is an optional dependency in some CI environments
+try:  # Playwright may be missing in some CI environments
     PLAYWRIGHT_VERSION = metadata.version("playwright")
-except metadata.PackageNotFoundError:  # pragma: no cover - development convenience
+except metadata.PackageNotFoundError:  # pragma: no cover - dev fallback
     PLAYWRIGHT_VERSION = None
 
 
@@ -47,7 +47,6 @@ class JobSnapshot(TypedDict, total=False):
     manifest_path: str
     manifest: dict[str, object]
     artifacts: list[dict[str, object]]
-    artifacts: list[dict[str, Any]]
     error: str | None
 
 
@@ -57,13 +56,13 @@ def build_initial_snapshot(
     job_id: str,
     settings: Settings | None = None,
 ) -> JobSnapshot:
-    """Construct a basic snapshot stub used before persistence wiring exists."""
+    """Construct a baseline snapshot before capture begins."""
 
     manifest = None
     active_settings = settings or global_settings
     if active_settings:
         manifest = ManifestMetadata(
-            environment=active_settings.manifest_environment(playwright_version=PLAYWRIGHT_VERSION),
+            environment=active_settings.manifest_environment(playwright_version=PLAYWRIGHT_VERSION)
         )
 
     snapshot = JobSnapshot(
@@ -81,31 +80,59 @@ def build_initial_snapshot(
 
 RunnerType = Callable[..., Awaitable[tuple[CaptureResult, list[dict[str, object]]]]]
 
+WebhookSender = Callable[[str, dict[str, Any]], Awaitable[None]]
+
 
 class JobManager:
-    """Lightweight in-memory job registry backed by ``Store`` persistence."""
+    """In-memory job registry backed by Store persistence."""
 
-    def __init__(self, *, store: Store | None = None, runner: RunnerType | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        store: Store | None = None,
+        runner: RunnerType | None = None,
+        webhook_sender: WebhookSender | None = None,
+    ) -> None:
         self.store = store or build_store()
         self._runner = runner or execute_capture_job
         self._snapshots: Dict[str, JobSnapshot] = {}
         self._tasks: Dict[str, asyncio.Task[None]] = {}
         self._subscribers: Dict[str, List[asyncio.Queue[JobSnapshot]]] = {}
+        self._event_logs: Dict[str, List[dict[str, Any]]] = {}
+        self._webhooks: Dict[str, List[dict[str, Any]]] = {}
+        self._webhook_sender = webhook_sender or _noop_webhook_sender
 
     async def create_job(self, request: JobCreateRequest) -> JobSnapshot:
         job_id = uuid4().hex
         snapshot = build_initial_snapshot(url=request.url, job_id=job_id)
-        self._snapshots[job_id] = snapshot
+        self._snapshots[job_id] = snapshot.copy()
         self._broadcast(job_id)
         task = asyncio.create_task(self._run_job(job_id=job_id, url=request.url))
         self._tasks[job_id] = task
-        return snapshot
+        return snapshot.copy()
 
     def get_snapshot(self, job_id: str) -> JobSnapshot:
         snapshot = self._snapshots.get(job_id)
-        if not snapshot:
+        if snapshot is None:
             raise KeyError(f"Job {job_id} not found")
-        return snapshot
+        return snapshot.copy()
+
+    def subscribe(self, job_id: str) -> asyncio.Queue[JobSnapshot]:
+        if job_id not in self._snapshots:
+            raise KeyError(f"Job {job_id} not found")
+        queue: asyncio.Queue[JobSnapshot] = asyncio.Queue()
+        queue.put_nowait(self._snapshots[job_id].copy())
+        self._subscribers.setdefault(job_id, []).append(queue)
+        return queue
+
+    def unsubscribe(self, job_id: str, queue: asyncio.Queue[JobSnapshot]) -> None:
+        subscribers = self._subscribers.get(job_id)
+        if not subscribers:
+            return
+        if queue in subscribers:
+            subscribers.remove(queue)
+        if not subscribers:
+            self._subscribers.pop(job_id, None)
 
     async def _run_job(self, *, job_id: str, url: str) -> None:
         try:
@@ -123,7 +150,7 @@ class JobManager:
             snapshot["artifacts"] = tile_artifacts
             self._broadcast(job_id)
             self._set_state(job_id, JobState.DONE)
-        except Exception as exc:  # pragma: no cover - surfaced to callers/logs
+        except Exception as exc:  # pragma: no cover - surfaced to API callers
             self._set_state(job_id, JobState.FAILED)
             self._set_error(job_id, str(exc))
             raise
@@ -132,47 +159,24 @@ class JobManager:
 
     def _set_state(self, job_id: str, state: JobState) -> None:
         snapshot = self._snapshots.get(job_id)
-        if snapshot is not None:
-            snapshot["state"] = state
+        if snapshot is None:
+            return
+        snapshot["state"] = state
         self._broadcast(job_id)
 
     def _set_error(self, job_id: str, message: str | None) -> None:
         snapshot = self._snapshots.get(job_id)
-        if snapshot is not None:
-            snapshot["error"] = message
+        if snapshot is None:
+            return
+        snapshot["error"] = message
         self._broadcast(job_id)
 
-    def subscribe(self, job_id: str) -> asyncio.Queue[JobSnapshot]:
-        if job_id not in self._snapshots:
-            raise KeyError(f"Job {job_id} not found")
-        queue: asyncio.Queue[JobSnapshot] = asyncio.Queue()
-        self._subscribers.setdefault(job_id, []).append(queue)
-        queue.put_nowait(self._snapshot_payload(job_id))
-        return queue
-
-    def unsubscribe(self, job_id: str, queue: asyncio.Queue[JobSnapshot]) -> None:
-        subscribers = self._subscribers.get(job_id)
-        if not subscribers:
-            return
-        if queue in subscribers:
-            subscribers.remove(queue)
-        if not subscribers:
-            self._subscribers.pop(job_id, None)
-
     def _broadcast(self, job_id: str) -> None:
-        if job_id not in self._snapshots or job_id not in self._subscribers:
+        payload = self._snapshots.get(job_id)
+        if payload is None:
             return
-        payload = self._snapshot_payload(job_id)
         for queue in list(self._subscribers.get(job_id, [])):
-            queue.put_nowait(payload)
-
-    def _snapshot_payload(self, job_id: str) -> JobSnapshot:
-        snapshot = self._snapshots[job_id]
-        payload = snapshot.copy()
-        state = payload.get("state")
-        if isinstance(state, JobState):
-            payload["state"] = state.value
-        return payload
+            queue.put_nowait(payload.copy())
 
 
 async def execute_capture_job(

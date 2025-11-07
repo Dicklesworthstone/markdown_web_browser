@@ -26,7 +26,7 @@ class CaptureWarningEntry:
 
     code: str
     message: str
-    count: int
+    count: float
     threshold: float
 
 
@@ -128,13 +128,17 @@ def build_sweep_warning(
             )
         )
 
-    if overlap_pairs > 0 and settings.overlap_warning_ratio > 0 and overlap_match_ratio < settings.overlap_warning_ratio:
+    if (
+        overlap_pairs > 0
+        and settings.overlap_warning_ratio > 0
+        and overlap_match_ratio < settings.overlap_warning_ratio
+    ):
         warnings.append(
             CaptureWarningEntry(
                 code="overlap-low",
                 message="Tile overlap match ratio is below the configured threshold; seams may misalign.",
-                count=int(overlap_match_ratio * 100),
-                threshold=int(settings.overlap_warning_ratio * 100),
+                count=overlap_match_ratio,
+                threshold=settings.overlap_warning_ratio,
             )
         )
 

@@ -58,6 +58,12 @@ print(settings.ocr.server_url)
 Add any new variables to `.env.example`, document them here, and update the
 manifest schema if they need to be echoed downstream.
 
+### Validating configuration
+- Run `uv run python scripts/check_env.py` to verify all required variables are present.
+  Use `--json` for machine-readable output in CI.
+- The script fails (exit code 1) when a required setting is missing, helping catch
+  misconfigured environments before capture jobs run.
+
 ## Manifest Metadata
 
 `app.settings.Settings.manifest_environment()` returns the canonical dictionary

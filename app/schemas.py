@@ -75,7 +75,7 @@ class ManifestWarning(BaseModel):
 
     code: str = Field(description="Stable identifier (e.g., canvas-heavy)")
     message: str = Field(description="Human-friendly details")
-    count: int = Field(ge=0, description="Observed count triggering the warning")
+    count: float = Field(ge=0, description="Observed count/ratio triggering the warning")
     threshold: float = Field(ge=0, description="Configured threshold for the warning")
 
 
@@ -137,4 +137,14 @@ class EmbeddingSearchResponse(BaseModel):
 
     total_sections: int
     matches: list[SectionEmbeddingMatch]
+
+
+class WebhookRegistrationRequest(BaseModel):
+    """Webhook callback registration payload."""
+
+    url: str = Field(description="Callback URL to invoke on job events")
+    events: list[str] | None = Field(
+        default=None,
+        description="States that should trigger the webhook (defaults to DONE/FAILED)",
+    )
     warnings: list[ManifestWarning] = Field(default_factory=list)

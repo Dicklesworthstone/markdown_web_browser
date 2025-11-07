@@ -115,6 +115,7 @@ Key signals:
 - **Database:** `runs.db` (SQLite/SQLModel/sqlite-vec) stores `runs(id, url, started_at, finished_at, status, cache_path, sha256_full, tiles, ocr_provider, model)` plus `links(run_id, href, text, rel, type)` and section embedding vectors.
 - **Git/LFS (optional):** Commit Markdown outputs, store heavy artifacts via LFS so CI can diff Markdown over time.
 - **Content addressing:** Key caches by `(normalized_url, cft_version, viewport, deviceScaleFactor, model_name, model_rev)` to prevent mismatches when browsers or models change.
+- _2025-11-08 — PinkCreek (bd-ug0) added `scripts/check_env.py` so CI/smoke jobs can fail fast when `.env` is incomplete (API_BASE_URL, CfT pin, olmOCR endpoints, concurrency caps)._
 
 ---
 
@@ -130,9 +131,11 @@ Key signals:
 - `GET /jobs/{id}/result.md` → final Markdown
 - `GET /jobs/{id}/links.json` → anchors/forms/headings/meta
 - `GET /jobs/{id}/artifact/{name}` → images/PDF
+- `POST /jobs/{id}/webhooks` → register callback URLs (defaults to DONE/FAILED notifications)
 - `POST /replay` → re-run with same manifest but different OCR/tiling policy
 
 _2025-11-08 — FuchsiaPond (bd: markdown_web_browser-t82) implemented real `POST /jobs` + `GET /jobs/{id}` routes via the new JobManager, so capture requests now persist manifests/tiles in `Store` and expose snapshots for the UI. SSE + events remain on the roadmap._
+_2025-11-08 — JobManager now drives `/jobs/{id}/stream`, so the HTMX SSE endpoint emits live snapshot JSON (state, progress, manifest path) instead of the demo feed; `/jobs/{id}/events` now serves newline-delimited snapshots for CLI/agent consumption._
 
 ### 4.2 Job States
 1. `BROWSER_STARTING`
@@ -188,7 +191,7 @@ _2025-11-08 — Added BeautifulSoup-powered DOM snapshot parsing so `extract_lin
 - Network idle that never resolves → fallback to `domcontentloaded` plus extra wait; record detour in manifest.
 - Canvas/WebGL-first content → emit warning banner + attach raw tile thumbnail next to Markdown block.
 - Anti-automation overlays → blocklist injection + UI toggle for per-domain overrides.
-  _2025-11-08 — BrownStone (bd-dm9) introduced JSON-backed selector blocklist + capture warnings; manifests now log `blocklist_hits` + warning codes for SSE/UI surfacing._
+_2025-11-08 — BrownStone (bd-dm9) introduced JSON-backed selector blocklist + capture warnings; manifests now log `blocklist_hits` + warning codes for SSE/UI surfacing. PinkCreek added `scripts/mdwb_cli.py demo` helpers so the CLI can render these warnings/links using the shared `.env` config._
 - Scroll shrink / poor overlap → capture now emits `scroll-shrink` and `overlap-low` warnings whenever viewport sweeps retry due to shrinking SPAs or overlap match ratios fall below the configured threshold (defaults: 1 shrink event, 0.65 ratio). _2025-11-08 — BrownStone (bd-dm9)._ 
 - Server overload → adaptive OCR concurrency, queue visibility, remote/local failover.
 - Partial results → stream partial Markdown as tiles finish; mark sections as incomplete with provenance comments.
@@ -240,7 +243,11 @@ mdwb fetch https://example.com \
   --ocr.server $OLMOCR_URL --ocr.key $OLMOCR_KEY --ocr.model olmOCR-2-7B-1025-FP8
 ```
 
-_2025-11-08 — PurpleDog (bd-dwf) added the initial Typer/Rich CLI scaffold (`scripts/mdwb_cli.py`) with demo `snapshot/links/stream/watch/events` commands powered by the `/jobs/demo/*` endpoints (including `--json`/`--raw` output); fetch/watch/replay commands will replace the stubs once `/jobs` lands._
+_2025-11-08 — PurpleDog (bd-dwf) added the initial Typer/Rich CLI scaffold (`scripts/mdwb_cli.py`) with demo `snapshot/links/stream/watch/events/warnings` commands powered by the `/jobs/demo/*` endpoints (including `--json`/`--raw` output + manifest warning/blocklist rendering), `mdwb dom links` for offline DOM snapshot parsing, and the first real `/jobs` commands (`mdwb fetch/show/stream/watch`) wired to the JobManager SSE feed / polling API (fetch supports `--watch`)._
+
+_2025-11-08 — RunPaths now tracks `dom_snapshot_path` and Store exposes `dom_snapshot_path(job_id)` so CLI/tests can discover the captured DOM HTML once t82 writes snapshots._
+
+_2025-11-08 — BrownStone (bd-dm9) added `mdwb warnings tail` to read the new warning/blocklist JSONL log (`WARNING_LOG_PATH`)._
 
 _2025-11-08 — BrownStone (bd-dm9) expanded the manifest + `/jobs` schema so blocklist hits and structured capture warnings flow through snapshots/SSE; demo endpoints + UI now render the warning pills, paving the way for real `/jobs` events once 3px is wired._
 
@@ -688,6 +695,7 @@ Use these snippets as scaffolding for docs, onboarding, and regression verificat
 
 _2025-11-08 — PinkCreek (bd-ug0) spinning up nightly smoke + weekly latency automation and wiring manifests/log storage per this section._
 - `scripts/run_smoke.py` orchestrates nightly captures per `benchmarks/production_set.json` (writing `manifest_index.json` under `benchmarks/production/<date>/` and refreshing `weekly_summary.json`). See `docs/ops.md` for the runbook + verification checklist.
+- Use `--dry-run` to exercise the smoke pipeline without hitting `/jobs`; pair with `--seed` (defaults to `0`) to keep synthetic manifests deterministic so dashboard diffs stay stable.
 
 Focus on a curated set of real customer-style URLs instead of synthetic benchmarks. Maintain `benchmarks/production_set.json` listing each URL, category, and target latency.
 

@@ -67,7 +67,8 @@ def test_build_sweep_warning_flags_overlap_ratio():
     )
 
     assert [w.code for w in warnings] == ["overlap-low"]
-    assert warnings[0].threshold == 80
+    assert warnings[0].threshold == 0.8
+    assert abs(warnings[0].count - 0.5) < 1e-6
 
 
 def test_build_sweep_warning_emits_seam_warning():

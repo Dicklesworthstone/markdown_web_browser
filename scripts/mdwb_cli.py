@@ -24,6 +24,7 @@ cli.add_typer(demo_cli, name="demo")
 class APISettings:
     base_url: str
     api_key: Optional[str]
+    warning_log_path: Path
 
 
 def _load_env_settings() -> APISettings:
@@ -32,8 +33,9 @@ def _load_env_settings() -> APISettings:
         config = DecoupleConfig(RepositoryEnv(str(env_path)))
         base_url = config("API_BASE_URL", default="http://localhost:8000")
         api_key = config("MDWB_API_KEY", default=None)
-        return APISettings(base_url=base_url, api_key=api_key)
-    return APISettings(base_url="http://localhost:8000", api_key=None)
+        warning_log = Path(config("WARNING_LOG_PATH", default="ops/warnings.jsonl"))
+        return APISettings(base_url=base_url, api_key=api_key, warning_log_path=warning_log)
+    return APISettings(base_url="http://localhost:8000", api_key=None, warning_log_path=Path("ops/warnings.jsonl"))
 
 
 def _resolve_settings(override_base: Optional[str]) -> APISettings:
@@ -62,7 +64,7 @@ def _client(settings: APISettings, http2: bool = True) -> httpx.Client:
 
 def _print_job(job: dict) -> None:
     table = Table("Field", "Value", title=f"Job {job.get('id', 'unknown')}")
-    for key in ("state", "url", "progress", "manifest"):
+    for key in ("state", "url", "progress", "manifest", "warnings", "blocklist_hits"):
         value = job.get(key)
         if isinstance(value, (dict, list)):
             value = json.dumps(value, indent=2)
@@ -95,13 +97,105 @@ def _iter_sse(response: httpx.Response) -> Iterable[Tuple[str, str]]:
         yield event, "\n".join(data_lines)
 
 
-@cli.command()
-def fetch(url: str = typer.Argument(..., help="URL to capture")) -> None:
-    """Placeholder until the real /jobs endpoint lands."""
+def _stream_job(job_id: str, settings: APISettings, *, raw: bool) -> None:
+    with httpx.Client(base_url=settings.base_url, timeout=None, headers=_auth_headers(settings)) as client:
+        with client.stream("GET", f"/jobs/{job_id}/stream") as response:
+            response.raise_for_status()
+            for event, payload in _iter_sse(response):
+                if raw:
+                    console.print(f"{event}\t{payload}")
+                else:
+                    _log_event(event, payload)
 
-    console.print(
-        "[yellow]POST /jobs is not available yet. Use `mdwb demo stream`/`links` to exercise the API until bd-3px ships.[/]"
-    )
+
+@cli.command()
+def fetch(
+    url: str = typer.Argument(..., help="URL to capture"),
+    api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
+    profile: Optional[str] = typer.Option(None, "--profile", help="Browser profile identifier"),
+    ocr_policy: Optional[str] = typer.Option(None, "--ocr-policy", help="OCR policy/model id"),
+    watch: bool = typer.Option(False, "--watch/--no-watch", help="Stream job progress after submission"),
+    raw: bool = typer.Option(False, "--raw", help="When watching, print raw SSE lines"),
+    http2: bool = typer.Option(True, "--http2/--no-http2"),
+) -> None:
+    """Submit a new capture job and optionally stream progress."""
+
+    settings = _resolve_settings(api_base)
+    client = _client(settings, http2=http2)
+    payload: dict[str, object] = {"url": url}
+    if profile:
+        payload["profile_id"] = profile
+    if ocr_policy:
+        payload["ocr"] = {"policy": ocr_policy}
+
+    response = client.post("/jobs", json=payload)
+    response.raise_for_status()
+    job = response.json()
+    console.print(f"[green]Created job {job.get('id')}[/]")
+    _print_job(job)
+
+    if watch and job.get("id"):
+        console.rule(f"Streaming {job['id']}")
+        _stream_job(job["id"], settings, raw=raw)
+
+
+@cli.command()
+def show(
+    job_id: str = typer.Argument(..., help="Job identifier"),
+    api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
+    http2: bool = typer.Option(True, "--http2/--no-http2"),
+) -> None:
+    """Display the latest snapshot for a real job."""
+
+    settings = _resolve_settings(api_base)
+    client = _client(settings, http2=http2)
+    response = client.get(f"/jobs/{job_id}")
+    response.raise_for_status()
+    _print_job(response.json())
+
+
+@cli.command()
+def stream(
+    job_id: str = typer.Argument(..., help="Job identifier"),
+    api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
+    raw: bool = typer.Option(False, "--raw", help="Print raw event payloads instead of colored labels."),
+) -> None:
+    """Tail the live SSE stream for a job."""
+
+    settings = _resolve_settings(api_base)
+    _stream_job(job_id, settings, raw=raw)
+
+
+@cli.command()
+def watch(
+    job_id: str = typer.Argument(..., help="Job identifier"),
+    api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
+    interval: float = typer.Option(1.5, "--interval", help="Seconds between polls"),
+    json_output: bool = typer.Option(False, "--json", help="Emit JSON snapshots"),
+    stop_on_done: bool = typer.Option(True, "--stop/--no-stop", help="Exit when terminal state reached"),
+    http2: bool = typer.Option(True, "--http2/--no-http2"),
+) -> None:
+    """Poll `/jobs/{id}` until completion, printing snapshots."""
+
+    settings = _resolve_settings(api_base)
+    client = _client(settings, http2=http2)
+    terminal_states = {"DONE", "FAILED", "CANCELLED"}
+
+    while True:
+        response = client.get(f"/jobs/{job_id}")
+        response.raise_for_status()
+        snapshot = response.json()
+        if json_output:
+            console.print_json(data=snapshot)
+        else:
+            _print_job(snapshot)
+        state = str(snapshot.get("state", ""))
+        if stop_on_done and state.upper() in terminal_states:
+            break
+        try:
+            typer.sleep(interval)
+        except KeyboardInterrupt:  # pragma: no cover
+            break
 
 
 @demo_cli.command("snapshot")
@@ -147,6 +241,8 @@ def _log_event(event: str, payload: str) -> None:
         console.print(f"[cyan]{payload}[/]")
     elif event == "progress":
         console.print(f"[magenta]{payload}[/]")
+    elif event in {"warning", "warnings"}:
+        console.print(f"[red]warning[/]: {payload}")
     else:
         console.print(f"[bold]{event}[/]: {payload}")
 
@@ -195,11 +291,4 @@ def demo_events(
                 jsonlib.dump({"event": event, "data": payload}, output)
                 output.write("\n")
                 output.flush()
-
-
-def main() -> None:
-    cli()
-
-
-if __name__ == "__main__":
-    main()
+ 

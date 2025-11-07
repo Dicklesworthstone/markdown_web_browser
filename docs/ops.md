@@ -12,8 +12,15 @@ uv run python scripts/run_smoke.py \
   --date $(date -u +%Y-%m-%d) \
   --http2 \
   --poll-interval 1.0 \
-  --timeout 900
+  --timeout 900 \
+  --seed 0
 ```
+
+Add `--dry-run` when you want to exercise the pipeline without hitting `/jobs`
+(useful before the API is live or when secrets are unavailable). Pair it with
+`--seed <int>` (defaults to 0) so synthetic manifests remain deterministic.
+Dry runs still write manifests, summary markdown, and weekly stats so downstream
+tooling can be tested.
 
 - Loads `benchmarks/production_set.json` (docs/articles, dashboards/apps,
   lightweight pages) and runs each URL via `scripts/olmocr_cli.py`.
@@ -55,6 +62,18 @@ Publish the summary in Monday’s ops update and attach the most recent
 - **OCR throttling**: temporarily reduce `OCR_MAX_CONCURRENCY` in `.env` and rerun,
   then notify the hosted OCR contact listed in `docs/olmocr_cli.md`.
 
+## Warning & Blocklist Logs
+
+- Every capture that emits warnings or blocklist hits appends a JSON line to
+  `WARNING_LOG_PATH` (defaults to `ops/warnings.jsonl`). The record includes the job ID,
+  URL, warning list, and blocklist version/hits so incidents can be triaged without
+  scraping manifests.
+- Use the CLI helper `uv run python scripts/mdwb_cli.py warnings --count 50`
+  (or pass `--log-path` / `--json`) to review recent entries. This is the fastest way
+  to confirm whether canvas/video/sticky or sweep warnings spiked overnight.
+- Rotate/ship the log via your usual log aggregation tooling; the file is plain JSONL
+  and safe to ingest into Loki/Elastic/GCS.
+
 ## Automation Hooks
 - Schedule the nightly job via cron or the CI runner (e.g., 02:00 UTC) and archive
   the resulting `benchmarks/production/<DATE>` directory as a build artifact.
@@ -62,7 +81,8 @@ Publish the summary in Monday’s ops update and attach the most recent
   metrics ingestion.
 - GitHub Actions example: `.github/workflows/nightly_smoke.yml` installs uv/Playwright,
   writes a minimal `.env` from repository secrets (`MDWB_API_BASE_URL`, `MDWB_API_KEY`,
-  `OLMOCR_SERVER`, `OLMOCR_API_KEY`), runs `scripts/run_smoke.py --date ${{ steps.dates.outputs.today }}`,
+  `OLMOCR_SERVER`, `OLMOCR_API_KEY`), runs `scripts/check_env.py` to fail fast on misconfigurations,
+  then executes `scripts/run_smoke.py --date ${{ steps.dates.outputs.today }}`,
   and uploads `benchmarks/production/<DATE>` as an artifact.
 
 ## API CLI Helpers

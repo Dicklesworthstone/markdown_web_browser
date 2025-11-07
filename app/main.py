@@ -97,6 +97,14 @@ def _snapshot_to_response(snapshot: JobSnapshot) -> JobSnapshotResponse:
     )
 
 
+def _snapshot_events(snapshot: JobSnapshot) -> list[tuple[str, str]]:
+    response = _snapshot_to_response(snapshot)
+    events = [("snapshot", json.dumps(response.model_dump()))]
+    if response.error:
+        events.append(("log", json.dumps({"level": "error", "message": response.error})))
+    return events
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index() -> str:
     """Serve the current web UI shell."""
@@ -160,6 +168,38 @@ async def job_stream(job_id: str, request: Request) -> StreamingResponse:
             JOB_MANAGER.unsubscribe(job_id, queue)
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+@app.get("/jobs/{job_id}/events")
+async def job_events(job_id: str, request: Request) -> StreamingResponse:
+    try:
+        queue = JOB_MANAGER.subscribe(job_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Job not found") from exc
+
+    async def event_generator() -> AsyncIterator[str]:
+        heartbeat = 0
+        try:
+            while True:
+                try:
+                    snapshot = await asyncio.wait_for(queue.get(), timeout=5)
+                except asyncio.TimeoutError:
+                    heartbeat += 1
+                    heartbeat_event = {"event": "heartbeat", "data": {"count": heartbeat}}
+                    yield json.dumps(heartbeat_event) + "\n"
+                    if await request.is_disconnected():
+                        break
+                    continue
+
+                for event_name, payload in _snapshot_events(snapshot):
+                    record = {"event": event_name, "data": json.loads(payload)}
+                    yield json.dumps(record) + "\n"
+                if await request.is_disconnected():
+                    break
+        finally:
+            JOB_MANAGER.unsubscribe(job_id, queue)
+
+    return StreamingResponse(event_generator(), media_type="application/x-ndjson")
 
 
 @app.get("/jobs/demo/links.json")
@@ -258,6 +298,11 @@ def _snapshot_events(snapshot: JobSnapshot) -> list[tuple[str, str]]:
             warnings = manifest.get("warnings")
             if warnings:
                 events.append(("warnings", json.dumps(warnings)))
+            environment = manifest.get("environment")
+            if isinstance(environment, dict):
+                cft_label = environment.get("cft_label") or environment.get("cft_version") or "CfT"
+                playwright_version = environment.get("playwright_version") or "?"
+                events.append(("runtime", f"{cft_label} · Playwright {playwright_version}"))
     artifacts = snapshot.get("artifacts")
     if artifacts:
         events.append(("artifacts", json.dumps(artifacts)))
