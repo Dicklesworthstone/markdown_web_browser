@@ -29,6 +29,11 @@ tooling can be tested.
   PNGs under `artifact/`.
 - Writes a daily `manifest_index.json` aggregating the job IDs, budgets, and timing data,
   plus `summary.md` (Markdown table with per-category budgets vs. observed p95 capture/total).
+  The latest run is always mirrored into:
+  - `benchmarks/production/latest.txt` (date stamp)
+  - `benchmarks/production/latest_manifest_index.json`
+  - `benchmarks/production/latest_summary.md`
+  so dashboards/automation can point at a stable path.
 
 ### Prerequisites
 - `/jobs` API available on `API_BASE_URL` with credentials in `.env`.
