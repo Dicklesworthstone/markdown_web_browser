@@ -242,6 +242,24 @@ body {
   color: #16a34a;
 }
 
+.event-controls {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.5rem;
+}
+
+.event-controls__buttons {
+  display: flex;
+  gap: 0.4rem;
+}
+
+.event-controls__buttons .toolbar__button--small[disabled] {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 .tabs {
   background: var(--surface);
   border: 1px solid var(--border);

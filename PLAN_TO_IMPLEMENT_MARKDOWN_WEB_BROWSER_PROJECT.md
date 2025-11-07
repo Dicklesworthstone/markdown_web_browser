@@ -265,7 +265,8 @@ _2025-11-08 — FuchsiaMountain (bd-rn4) imported the upstream “Automated olmO
 
 _2025-11-08 — WhiteSnow (bd-y5b) hardened `scripts/olmocr_cli.py` optional handling + type hints so `uvx ty check` stays green after importing the upstream CLI helpers (detected server/model flags + stdout filtering)._
 
-_2025-11-08 — WhiteSnow (bd-dwf) added `mdwb warnings tail` to `scripts/mdwb_cli.py` so ops/agents can stream `WARNING_LOG_PATH` with `--count/--json/--follow` options and immediately see sweep stats + validation failures. The CLI job watcher also now emits blocklist/sweep/validation summaries when manifests stream via SSE/NDJSON, and `mdwb jobs webhooks list/add/delete` lets agents inspect/manage `/jobs/{id}/webhooks` from the CLI._
+_2025-11-08 — WhiteSnow (bd-dwf/kxv/xf0) added `mdwb warnings tail` + richer event logging, `mdwb jobs webhooks list/add/delete`, `mdwb fetch --webhook-url …`, and `mdwb jobs artifacts manifest|markdown|links` so agents can manage callbacks and download artifacts entirely via the CLI._
+_2025-11-08 — Follow-up (GreenPond, bd-kxv docs) documented the new `mdwb fetch --webhook-url/--webhook-event` flags and the CLI’s non-zero exit codes/`--json` output for webhook deletion so automation scripts know how to wire the flow end-to-end. Tests: `tests/test_mdwb_cli_fetch.py`, `tests/test_mdwb_cli_webhooks.py`._
 
 ### 9.2 Agent JSON Contract
 ```
@@ -277,6 +278,8 @@ GET  /jobs/{id}/status
 
 ### 9.3 Event Stream
 _2025-11-08 — OrangeMountain (bd-3px/dwf) wired a persistent event log so `/jobs/{id}/events?since=<iso>` serves NDJSON snapshots and `/jobs/{id}/webhooks` registers signed callbacks (header `X-MDWB-Signature`). `scripts/mdwb_cli.py watch` streams the live NDJSON feed (with `--since/--follow` cursors) and falls back to SSE when the endpoint is unavailable; `mdwb events` outputs raw NDJSON for automation. The CLI now enforces required `.env` keys (`API_BASE_URL`, `OLMOCR_SERVER`, `OLMOCR_MODEL`, `OLMOCR_API_KEY`) via `_required_config()`, so ops get an immediate failure instead of silent defaults._
+_2025-11-08 — mdwb fetch gained `--webhook-url`/`--webhook-event` so operators can register callbacks as soon as a job is created; the CLI reuses `/jobs/{id}/webhooks` for each URL and reports failures inline. PinkCat (bd-kxv) added argument validation/tests so `--webhook-event` cannot be used without `--webhook-url` and the helper remains covered by pytest._
+_2025-11-08 — PinkCat (bd-tda) landed the initial replay helper, and PinkDog (bd-tda follow-up) reorganized it under `mdwb jobs replay manifest <manifest.json>` with Typer subgrouping, HTTP/2 toggles, `--json` output, and expanded pytest coverage so `/replay` flows no longer depend on the legacy shell script._
 _2025-11-08 — Added pytest coverage (`tests/test_mdwb_cli_events.py`) for the CLI event-tail helpers so `_iter_event_lines`, `_watch_job_events_pretty`, and `_cursor_from_line` keep working as the NDJSON feed evolves._
 - SSE: `event:state`, `event:tile`, `event:warning`
 - JSONLines: newline-delimited objects mirroring SSE for CLI `--follow`
@@ -285,7 +288,8 @@ _2025-11-08 — Added pytest coverage (`tests/test_mdwb_cli_events.py`) for the 
 - `/jobs/{id}/webhook` registration lets external agents receive signed POST callbacks on state transitions (same payload as SSE events) so automation pipelines do not need to poll.
 - `/jobs/events/subscribe` returns an API key-scoped cursor for bulk consumption; agents can request `filter=warnings` to only receive anomaly events (canvas, overlay, retry spree).
 - CLI supports `mdwb watch <id> --on tile 'echo "tile done"'` for quick local automation, mirroring the webhook payloads.
-_2025-11-08 — BlueHill (bd-0q7/848/woz) fixed duplicate DELETE `/jobs/{id}/webhooks` handlers, added the CLI delete command, and layered FastAPI regression tests covering success + 400/404/422 error paths so webhook management stays reliable._
+_2025-11-08 — BlueHill (bd-0q7/848/woz/lud/9qo/tcf) fixed duplicate DELETE `/jobs/{id}/webhooks` handlers, added CLI helpers for list/add/delete (all supporting `--json` plus consistent error exits), and layered FastAPI regression tests covering success + 400/404/422 error paths so webhook management stays reliable._
+_2025-11-08 — PinkCat (bd-us8) refactored the CLI webhook delete flow into a helper, surfaced the request payload in `--json` output, and expanded pytest coverage (id vs url + error cases) so `mdwb jobs webhooks delete` matches the Plan §9 contract._
 
 ---
 
@@ -616,6 +620,7 @@ _2025-11-08 — PinkCreek (bd-ug0) designing ops automation: smoke/latency job r
   - `HighCaptureLatency`: p95 capture_duration > 120s for 15 minutes.
   - `OCRThrottleSpike`: `ocr_retry_total{reason="throttle"}` rate > 5/min.
   - `SSEDrop`: SSE heartbeat gap > 12s (monitor via HTMX ping endpoint).
+_2025-11-08 — WhiteCastle (bd-7sx) wired Prometheus instrumentation (`prometheus-fastapi-instrumentator` + background exporter on `PROMETHEUS_PORT`) and custom metrics covering capture/OCR/stitch histograms, warning/blocklist counters, SSE heartbeats, and job completion totals. `/metrics` now exposes the same registry for local smoke checks and CI._
 
 ### 20.3 Release & Regression Process
 - **Chrome for Testing pinning:** upgrade CfT monthly; run the viewport sweep regression test plus the full-page omission golden test before merging. Record the CfT tag in `manifest.json` and release notes.
@@ -726,6 +731,9 @@ florence-2-base:
 ```bash
 mdwb fetch https://example.com --out out.md --model olmOCR-2-7B-1025-FP8 \
   --events | jq --unbuffered 'select(.event=="warning")'
+
+# Replay a stored manifest with validation/output control
+mdwb jobs replay manifest cache/example.com/run-2025-11-08/manifest.json --json
 ```
 
 _2025-11-08 — PinkCreek wired `scripts/mdwb_cli.py` into the shared `.env` config so demo commands (snapshot/links/stream) automatically use `API_BASE_URL` + `MDWB_API_KEY`; override with `--api-base` when pointing at staging._
@@ -740,6 +748,7 @@ _2025-11-08 — PinkCreek (bd-ug0) spinning up nightly smoke + weekly latency au
 - `scripts/run_smoke.py` orchestrates nightly captures per `benchmarks/production_set.json` (writing `manifest_index.json` under `benchmarks/production/<date>/` and refreshing `weekly_summary.json`). See `docs/ops.md` for the runbook + verification checklist.
 - Use `--dry-run` to exercise the smoke pipeline without hitting `/jobs`; pair with `--seed` (defaults to `0`) to keep synthetic manifests deterministic so dashboard diffs stay stable. Scope to targeted slices with `--category <name>` (repeatable) when only certain sets need reruns. The script also mirrors the latest run into `benchmarks/production/latest_{manifest_index,summary}.json|md`, and `scripts/show_latest_smoke.py` now prints the summary, manifest index, aggregated metrics, and rolling weekly budget table via `uv run python scripts/show_latest_smoke.py --manifest --metrics --weekly --limit 5`. Set `MDWB_SMOKE_ROOT=/path/to/runs` (or pass `--root`) when the pointer files live outside `benchmarks/production/` so ops can target CI artifacts without reshuffling files, and pass `--json` whenever automation/dashboards need the data in machine-readable form. `scripts/show_latest_smoke.py check --root benchmarks/production --json` exits non-zero if any pointer is missing (and returns a structured payload), making it easy to gate CI/dashboards. _2025-11-08 — BlueHill (bd-h2m/3pr/a2e/2xq) added the weekly view + MDWB_SMOKE_ROOT/`--root` override, JSON output, and the text/JSON check command so ops can inspect or validate summary/manifest/weekly data from one CLI invocation._
 - Use `--dry-run` to exercise the smoke pipeline without hitting `/jobs`; pair with `--seed` (defaults to `0`) to keep synthetic manifests deterministic so dashboard diffs stay stable. Scope to targeted slices with `--category <name>` (repeatable) when only certain sets need reruns. The script also mirrors the latest run into `benchmarks/production/latest_{manifest_index,summary}.json|md`, and `scripts/show_latest_smoke.py --root /path/to/run --manifest --metrics --weekly` prints those pointer files on demand so dashboards and humans can grab the freshest run without hunting for dates.
+  When a rerun happens outside the standard pipeline, call `scripts/update_smoke_pointers.py <run-dir>` (with `--root`/`--weekly-source` as needed) to refresh the `latest_*` pointers.
 - _2025-11-08 — BlueCreek (bd-0rn) added `tests/test_show_latest_smoke.py` so the CLI pointer/manifest/weekly output is covered whenever PLAN §22 evolves._
 
 Focus on a curated set of real customer-style URLs instead of synthetic benchmarks. Maintain `benchmarks/production_set.json` listing each URL, category, and target latency.

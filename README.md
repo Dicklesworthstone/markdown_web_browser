@@ -37,9 +37,11 @@ See `PLAN_TO_IMPLEMENT_MARKDOWN_WEB_BROWSER_PROJECT.md` §§2–5, 19 for the fu
 
 ## CLI cheatsheet (`scripts/mdwb_cli.py`)
 - `fetch <url> [--watch]` — enqueue + optionally stream Markdown as tiles finish.
+- `fetch <url> --webhook-url https://... [--webhook-event DONE --webhook-event FAILED]` — register callbacks right after the job is created.
 - `show <job-id>` — dump the latest job snapshot (state, warnings, manifest paths).
 - `stream <job-id>` — follow the SSE feed.
 - `watch <job-id>` / `events <job-id> --follow --since <ISO>` — tail the `/jobs/{id}/events` NDJSON log.
+- `jobs replay manifest <manifest.json>` — resubmit a stored manifest via `/replay` with validation/JSON output support.
 - `warnings --count 50` — tail `ops/warnings.jsonl` for capture/blocklist incidents.
 - `dom links --job-id <id>` — render the stored `links.json` (anchors/forms/headings/meta).
 - `demo snapshot|stream|events` — exercise the demo endpoints without hitting a live pipeline.
@@ -81,8 +83,9 @@ Additional expectations (per PLAN §§14, 19.10, 22):
 - `scripts/run_smoke.py` — nightly URL set capture + manifest/latency aggregation.
 - `scripts/show_latest_smoke.py` — quick pointers to the latest smoke outputs.
 - `scripts/olmocr_cli.py` + `docs/olmocr_cli.md` — hosted olmOCR orchestration/diagnostics.
-- `scripts/replay_job.sh` — re-run a job with a stored manifest via `POST /replay`.
-- Prometheus metrics exposed via FastAPI (`prometheus-client`); see `ops/dashboards.json` & `ops/alerts.md`.
+- `mdwb jobs replay manifest <manifest.json>` — re-run a job with a stored manifest via `POST /replay` (accepts `--api-base`, `--http2`, `--json`); keep `scripts/replay_job.sh` around for legacy automation until everything points at the CLI.
+- `scripts/update_smoke_pointers.py <run-dir> --root benchmarks/production` — refresh `latest_summary.md`, `latest_manifest_index.json`, and `latest_metrics.json` after ad-hoc smoke runs so dashboards point at the right data (add `--weekly-source` when overriding the rolling summary).
+- Prometheus metrics now cover capture/OCR/stitch durations, warning/blocklist counts, job completions, and SSE heartbeats via `prometheus-fastapi-instrumentator`. Scrape `/metrics` on the API port or hit the background exporter on `PROMETHEUS_PORT` (default 9000); docs/ops.md lists the metric names + alert hooks.
 
 ### Handy commands
 ```bash
@@ -93,7 +96,7 @@ uv run python scripts/check_env.py
 uv run python scripts/mdwb_cli.py demo stream
 
 # Replay an existing manifest
-scripts/replay_job.sh cache/example.com/.../manifest.json
+uv run python scripts/mdwb_cli.py jobs replay manifest cache/example.com/.../manifest.json
 
 # Tail warning log via CLI
 uv run python scripts/mdwb_cli.py warnings --count 25
@@ -110,7 +113,7 @@ uv run python scripts/run_smoke.py --date $(date -u +%Y-%m-%d) --category docs_a
 - `dom_snapshot.html` — raw DOM capture used for link diffs and hybrid recovery (when enabled).
 - `bundle.tar.zst` — optional tarball for incidents/export (`Store.build_bundle`).
 
-Use `scripts/replay_job.sh` or `/jobs/{id}/artifact/...` endpoints to fetch any of the above for debugging.
+Use `mdwb jobs replay manifest …` (or `/jobs/{id}/artifact/...`) to reproduce a job locally and fetch its artifacts for debugging.
 
 ## Communication & task tracking
 - **Beads** (`bd ...`) track every feature/bug (map bead IDs to Plan sections in Agent Mail threads).

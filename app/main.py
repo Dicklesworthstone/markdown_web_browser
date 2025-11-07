@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator, Mapping, cast
@@ -11,7 +13,10 @@ from typing import Any, AsyncIterator, Mapping, cast
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from prometheus_client import start_http_server
+from prometheus_fastapi_instrumentator import Instrumentator
 
+from app import metrics
 from app.dom_links import blend_dom_with_ocr, demo_dom_links, demo_ocr_links, serialize_links
 from app.jobs import JobManager, JobSnapshot, JobState, build_signed_webhook_sender
 from app.schemas import (
@@ -30,8 +35,43 @@ from app.store import build_store
 BASE_DIR = Path(__file__).resolve().parent.parent
 WEB_ROOT = BASE_DIR / "web"
 
-app = FastAPI(title="Markdown Web Browser")
+LOGGER = logging.getLogger(__name__)
+_PROMETHEUS_EXPORTER_STARTED = False
+
+
+async def _start_prometheus_exporter() -> None:
+    """Expose Prometheus metrics on the configured auxiliary port."""
+
+    global _PROMETHEUS_EXPORTER_STARTED
+    if _PROMETHEUS_EXPORTER_STARTED:
+        return
+    port = settings.telemetry.prometheus_port
+    if port <= 0:
+        return
+    try:
+        start_http_server(port)
+    except OSError as exc:  # pragma: no cover - system dependent
+        LOGGER.warning("Prometheus exporter failed to bind on port %s: %s", port, exc)
+        return
+    _PROMETHEUS_EXPORTER_STARTED = True
+    LOGGER.info("Prometheus exporter listening on port %s", port)
+
+
+@asynccontextmanager
+async def _lifespan(_: FastAPI):
+    await _start_prometheus_exporter()
+    yield
+
+
+app = FastAPI(title="Markdown Web Browser", lifespan=_lifespan)
 app.mount("/static", StaticFiles(directory=WEB_ROOT), name="static")
+instrumentator = Instrumentator(should_instrument_requests_inprogress=True)
+instrumentator.instrument(app)
+try:
+    instrumentator.expose(app, include_in_schema=False, should_gzip=True)
+except ValueError:  # pragma: no cover - already registered
+    LOGGER.debug("Prometheus /metrics endpoint already exposed")
+
 JOB_MANAGER = JobManager(webhook_sender=build_signed_webhook_sender(settings.webhook_secret))
 store = build_store()
 
@@ -154,6 +194,7 @@ async def job_stream(job_id: str, request: Request) -> StreamingResponse:
                     snapshot = await asyncio.wait_for(queue.get(), timeout=5)
                 except asyncio.TimeoutError:
                     heartbeat += 1
+                    metrics.increment_sse_heartbeat()
                     yield f"event: log\ndata: <li>Heartbeat {heartbeat}: waiting for updates…</li>\n\n"
                     if await request.is_disconnected():
                         break

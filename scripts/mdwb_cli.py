@@ -29,8 +29,12 @@ console = Console()
 cli = typer.Typer(help="Interact with the Markdown Web Browser API")
 demo_cli = typer.Typer(help="Demo commands hitting the built-in /jobs/demo endpoints.")
 cli.add_typer(demo_cli, name="demo")
-jobs_cli = typer.Typer(help="Job utilities (events/watch).")
+jobs_cli = typer.Typer(help="Job utilities (events/watch/replay).")
 cli.add_typer(jobs_cli, name="jobs")
+jobs_replay_cli = typer.Typer(help="Replay helpers (manifest, future inputs).")
+jobs_cli.add_typer(jobs_replay_cli, name="replay")
+jobs_artifacts_cli = typer.Typer(help="Download manifests/markdown/links for jobs.")
+jobs_cli.add_typer(jobs_artifacts_cli, name="artifacts")
 jobs_webhooks_cli = typer.Typer(help="Manage job webhooks.")
 jobs_cli.add_typer(jobs_webhooks_cli, name="webhooks")
 warnings_cli = typer.Typer(help="Warning/blocklist log helpers.")
@@ -256,8 +260,21 @@ def fetch(
     watch: bool = typer.Option(False, "--watch/--no-watch", help="Stream job progress after submission"),
     raw: bool = typer.Option(False, "--raw", help="When watching, print raw NDJSON lines"),
     http2: bool = typer.Option(True, "--http2/--no-http2"),
+    webhook_url: Optional[list[str]] = typer.Option(
+        None,
+        "--webhook-url",
+        help="Register this webhook URL immediately after job creation (repeat to add multiple).",
+    ),
+    webhook_event: Optional[list[str]] = typer.Option(
+        None,
+        "--webhook-event",
+        help="States that trigger the registered webhooks (defaults to DONE/FAILED).",
+    ),
 ) -> None:
     """Submit a new capture job and optionally stream progress."""
+
+    if webhook_event and not webhook_url:
+        raise typer.BadParameter("Use --webhook-event together with --webhook-url.", param_hint="--webhook-event")
 
     settings = _resolve_settings(api_base)
     client = _client(settings, http2=http2)
@@ -273,11 +290,20 @@ def fetch(
     console.print(f"[green]Created job {job.get('id')}[/]")
     _print_job(job)
 
-    if watch and job.get("id"):
-        console.rule(f"Streaming {job['id']}")
+    job_id = job.get("id")
+    if job_id and webhook_url:
+        _register_webhooks_for_job(
+            client,
+            job_id,
+            urls=webhook_url,
+            events=webhook_event,
+        )
+
+    if watch and job_id:
+        console.rule(f"Streaming {job_id}")
         try:
             _watch_job_events_pretty(
-                job["id"],
+                job_id,
                 settings,
                 cursor=None,
                 follow=True,
@@ -288,7 +314,7 @@ def fetch(
             console.print(
                 f"[yellow]Events feed unavailable ({exc}); falling back to SSE stream.[/]"
             )
-            _stream_job(job["id"], settings, raw=raw)
+            _stream_job(job_id, settings, raw=raw)
 
 
 @cli.command()
@@ -455,11 +481,69 @@ def _option_value(value):  # noqa: ANN001
     return value
 
 
+def _delete_job_webhooks(
+    client: httpx.Client,
+    job_id: str,
+    *,
+    webhook_id: int | None,
+    url: str | None,
+) -> tuple[httpx.Response, dict[str, Any]]:
+    payload: dict[str, Any] = {}
+    if webhook_id is not None:
+        payload["id"] = webhook_id
+    if url:
+        payload["url"] = url
+    response = client.request("DELETE", f"/jobs/{job_id}/webhooks", json=payload or None)
+    return response, payload
+
+
 def _parse_json_payload(payload: str) -> Any:
     try:
         return json.loads(payload)
     except Exception:  # pragma: no cover - best effort
         return None
+
+
+def _write_text_output(content: str, path: str | None, *, description: str) -> None:
+    if path:
+        out_path = Path(path)
+        out_path.write_text(content, encoding="utf-8")
+        console.print(f"[green]Saved {description} to {out_path}[/]")
+    else:
+        console.print(content)
+
+
+def _write_binary_output(content: bytes, path: str | None, *, description: str) -> None:
+    if path:
+        out_path = Path(path)
+        out_path.write_bytes(content)
+        console.print(f"[green]Saved {description} to {out_path}[/]")
+    else:
+        console.print(content.decode("utf-8", errors="ignore"))
+
+
+def _register_webhooks_for_job(
+    client: httpx.Client,
+    job_id: str,
+    *,
+    urls: list[str],
+    events: Optional[list[str]],
+) -> None:
+    if not urls:
+        return
+    successes = 0
+    for url in urls:
+        payload: dict[str, Any] = {"url": url}
+        if events:
+            payload["events"] = events
+        response = client.post(f"/jobs/{job_id}/webhooks", json=payload)
+        if response.status_code >= 400:
+            detail = _extract_detail(response) or response.text or "unknown error"
+            console.print(f"[red]Failed to register webhook {url}: {detail}[/]")
+            continue
+        successes += 1
+    if successes:
+        console.print(f"[green]Registered {successes} webhook(s) for {job_id}.[/]")
 
 
 def _cursor_from_line(line: str, fallback: str | None) -> str | None:
@@ -746,7 +830,7 @@ def dom_links(
 def jobs_webhooks_list(
     job_id: str = typer.Argument(..., help="Job identifier"),
     api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
-    json_output: bool = typer.Option(False, "--json", help="Print raw JSON instead of a table."),
+    json_output: bool = typer.Option(False, "--json", help="Emit structured JSON instead of a table."),
 ) -> None:
     """List registered webhooks for a job."""
 
@@ -754,12 +838,12 @@ def jobs_webhooks_list(
     client = _client(settings)
     response = client.get(f"/jobs/{job_id}/webhooks")
     if response.status_code == 404:
-        console.print(f"[red]Job {job_id} not found.[/]")
-        return
+        detail = _extract_detail(response) or f"Job {job_id} not found."
+        _print_webhook_list_error(detail, job_id, json_output)
     response.raise_for_status()
     data = response.json()
     if json_output:
-        console.print_json(data=data)
+        console.print_json(data={"status": "ok", "job_id": job_id, "webhooks": data})
         return
     _print_webhooks(data)
 
@@ -775,6 +859,7 @@ def jobs_webhooks_add(
         "-e",
         help="Job state to trigger the webhook (repeat flag for multiple states). Defaults to DONE+FAILED.",
     ),
+    json_output: bool = typer.Option(False, "--json/--no-json", help="Emit JSON payload instead of text."),
 ) -> None:
     """Register a webhook for a job."""
 
@@ -784,14 +869,16 @@ def jobs_webhooks_add(
     if event:
         payload["events"] = event
     response = client.post(f"/jobs/{job_id}/webhooks", json=payload)
-    if response.status_code == 404:
-        console.print(f"[red]Job {job_id} not found.[/]")
-        return
-    if response.status_code == 400:
-        detail = response.json().get("detail", response.text)
-        console.print(f"[red]Webhook rejected:[/red] {detail}")
-        return
+    if response.status_code in {400, 404}:
+        detail = _extract_detail(response) or (
+            "Job not found." if response.status_code == 404 else "Webhook rejected."
+        )
+        _print_webhook_add_error(detail, job_id, json_output)
     response.raise_for_status()
+    body = response.json()
+    if json_output:
+        console.print_json(data={"status": "ok", **body})
+        return
     console.print(f"[green]Registered webhook for {job_id} ({url}).[/] Trigger states: {', '.join(event) if event else 'DONE, FAILED'}.")
 
 
@@ -801,6 +888,7 @@ def jobs_webhooks_delete(
     api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
     webhook_id: Optional[int] = typer.Option(None, "--id", help="Webhook record id"),
     url: Optional[str] = typer.Option(None, "--url", help="Webhook URL to delete"),
+    json_output: bool = typer.Option(False, "--json/--no-json", help="Emit JSON payload instead of text."),
 ) -> None:
     """Remove a webhook subscription from a job."""
 
@@ -811,21 +899,140 @@ def jobs_webhooks_delete(
 
     settings = _resolve_settings(api_base)
     client = _client(settings)
-    payload: dict[str, Any] = {}
-    if webhook_id is not None:
-        payload["id"] = webhook_id
-    if url:
-        payload["url"] = url
-    response = client.request("DELETE", f"/jobs/{job_id}/webhooks", json=payload)
+    response, payload = _delete_job_webhooks(client, job_id, webhook_id=webhook_id, url=url)
     if response.status_code == 404:
-        detail = _extract_detail(response)
-        console.print(f"[red]{detail or 'Webhook or job not found.'}[/]")
-        return
+        detail = _extract_detail(response) or "Webhook or job not found."
+        _print_delete_error(detail, job_id, json_output)
     if response.status_code == 400:
-        detail = _extract_detail(response)
-        console.print(f"[red]Webhook deletion rejected:[/red] {detail}")
-        return
+        detail = _extract_detail(response) or "Webhook deletion rejected."
+        _print_delete_error(detail, job_id, json_output)
     response.raise_for_status()
     body = response.json()
-    body.get("deleted", body.get("job_id"))
+    if json_output:
+        console.print_json(data={"status": "ok", **body, "request": payload})
+        return
     console.print(f"[green]Deleted {body.get('deleted', 0)} webhook(s) from {job_id}.[/]")
+
+
+@jobs_artifacts_cli.command("manifest")
+def jobs_manifest(
+    job_id: str = typer.Argument(..., help="Job identifier"),
+    api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
+    out: Optional[str] = typer.Option(None, "--out", help="Write manifest JSON to this path"),
+    pretty: bool = typer.Option(True, "--pretty/--raw", help="Pretty-print JSON before writing."),
+) -> None:
+    settings = _resolve_settings(api_base)
+    client = _client(settings)
+    response = client.get(f"/jobs/{job_id}/manifest.json")
+    if response.status_code == 404:
+        console.print(f"[red]Job {job_id} not found.[/]")
+        raise typer.Exit(code=1)
+    response.raise_for_status()
+    text = response.text
+    if pretty:
+        parsed = _parse_json_payload(text)
+        if parsed is not None:
+            text = json.dumps(parsed, indent=2)
+    _write_text_output(text, out, description="manifest")
+
+
+@jobs_artifacts_cli.command("markdown")
+def jobs_markdown(
+    job_id: str = typer.Argument(..., help="Job identifier"),
+    api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
+    out: Optional[str] = typer.Option(None, "--out", help="Write markdown to this path"),
+) -> None:
+    settings = _resolve_settings(api_base)
+    client = _client(settings)
+    response = client.get(f"/jobs/{job_id}/result.md")
+    if response.status_code == 404:
+        console.print(f"[red]Job {job_id} not found.[/]")
+        raise typer.Exit(code=1)
+    response.raise_for_status()
+    _write_text_output(response.text, out, description="markdown")
+
+
+@jobs_artifacts_cli.command("links")
+def jobs_links(
+    job_id: str = typer.Argument(..., help="Job identifier"),
+    api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
+    out: Optional[str] = typer.Option(None, "--out", help="Write links JSON to this path"),
+    pretty: bool = typer.Option(True, "--pretty/--raw", help="Pretty-print JSON before writing."),
+) -> None:
+    settings = _resolve_settings(api_base)
+    client = _client(settings)
+    response = client.get(f"/jobs/{job_id}/links.json")
+    if response.status_code == 404:
+        console.print(f"[red]Job {job_id} not found.[/]")
+        raise typer.Exit(code=1)
+    response.raise_for_status()
+    text = response.text
+    if pretty:
+        parsed = _parse_json_payload(text)
+        if parsed is not None:
+            text = json.dumps(parsed, indent=2)
+    _write_text_output(text, out, description="links")
+
+
+@jobs_replay_cli.command("manifest")
+def jobs_replay_manifest(
+    manifest_path: Path = typer.Argument(
+        ...,
+        exists=True,
+        dir_okay=False,
+        readable=True,
+        resolve_path=True,
+        help="Path to manifest.json",
+    ),
+    api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
+    http2: bool = typer.Option(True, "--http2/--no-http2", help="Use HTTP/2 for the replay request."),
+    json_output: bool = typer.Option(False, "--json/--no-json", help="Emit JSON instead of text output."),
+) -> None:
+    """Replay a capture manifest via POST /replay."""
+
+    try:
+        manifest_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise typer.BadParameter(f"Manifest is not valid JSON ({exc})", param_hint="manifest_path") from exc
+
+    settings = _resolve_settings(api_base)
+    client = _client(settings, http2=http2)
+    response = client.post("/replay", json={"manifest": manifest_payload})
+    if response.status_code >= 400:
+        detail = _extract_detail(response) or response.text or f"HTTP {response.status_code}"
+        if json_output:
+            console.print_json(data={"status": "error", "detail": detail})
+        else:
+            console.print(f"[red]Replay failed:[/] {detail}")
+        raise typer.Exit(1)
+
+    job = response.json()
+    if json_output:
+        console.print_json(data={"status": "ok", "job": job})
+        return
+    console.print("[green]Replay submitted.[/]")
+    _print_job(job)
+
+
+def _print_delete_error(detail: str, job_id: str, json_output: bool) -> None:
+    if json_output:
+        console.print_json(data={"status": "error", "job_id": job_id, "detail": detail})
+    else:
+        console.print(f"[red]{detail}[/]")
+    raise typer.Exit(1)
+
+
+def _print_webhook_add_error(detail: str, job_id: str, json_output: bool) -> None:
+    if json_output:
+        console.print_json(data={"status": "error", "job_id": job_id, "detail": detail})
+    else:
+        console.print(f"[red]{detail}[/]")
+    raise typer.Exit(1)
+
+
+def _print_webhook_list_error(detail: str, job_id: str, json_output: bool) -> None:
+    if json_output:
+        console.print_json(data={"status": "error", "job_id": job_id, "detail": detail})
+    else:
+        console.print(f"[red]{detail}[/]")
+    raise typer.Exit(1)

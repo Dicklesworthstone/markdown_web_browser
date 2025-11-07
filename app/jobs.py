@@ -18,13 +18,14 @@ import logging
 
 import httpx
 
+from app import metrics
 from app.capture import CaptureConfig, CaptureResult, capture_tiles
-from app.ocr_client import OCRRequest, submit_tiles
-from app.stitch import stitch_markdown
 from app.dom_links import extract_links_from_dom, serialize_links
+from app.ocr_client import OCRRequest, submit_tiles
 from app.schemas import JobCreateRequest, ManifestMetadata
 from app.settings import Settings, settings as global_settings
 from app.store import Store, build_store
+from app.stitch import stitch_markdown
 from app.warning_log import append_warning_log
 
 LOGGER = logging.getLogger(__name__)
@@ -210,6 +211,9 @@ class JobManager:
             return
         snapshot["state"] = state
         self._broadcast(job_id)
+        normalized_state = state.value if isinstance(state, JobState) else str(state)
+        if normalized_state in (JobState.DONE.value, JobState.FAILED.value):
+            metrics.record_job_completion(normalized_state)
 
     def _set_error(self, job_id: str, message: str | None) -> None:
         snapshot = self._snapshots.get(job_id)
@@ -413,6 +417,7 @@ async def execute_capture_job(
         markdown, ocr_ms, stitch_ms = await _run_ocr_pipeline(job_id=job_id, capture_result=capture_result)
         capture_result.manifest.ocr_ms = ocr_ms
         capture_result.manifest.stitch_ms = stitch_ms
+        metrics.observe_manifest_metrics(capture_result.manifest)
         append_warning_log(job_id=job_id, url=url, manifest=capture_result.manifest)
         dom_snapshot = getattr(capture_result, "dom_snapshot", None)
         dom_path = None
@@ -497,8 +502,20 @@ def _persist_pending_webhooks(store: Store, pending: Sequence[dict[str, Any]], j
 
 
 def _webhook_matches(entry: dict[str, Any], webhook_id: int | None, url: str | None) -> bool:
-    if url and entry.get("url") == url:
-        return True
-    if webhook_id is not None and entry.get("id") == webhook_id:
-        return True
+    """Return True when the entry satisfies the selector passed by the caller.
+
+    When both ``webhook_id`` and ``url`` are provided we require *both* to match,
+    mirroring the SQL filters in :meth:`Store.delete_webhooks`. This prevents
+    removing cached entries that the persistence layer rejected (keeping the
+    in-memory view and database in sync).
+    """
+
+    entry_id = entry.get("id")
+    entry_url = entry.get("url")
+    if webhook_id is not None and url:
+        return entry_id == webhook_id and entry_url == url
+    if webhook_id is not None:
+        return entry_id == webhook_id
+    if url:
+        return entry_url == url
     return False

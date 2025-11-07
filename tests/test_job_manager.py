@@ -315,6 +315,30 @@ def test_delete_webhook_removes_records(tmp_path: Path):
     assert store.list_webhooks(job_id) == []
 
 
+@pytest.mark.asyncio
+async def test_delete_webhook_requires_both_identifiers(tmp_path: Path):
+    """When both id and url are provided, both must match before removal."""
+
+    config = StorageConfig(cache_root=tmp_path / "cache", db_path=tmp_path / "runs.db")
+    store = Store(config)
+    manager = JobManager(store=store, runner=_fake_runner)
+    snapshot = await manager.create_job(JobCreateRequest(url="https://example.com/web"))
+    job_id = snapshot["id"]
+    await manager._tasks[job_id]
+    manager.register_webhook(job_id, url="https://example.com/hook", events=[JobState.DONE.value])
+    records = store.list_webhooks(job_id)
+    assert len(records) == 1
+    webhook_id = records[0].id
+    assert webhook_id is not None
+
+    deleted = manager.delete_webhook(job_id, webhook_id=webhook_id + 1, url="https://example.com/hook")
+
+    assert deleted == 0
+    # Store still has the record because the ID mismatch prevented deletion.
+    assert len(store.list_webhooks(job_id)) == 1
+    assert manager._webhooks[job_id], "cached webhook list should remain intact"
+
+
 class _DeleteStubStore:
     def __init__(self) -> None:
         self.calls: list[tuple[str, int | None, str | None]] = []

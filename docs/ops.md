@@ -105,6 +105,29 @@ Publish the summary in Monday’s ops update and attach the most recent
 - Rotate/ship the log via your usual log aggregation tooling; the file is plain JSONL
   and safe to ingest into Loki/Elastic/GCS.
 
+## Prometheus Metrics
+
+- FastAPI is instrumented via `prometheus-fastapi-instrumentator`; scrape `GET /metrics`
+  on the API host for request-level stats. A background exporter also listens on
+  `PROMETHEUS_PORT` (default `9000`) so dashboards can point at a dedicated scrape port when
+  the API is behind auth.
+- Custom metrics include:
+  - `mdwb_capture_duration_seconds`, `mdwb_ocr_duration_seconds`, `mdwb_stitch_duration_seconds`
+    (histograms for stage timing telemetry, already bucketed for the alert budgets in PLAN §20).
+  - `mdwb_capture_warnings_total{code="…"}` and `mdwb_blocklist_hits_total{selector="…"}` so
+    noisy overlays or duplicate seams trigger dashboards without parsing manifests.
+  - `mdwb_job_completions_total{state="DONE|FAILED"}` to track success rates and
+    `mdwb_sse_heartbeat_total` to alert on stalled `/jobs/{id}/stream` feeds.
+- Quick smoke check:
+
+```
+curl -s http://localhost:8000/metrics | grep mdwb_capture_duration_seconds
+curl -s http://localhost:9000/metrics | head -n 5  # dedicated Prom port
+```
+
+Tie the new counters into `ops/dashboards.json`/`ops/alerts.md` so Grafana can page when
+warning spikes, job failures, or SSE stalls exceed their budgets.
+
 ## Automation Hooks
 - Schedule the nightly job via cron or the CI runner (e.g., 02:00 UTC) and archive
   the resulting `benchmarks/production/<DATE>` directory as a build artifact.
@@ -125,8 +148,10 @@ Publish the summary in Monday’s ops update and attach the most recent
 - The CLI now enforces the required `.env` keys (`API_BASE_URL`, `OLMOCR_SERVER`,
   `OLMOCR_MODEL`, `OLMOCR_API_KEY`) via `_required_config()`. If one is missing it fails
   fast with a clear error—fill in `.env` (or pass `--api-base/--server`) before rerunning.
-- Webhook helpers: `mdwb jobs webhooks list`, `... add`, and the new `... delete --id/--url`
-  manage `/jobs/{id}/webhooks` without hand-written curl calls.
+- Webhook helpers: `mdwb jobs webhooks list`, `... add`, and `... delete --id/--url`
+  manage `/jobs/{id}/webhooks` without hand-written curl calls. Each command accepts `--json`
+  when automation needs structured output (`list` returns `{status: \"ok\", webhooks:[...]}` while `add`/`delete`
+  respond with `{status: \"ok\"|\"error\", ...}` and exit non-zero on failures) so CI/pipelines can branch on the result immediately.
 - Override the API base temporarily via `--api-base https://staging.mdwb.internal`
   if you need to target a different environment.
 - `uv run python scripts/mdwb_cli.py watch <job-id>` streams the human-friendly
@@ -136,9 +161,21 @@ Publish the summary in Monday’s ops update and attach the most recent
 - The Events tab/CLI watchers now show blocklist, sweep, and validation events emitted
   directly by the SSE feed, so the new manifest breadcrumbs surface even when the
   Manifest tab isn’t open.
+- When you run smoke manually (e.g., re-testing a single date), refresh the pointer files via
+  `uv run python scripts/update_smoke_pointers.py <run-dir> --root benchmarks/production`
+  (add `--weekly-source benchmarks/production/weekly_summary.json` if you need to override the weekly summary). This keeps
+  `latest_summary.md`, `latest_manifest_index.json`, and `latest_metrics.json` aligned with the run that ops dashboards should display.
 - `uv run python scripts/mdwb_cli.py events <job-id> --follow` tails the raw
   `/jobs/{id}/events` NDJSON feed for pipelines; combine with `--since` to resume
   from the last timestamp when running in cron or CI.
-- `uv run python scripts/mdwb_cli.py jobs webhooks list <job-id>` / `... add ...` / `... delete ...`
-  lets agents inspect/manage webhook callbacks per PLAN §4 without issuing manual
-  curl requests; repeat `--event` to subscribe to additional job states.
+- `uv run python scripts/mdwb_cli.py fetch <url> --webhook-url https://example.com/hook`
+  registers the webhook immediately after the job ID is created (repeat flag to add more);
+  add `--webhook-event <STATE>` to override the default DONE/FAILED trigger set. Failed registrations
+  are logged inline (CLI still returns zero so captures proceed), and you can re-run
+  `mdwb jobs webhooks add` later if a selector needs to be corrected.
+- `uv run python scripts/mdwb_cli.py jobs artifacts manifest <job-id> --out manifest.json`
+  (or `markdown`, `links`) downloads the persisted files without curl; use `--pretty/--raw`
+  to control JSON formatting when writing to disk.
+- `uv run python scripts/mdwb_cli.py jobs replay manifest <manifest.json>` replays a saved manifest
+  via `POST /replay` with path validation, HTTP/2 toggles, and optional JSON output. The legacy
+  `scripts/replay_job.sh` script remains for legacy automation but new workflows should prefer the CLI.

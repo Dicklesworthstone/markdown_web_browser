@@ -638,6 +638,8 @@ function initEventsPanel(root) {
     return null;
   }
   const statusEl = root.querySelector('[data-events-status]');
+  const pauseButton = root.querySelector('[data-events-pause]');
+  const resumeButton = root.querySelector('[data-events-resume]');
   let abortController = null;
   let streamTask = null;
   let activeJobId = root.dataset.jobId || 'demo';
@@ -811,17 +813,28 @@ function initEventsPanel(root) {
     }
   };
 
-  const connect = (jobId) => {
+  const connect = (jobId, { resetCursor = true } = {}) => {
     activeJobId = jobId || 'demo';
-    cursor = null;
+    if (resetCursor) {
+      cursor = null;
+    }
     resetLog();
     stop();
     abortController = new AbortController();
     setStatus(`Connecting to events for ${activeJobId}…`, 'pending');
+    if (pauseButton) {
+      pauseButton.disabled = false;
+    }
+    if (resumeButton) {
+      resumeButton.disabled = true;
+    }
     streamTask = streamLoop().catch((error) => {
       if (!abortController?.signal.aborted) {
         console.error('Events stream crashed', error);
         setStatus(error.message || 'Events feed error', 'error');
+        if (resumeButton) {
+          resumeButton.disabled = false;
+        }
       }
     });
   };
@@ -832,7 +845,25 @@ function initEventsPanel(root) {
       abortController = null;
     }
     streamTask = null;
+    if (pauseButton) {
+      pauseButton.disabled = true;
+    }
+    if (resumeButton) {
+      resumeButton.disabled = false;
+    }
   };
+
+  pauseButton?.addEventListener('click', () => {
+    stop();
+    setStatus('Stream paused.', 'warning');
+  });
+
+  resumeButton?.addEventListener('click', () => {
+    if (resumeButton.disabled) {
+      return;
+    }
+    connect(activeJobId, { resetCursor: false });
+  });
 
   return { connect, stop };
 }

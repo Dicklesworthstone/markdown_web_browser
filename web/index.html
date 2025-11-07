@@ -178,7 +178,17 @@
           </article>
           <article class="tab-panel" data-tab-panel="events" hidden>
             <h2>Event Feed</h2>
-            <p class="events-status" data-events-status>Attach to a job to stream event history.</p>
+            <div class="event-controls">
+              <p class="events-status" data-events-status>Attach to a job to stream event history.</p>
+              <div class="event-controls__buttons">
+                <button type="button" class="toolbar__button toolbar__button--small" data-events-pause>
+                  Pause Stream
+                </button>
+                <button type="button" class="toolbar__button toolbar__button--small" data-events-resume disabled>
+                  Resume Stream
+                </button>
+              </div>
+            </div>
             <ul class="event-feed" id="events-log" data-events-log></ul>
           </article>
         </div>

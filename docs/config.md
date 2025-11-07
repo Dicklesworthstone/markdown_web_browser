@@ -53,7 +53,7 @@ print(settings.ocr.server_url)
 | `SCROLL_SHRINK_RETRIES` | `2` | Number of times to re-sweep when SPA height shrinks mid-run. Logged in manifest stats. |
 | `SCREENSHOT_MASK_SELECTORS` | *(empty)* | Comma-separated selectors masked during screenshots (cookie banners, tickers). |
 | `SCREENSHOT_STYLE_HASH` | auto-derived if blank | Hash of viewport/mask settings included in manifests & bug reports. |
-| `PROMETHEUS_PORT` | `9000` | Port for the Prometheus metrics endpoint. |
+| `PROMETHEUS_PORT` | `9000` | Port for the standalone Prometheus exporter (the API also exposes `/metrics`). |
 | `HTMX_SSE_HEARTBEAT_MS` | `4000` | Interval (ms) for SSE heartbeat events streamed to the UI. |
 | `WEBHOOK_SECRET` | `mdwb-dev-webhook` | Shared secret used to sign `/jobs/{id}/webhooks` callbacks. |
 
@@ -129,3 +129,4 @@ in `app/schemas.py` (see `ManifestEnvironment`, `ManifestTimings`, and
 * Prometheus + HTMX SSE heartbeat intervals come directly from this config—keep
   dashboards/tests in sync with any changes.
 * The warning/blocklist JSONL log now includes `sweep_stats`, overlap ratios, and any `validation_failures`, so Ops can spot retries or seam duplication even when DOM warnings don’t fire. Ensure the log rotation/search tooling ingests the new keys.
+* Prometheus scraping now covers capture/OCR/stitch latencies, warning/blocklist totals, SSE heartbeats, and job completions. Scrape `/metrics` directly or hit the exporter bound to `PROMETHEUS_PORT` when you need a dedicated port.

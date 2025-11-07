@@ -27,6 +27,7 @@ run_step "ty check" uvx ty check
 run_step "pytest" uv run pytest \
   tests/test_mdwb_cli_events.py \
   tests/test_mdwb_cli_webhooks.py \
+  tests/test_mdwb_cli_fetch.py \
   tests/test_olmocr_cli_config.py \
   tests/test_check_env.py \
   tests/test_show_latest_smoke.py \
