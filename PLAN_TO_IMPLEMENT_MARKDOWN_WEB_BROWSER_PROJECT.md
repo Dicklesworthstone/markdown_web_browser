@@ -690,7 +690,10 @@ florence-2-base:
   "job_id": "2025-11-07T12-22-18Z-e1a9",
   "url": "https://example.com/article",
   "cft_version": "chrome-130.0.6723.69",
-  "playwright_version": "1.48.2",
+  "cft_label": "Stable-1",
+  "playwright_channel": "cft",
+  "playwright_version": "1.50.0",
+  "browser_transport": "cdp",
   "device_scale_factor": 2,
   "long_side_px": 1288,
   "model": "olmOCR-2-7B-1025-FP8",
@@ -700,11 +703,22 @@ florence-2-base:
     "max_steps": 200,
     "intersection_observer": true
   },
-  "screenshot_style_hash": "a9134b9",
+  "screenshot_style_hash": "dev-sweeps-v1",
   "tiles_total": 18,
   "capture_ms": 18234,
   "ocr_ms": 27654,
-  "stitch_ms": 1042
+  "stitch_ms": 1042,
+  "warnings": [
+    {
+      "code": "canvas-heavy",
+      "message": "High canvas count may hide chart labels.",
+      "count": 4,
+      "threshold": 3
+    }
+  ],
+  "blocklist_hits": {
+    "#onetrust-consent-sdk": 2
+  }
 }
 ```
 

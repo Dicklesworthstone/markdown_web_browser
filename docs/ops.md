@@ -55,7 +55,7 @@ uv run python scripts/run_smoke.py \
 - Enough quota on the hosted olmOCR endpoint for the nightly workload.
 
 ### Verification Checklist
-1. `scripts/run_checks.sh` (ruff → ty → Playwright smoke) passes before the smoke run.
+1. `scripts/run_checks.sh` (ruff → ty → targeted pytest suite → Playwright smoke) passes before the smoke run. The bundled pytest step covers CLI events/webhooks, olmOCR CLI config, check_env, show_latest_smoke (including `check`/`--json`), and API webhook tests so regressions surface before captures run.
 2. Each category report stays below its p95 latency budget (see `manifest_index.json`).
 3. Failures must be triaged immediately; rerun `scripts/olmocr_cli.py run` on the
    offending URL with `--out-dir benchmarks/reruns` for deeper debugging.
