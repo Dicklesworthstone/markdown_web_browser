@@ -78,11 +78,12 @@ Publish the summary in Monday’s ops update and attach the most recent
 
 - Every capture that emits warnings or blocklist hits appends a JSON line to
   `WARNING_LOG_PATH` (defaults to `ops/warnings.jsonl`). The record includes the job ID,
-  URL, warning list, and blocklist version/hits so incidents can be triaged without
-  scraping manifests.
-- Use the CLI helper `uv run python scripts/mdwb_cli.py warnings --count 50`
-  (or pass `--log-path` / `--json`) to review recent entries. This is the fastest way
-  to confirm whether canvas/video/sticky or sweep warnings spiked overnight.
+  URL, warning list, blocklist hits, sweep stats, and `validation_failures` so incidents
+  can be triaged without scraping manifests.
+- Use the CLI helper `uv run python scripts/mdwb_cli.py warnings tail --count 50 --json`
+  (add `--follow` to stream, or `--log-path` to override the default) to review recent entries.
+  The pretty output summarizes warning codes, blocklist selectors, sweep overlap ratios, and
+  validation failures so ops can spot duplicate seams or retries immediately.
 - Rotate/ship the log via your usual log aggregation tooling; the file is plain JSONL
   and safe to ingest into Loki/Elastic/GCS.
 

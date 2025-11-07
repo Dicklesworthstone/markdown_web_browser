@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import json
+import os
 import time
+from collections import deque
 from datetime import datetime, timedelta
 from dataclasses import dataclass
 from pathlib import Path
@@ -316,9 +318,7 @@ def watch(
             raw=raw,
         )
     except httpx.HTTPError as exc:
-        console.print(
-            f"[yellow]Events feed unavailable ({exc}); falling back to SSE stream.[/]"
-        )
+        console.print(f"[yellow]Events feed unavailable ({exc}); falling back to SSE stream.[/]")
         _stream_job(job_id, settings, raw=raw)
 
 

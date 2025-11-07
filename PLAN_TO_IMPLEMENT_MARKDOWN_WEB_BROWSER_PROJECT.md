@@ -259,6 +259,8 @@ _2025-11-08 — BrownStone (bd-dm9) expanded the manifest + `/jobs` schema so bl
 
 _2025-11-08 — WhiteSnow (bd-y5b) hardened `scripts/olmocr_cli.py` optional handling + type hints so `uvx ty check` stays green after importing the upstream CLI helpers (detected server/model flags + stdout filtering)._
 
+_2025-11-08 — WhiteSnow (bd-dwf) added `mdwb warnings tail` to `scripts/mdwb_cli.py` so ops/agents can stream `WARNING_LOG_PATH` with `--count/--json/--follow` options and immediately see sweep stats + validation failures._
+
 ### 9.2 Agent JSON Contract
 ```
 POST /jobs { url, options }
