@@ -130,3 +130,23 @@ def test_show_latest_smoke_check_missing_file(tmp_path: Path):
     result = runner.invoke(module.app, ["check", "--root", str(tmp_path)])
     assert result.exit_code == 1
     assert "manifest_index" in result.output
+
+
+def test_show_latest_smoke_check_json_success(tmp_path: Path):
+    module = _load_cli()
+    _write_pointer_files(tmp_path)
+    result = runner.invoke(module.app, ["check", "--root", str(tmp_path), "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["status"] == "ok"
+    assert payload["missing"] == []
+
+
+def test_show_latest_smoke_check_json_missing(tmp_path: Path):
+    module = _load_cli()
+    _write_pointer_files(tmp_path, include_weekly=False)
+    result = runner.invoke(module.app, ["check", "--root", str(tmp_path), "--json"])
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["status"] == "missing"
+    assert "weekly_summary" in payload["missing"]
