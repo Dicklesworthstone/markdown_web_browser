@@ -45,8 +45,9 @@ uv run python scripts/run_smoke.py \
   table. Set `MDWB_SMOKE_ROOT=/path/to/runs` (or pass `--root`) if the pointer files live outside
   `benchmarks/production/`, and add `--json` when automation needs structured output instead of tables.
 - For automation/health checks, run `uv run python scripts/show_latest_smoke.py check --root benchmarks/production`
-  (add `--no-weekly` if you only care about summary/manifest/metrics). The command exits non-zero when any
-  required pointer file is missing, making it suitable for CI/dashboards.
+  (add `--no-weekly` if you only care about summary/manifest/metrics). Pass `--json` when you want a structured payload
+  (fields: `status`, `missing`, `root`, `weekly_required`, `run_date`) and rely on the exit code instead of parsing text.
+  The command exits non-zero when any required pointer file is missing, making it ideal for CI/dashboards.
 
 ### Prerequisites
 - `/jobs` API available on `API_BASE_URL` with credentials in `.env`.
