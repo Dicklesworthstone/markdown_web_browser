@@ -1,7 +1,8 @@
-"""DOM link harvesting and hybrid text recovery helpers."""
+"""DOM + OCR link harvesting and hybrid text recovery helpers."""
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -57,6 +58,21 @@ def extract_links_from_dom(dom_snapshot: Path) -> Sequence[LinkRecord]:
     return records
 
 
+_MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^)\s]+)\)")
+
+
+def extract_links_from_markdown(markdown: str) -> Sequence[LinkRecord]:
+    """Heuristically parse Markdown links (e.g., `[text](https://example.com)`)."""
+
+    if not markdown:
+        return []
+    records: list[LinkRecord] = []
+    for match in _MARKDOWN_LINK_RE.finditer(markdown):
+        text, href = match.groups()
+        records.append(LinkRecord(text=text.strip(), href=href.strip(), source="OCR", delta="OCR only"))
+    return records
+
+
 def blend_dom_with_ocr(
     *,
     dom_links: Sequence[LinkRecord],
@@ -71,7 +87,7 @@ def blend_dom_with_ocr(
             text=record.text,
             href=record.href,
             source="DOM",
-            delta="✓",
+            delta="DOM only",
         )
 
     for record in ocr_links:
@@ -79,15 +95,18 @@ def blend_dom_with_ocr(
         if key in results:
             combined = results[key]
             combined.source = "DOM+OCR"
-            combined.delta = "✓"
             if not combined.text:
                 combined.text = record.text
+            if combined.text and record.text and combined.text != record.text:
+                combined.delta = "text mismatch"
+            else:
+                combined.delta = "✓"
         else:
             results[key] = LinkRecord(
                 text=record.text,
                 href=record.href,
                 source="OCR",
-                delta="Δ +1",
+                delta="OCR only",
             )
 
     return list(results.values())

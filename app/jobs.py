@@ -19,9 +19,16 @@ import logging
 import httpx
 
 from app import metrics
-from app.capture import CaptureConfig, CaptureResult, capture_tiles
-from app.dom_links import extract_links_from_dom, serialize_links
-from app.ocr_client import OCRRequest, submit_tiles
+from app.capture import CaptureConfig, CaptureManifest, CaptureResult, capture_tiles
+from app.capture_warnings import CaptureWarningEntry
+from app.dom_links import (
+    LinkRecord,
+    blend_dom_with_ocr,
+    extract_links_from_dom,
+    extract_links_from_markdown,
+    serialize_links,
+)
+from app.ocr_client import OCRRequest, SubmitTilesResult, submit_tiles
 from app.schemas import JobCreateRequest, ManifestMetadata
 from app.settings import Settings, settings as global_settings
 from app.store import Store, build_store
@@ -93,8 +100,6 @@ def build_initial_snapshot(
     if manifest:
         snapshot["manifest"] = manifest.model_dump()
     return snapshot
-
-
 RunnerType = Callable[..., Awaitable[tuple[CaptureResult, list[dict[str, object]]]]]
 
 
@@ -195,6 +200,7 @@ class JobManager:
             snapshot["manifest"] = asdict(capture_result.manifest)
             snapshot["artifacts"] = tile_artifacts
             self._broadcast(job_id)
+            self._emit_ocr_event(job_id, capture_result.manifest)
             self._set_state(job_id, JobState.DONE)
             storage.update_status(job_id=job_id, status=JobState.DONE, finished_at=datetime.now(timezone.utc))
         except Exception as exc:  # pragma: no cover - surfaced to API callers
@@ -340,20 +346,23 @@ class JobManager:
         return payload
 
     def _record_event(self, job_id: str, payload: JobSnapshot) -> None:
-        entry = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "sequence": self._event_sequences.get(job_id, 0),
-            "event": "snapshot",
-            "snapshot": payload,
-        }
-        sequence = int(entry["sequence"])
+        self._append_event_entry(job_id, {"event": "snapshot", "snapshot": payload})
+
+    def _record_custom_event(self, job_id: str, event: str, data: Mapping[str, Any]) -> None:
+        self._append_event_entry(job_id, {"event": event, "data": dict(data)})
+
+    def _append_event_entry(self, job_id: str, entry: Mapping[str, Any]) -> None:
+        sequence = self._event_sequences.get(job_id, 0)
+        enriched = dict(entry)
+        enriched.setdefault("timestamp", datetime.now(timezone.utc).isoformat())
+        enriched["sequence"] = sequence
         self._event_sequences[job_id] = sequence + 1
         log = self._event_logs.setdefault(job_id, [])
-        log.append(entry)
+        log.append(enriched)
         if len(log) > _EVENT_HISTORY_LIMIT:
             del log[: len(log) - _EVENT_HISTORY_LIMIT]
         for queue in list(self._event_subscribers.get(job_id, [])):
-            queue.put_nowait(entry.copy())
+            queue.put_nowait(enriched.copy())
 
     def _parse_timestamp(self, raw: Any) -> datetime | None:
         if not isinstance(raw, str):
@@ -372,6 +381,12 @@ class JobManager:
         except (TypeError, ValueError):
             return False
         return seq > min_sequence
+
+    def _emit_ocr_event(self, job_id: str, manifest: CaptureManifest) -> None:
+        summary = _summarize_ocr_batches(manifest)
+        if not summary:
+            return
+        self._record_custom_event(job_id, "ocr_telemetry", summary)
 
     def _maybe_trigger_webhooks(self, job_id: str, payload: JobSnapshot) -> None:
         sender = self._webhook_sender
@@ -414,13 +429,17 @@ async def execute_capture_job(
     capture_config = config or CaptureConfig(url=url)
     try:
         capture_result = await capture_tiles(capture_config)
-        markdown, ocr_ms, stitch_ms = await _run_ocr_pipeline(job_id=job_id, capture_result=capture_result)
+        markdown, ocr_ms, stitch_ms, ocr_links = await _run_ocr_pipeline(
+            job_id=job_id,
+            capture_result=capture_result,
+        )
         capture_result.manifest.ocr_ms = ocr_ms
         capture_result.manifest.stitch_ms = stitch_ms
         metrics.observe_manifest_metrics(capture_result.manifest)
         append_warning_log(job_id=job_id, url=url, manifest=capture_result.manifest)
         dom_snapshot = getattr(capture_result, "dom_snapshot", None)
         dom_path = None
+        dom_links: Sequence[LinkRecord] = []
         if dom_snapshot:
             dom_path = storage.write_dom_snapshot(job_id=job_id, html=dom_snapshot)
         write_links = getattr(storage, "write_links", None)
@@ -434,6 +453,11 @@ async def execute_capture_job(
         storage.write_manifest(job_id=job_id, manifest=capture_result.manifest)
         if markdown:
             storage.write_markdown(job_id=job_id, content=markdown)
+        blended_links: Sequence[LinkRecord] = dom_links
+        if ocr_links:
+            blended_links = blend_dom_with_ocr(dom_links=dom_links, ocr_links=ocr_links)
+        if blended_links and callable(write_links):
+            storage.write_links(job_id=job_id, links=serialize_links(blended_links))
     except Exception:
         raise
 
@@ -471,25 +495,89 @@ def build_signed_webhook_sender(secret: str, *, version: str = "v1") -> WebhookS
     return _sender
 
 
-async def _run_ocr_pipeline(*, job_id: str, capture_result: CaptureResult) -> tuple[str, int | None, int | None]:
+async def _run_ocr_pipeline(
+    *,
+    job_id: str,
+    capture_result: CaptureResult,
+) -> tuple[str, int | None, int | None, Sequence[LinkRecord]]:
     """Submit tiles to olmOCR and stitch the resulting Markdown."""
 
     tiles = capture_result.tiles
     if not tiles:
-        return "", None, None
+        return "", None, None, []
 
     requests: list[OCRRequest] = [
         OCRRequest(tile_id=f"{job_id}-tile-{tile.index:04d}", tile_bytes=tile.png_bytes)
         for tile in tiles
     ]
     ocr_start = time.perf_counter()
-    markdown_chunks = await submit_tiles(requests=requests)
+    ocr_output = await submit_tiles(requests=requests)
     ocr_ms = int((time.perf_counter() - ocr_start) * 1000)
+    _apply_ocr_metadata(capture_result.manifest, ocr_output)
 
     stitch_start = time.perf_counter()
-    markdown = stitch_markdown(markdown_chunks)
+    markdown = stitch_markdown(ocr_output.markdown_chunks, tiles)
     stitch_ms = int((time.perf_counter() - stitch_start) * 1000)
-    return markdown, ocr_ms, stitch_ms
+    ocr_links = extract_links_from_markdown(markdown)
+    return markdown, ocr_ms, stitch_ms, ocr_links
+
+
+def _apply_ocr_metadata(manifest: CaptureManifest, result: SubmitTilesResult) -> None:
+    """Embed OCR telemetry + quota data into the capture manifest."""
+
+    manifest.ocr_batches = [
+        {
+            "tile_ids": list(batch.tile_ids),
+            "latency_ms": batch.latency_ms,
+            "status_code": batch.status_code,
+            "request_id": batch.request_id,
+            "payload_bytes": batch.payload_bytes,
+            "attempts": batch.attempts,
+        }
+        for batch in result.batches
+    ]
+    manifest.ocr_quota = {
+        "limit": result.quota.limit,
+        "used": result.quota.used,
+        "threshold_ratio": result.quota.threshold_ratio,
+        "warning_triggered": result.quota.warning_triggered,
+    }
+    if result.quota.warning_triggered and result.quota.limit and result.quota.used is not None:
+        manifest.warnings.append(
+            CaptureWarningEntry(
+                code="ocr-quota",
+                message="Hosted OCR usage exceeded 70% of configured daily quota.",
+                count=float(result.quota.used),
+                threshold=float(result.quota.limit),
+            )
+        )
+
+
+def _summarize_ocr_batches(manifest: CaptureManifest) -> dict[str, Any] | None:
+    batches = getattr(manifest, "ocr_batches", None)
+    if not batches:
+        return None
+    latencies = [batch.get("latency_ms") for batch in batches if isinstance(batch.get("latency_ms"), (int, float))]
+    payloads = [batch.get("payload_bytes") for batch in batches if isinstance(batch.get("payload_bytes"), (int, float))]
+    non_2xx = sum(1 for batch in batches if isinstance(batch.get("status_code"), int) and batch["status_code"] >= 400)
+    summary: dict[str, Any] = {
+        "total_batches": len(batches),
+        "non_2xx_batches": non_2xx,
+    }
+    if latencies:
+        summary["avg_latency_ms"] = int(sum(latencies) / len(latencies))
+        summary["max_latency_ms"] = int(max(latencies))
+    if payloads:
+        summary["total_payload_bytes"] = int(sum(payloads))
+    last_request_id = next((batch.get("request_id") for batch in reversed(batches) if batch.get("request_id")), None)
+    if last_request_id:
+        summary["last_request_id"] = last_request_id
+    quota = getattr(manifest, "ocr_quota", None) or {}
+    if quota:
+        summary["quota_used"] = quota.get("used")
+        summary["quota_limit"] = quota.get("limit")
+        summary["quota_warning"] = bool(quota.get("warning_triggered"))
+    return summary
 
 
 def _persist_pending_webhooks(store: Store, pending: Sequence[dict[str, Any]], job_id: str) -> None:

@@ -2,6 +2,7 @@ from app.schemas import (
     ConcurrencyWindow,
     ManifestEnvironment,
     ManifestMetadata,
+    ManifestSweepStats,
     ManifestWarning,
     ViewportSettings,
 )
@@ -36,8 +37,22 @@ def test_manifest_metadata_accepts_blocklist_and_warnings() -> None:
                 threshold=3,
             )
         ],
+        sweep_stats=ManifestSweepStats(
+            sweep_count=4,
+            total_scroll_height=12000,
+            shrink_events=1,
+            retry_attempts=1,
+            overlap_pairs=6,
+            overlap_match_ratio=0.83,
+        ),
+        overlap_match_ratio=0.83,
+        validation_failures=["tile 0003 checksum mismatch"],
     )
 
     assert manifest.blocklist_version == "2025-11-07"
     assert manifest.blocklist_hits["#onetrust-consent-sdk"] == 2
     assert manifest.warnings[0].code == "canvas-heavy"
+    assert manifest.sweep_stats is not None
+    assert manifest.sweep_stats.overlap_pairs == 6
+    assert manifest.overlap_match_ratio == 0.83
+    assert manifest.validation_failures == ["tile 0003 checksum mismatch"]

@@ -116,36 +116,33 @@
           <article class="tab-panel" data-tab-panel="manifest" hidden>
             <h2>Manifest</h2>
             <pre class="placeholder manifest" data-sse-field="manifest">CfT label, Playwright version, screenshot style hash, and timing metrics will stream into this panel.</pre>
-          <div class="blocklist-panel">
-            <h3>Blocklist Hits</h3>
-            <div class="blocklist-list" data-blocklist-hits>
-              <p class="placeholder">No selectors matched during this run.</p>
+            <div class="blocklist-panel">
+              <h3>Blocklist Hits</h3>
+              <div class="blocklist-list" data-blocklist-hits>
+                <p class="placeholder">No selectors matched during this run.</p>
+              </div>
             </div>
-          </div>
-          <div class="sweep-panel">
-            <h3>Sweep Stats</h3>
-            <div class="sweep-summary" data-sweep-summary>Sweep data pending…</div>
-            <div class="sweep-list" data-sweep-stats>
-              <p class="placeholder">No sweep data yet.</p>
-            </div>
-          </div>
-          <div class="validation-panel">
-            <h3>Validation Alerts</h3>
-            <div class="validation-summary" data-validation-summary>Waiting for capture…</div>
-            <div class="validation-list" data-validation-list>
-              <p class="placeholder">No validation issues detected.</p>
-            </div>
-          </div>
             <div class="sweep-panel">
               <h3>Sweep Stats</h3>
+              <div class="sweep-summary" data-sweep-summary>Sweep data pending…</div>
               <div class="sweep-list" data-sweep-stats>
                 <p class="placeholder">No sweep data yet.</p>
               </div>
             </div>
             <div class="validation-panel">
-              <h3>Validation Failures</h3>
+              <h3>Validation Alerts</h3>
+              <div class="validation-summary" data-validation-summary>Waiting for capture…</div>
               <div class="validation-list" data-validation-list>
                 <p class="placeholder">No validation issues detected.</p>
+              </div>
+            </div>
+            <div class="ocr-panel">
+              <h3>OCR Telemetry</h3>
+              <div class="ocr-quota" data-ocr-quota>
+                <p class="placeholder">Quota data will appear once OCR finishes.</p>
+              </div>
+              <div class="ocr-batches" data-ocr-batches>
+                <p class="placeholder">Batch latency and request IDs will be listed here when available.</p>
               </div>
             </div>
           </article>

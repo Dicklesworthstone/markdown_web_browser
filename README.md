@@ -39,12 +39,15 @@ See `PLAN_TO_IMPLEMENT_MARKDOWN_WEB_BROWSER_PROJECT.md` §§2–5, 19 for the fu
 ## CLI cheatsheet (`scripts/mdwb_cli.py`)
 - `fetch <url> [--watch]` — enqueue + optionally stream Markdown as tiles finish.
 - `fetch <url> --webhook-url https://... [--webhook-event DONE --webhook-event FAILED]` — register callbacks right after the job is created.
-- `show <job-id>` — dump the latest job snapshot (state, warnings, manifest paths).
+- `show <job-id> [--ocr-metrics]` — dump the latest job snapshot, optionally with OCR batch/quota telemetry.
 - `stream <job-id>` — follow the SSE feed.
-- `watch <job-id>` / `events <job-id> --follow --since <ISO>` — tail the `/jobs/{id}/events` NDJSON log.
+- `watch <job-id>` / `events <job-id> --follow --since <ISO>` — tail the `/jobs/{id}/events` NDJSON log (use `--on EVENT=COMMAND` to run hooks when specific events fire).
+- `diag <job-id>` — print CfT/Playwright metadata, capture/OCR timings, warnings, and blocklist hits for incident triage.
 - `jobs replay manifest <manifest.json>` — resubmit a stored manifest via `/replay` with validation/JSON output support.
+- `jobs embeddings search <job-id> --vector-file vector.json [--top-k 5]` — search sqlite-vec section embeddings for a run (supports inline `--vector` strings and `--json` output).
 - `warnings --count 50` — tail `ops/warnings.jsonl` for capture/blocklist incidents.
 - `dom links --job-id <id>` — render the stored `links.json` (anchors/forms/headings/meta).
+- `jobs ocr-metrics <job-id> [--json]` — summarize OCR batch latency, request IDs, and quota usage from the manifest.
 - `demo snapshot|stream|events` — exercise the demo endpoints without hitting a live pipeline.
 
 The CLI reads `API_BASE_URL` + `MDWB_API_KEY` from `.env`; override with `--api-base` when targeting staging. For CUDA/vLLM workflows, see `docs/olmocr_cli_tool_documentation.md` and `docs/olmocr_cli_integration.md` for detailed setup + merge notes.
@@ -99,8 +102,14 @@ uv run python scripts/mdwb_cli.py demo stream
 # Replay an existing manifest
 uv run python scripts/mdwb_cli.py jobs replay manifest cache/example.com/.../manifest.json
 
+# Search embeddings for a run (vector as JSON array)
+uv run python scripts/mdwb_cli.py jobs embeddings search JOB_ID --vector "[0.12, 0.04, ...]" --top-k 3
+
 # Tail warning log via CLI
 uv run python scripts/mdwb_cli.py warnings --count 25
+
+# Download a job's tar bundle (tiles + markdown + manifest)
+uv run python scripts/mdwb_cli.py jobs bundle <job-id> --out path/to/bundle.tar.zst
 
 # Run nightly smoke for docs/articles only (dry run)
 uv run python scripts/run_smoke.py --date $(date -u +%Y-%m-%d) --category docs_articles --dry-run
@@ -114,7 +123,7 @@ uv run python scripts/run_smoke.py --date $(date -u +%Y-%m-%d) --category docs_a
 - `dom_snapshot.html` — raw DOM capture used for link diffs and hybrid recovery (when enabled).
 - `bundle.tar.zst` — optional tarball for incidents/export (`Store.build_bundle`).
 
-Use `mdwb jobs replay manifest …` (or `/jobs/{id}/artifact/...`) to reproduce a job locally and fetch its artifacts for debugging.
+Use `mdwb jobs bundle …` or `mdwb jobs artifacts manifest …` (or `/jobs/{id}/artifact/...`) to reproduce a job locally and fetch its artifacts for debugging.
 
 ## Communication & task tracking
 - **Beads** (`bd ...`) track every feature/bug (map bead IDs to Plan sections in Agent Mail threads).

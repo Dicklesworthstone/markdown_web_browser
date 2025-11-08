@@ -130,9 +130,14 @@ the workflows converge.
 - Quick smoke check:
 
 ```
+uv run python scripts/check_metrics.py run --timeout 3.0
 curl -s http://localhost:8000/metrics | grep mdwb_capture_duration_seconds
 curl -s http://localhost:9000/metrics | head -n 5  # dedicated Prom port
 ```
+
+The CLI command above reads `.env` for `API_BASE_URL`/`PROMETHEUS_PORT` (override with
+`--api-base`/`--exporter-port`). Use `--no-include-exporter` when only the primary `/metrics`
+endpoint is exposed.
 
 Tie the new counters into `ops/dashboards.json`/`ops/alerts.md` so Grafana can page when
 warning spikes, job failures, or SSE stalls exceed their budgets.
@@ -166,7 +171,8 @@ warning spikes, job failures, or SSE stalls exceed their budgets.
 - `uv run python scripts/mdwb_cli.py watch <job-id>` streams the human-friendly
   view on `/jobs/{id}/events` (state/progress/warnings) and automatically falls
   back to the SSE stream if the NDJSON endpoint is unavailable. Pass
-  `--raw/--since/--interval` to align with automation requirements.
+  `--raw/--since/--interval` to align with automation requirements, and add `--on EVENT=COMMAND`
+  (repeatable) to run shell hooks when particular events fire (e.g., `--on state:DONE='notify-send mdwb done'`).
 - The Events tab/CLI watchers now show blocklist, sweep, and validation events emitted
   directly by the SSE feed, so the new manifest breadcrumbs surface even when the
   Manifest tab isn’t open.
@@ -185,6 +191,15 @@ warning spikes, job failures, or SSE stalls exceed their budgets.
 - `uv run python scripts/mdwb_cli.py jobs artifacts manifest <job-id> --out manifest.json`
   (or `markdown`, `links`) downloads the persisted files without curl; use `--pretty/--raw`
   to control JSON formatting when writing to disk.
+- `uv run python scripts/mdwb_cli.py jobs bundle <job-id> --out bundle.tar.zst`
+  fetches the tarball (`bundle.tar.zst`) that Store emits alongside the tiles/markdown/links/manifest, keeping
+  incidents and reruns reproducible without hand-written curl commands.
 - `uv run python scripts/mdwb_cli.py jobs replay manifest <manifest.json>` replays a saved manifest
   via `POST /replay` with path validation, HTTP/2 toggles, and optional JSON output. The legacy
   `scripts/replay_job.sh` script remains for legacy automation but new workflows should prefer the CLI.
+- `uv run python scripts/mdwb_cli.py jobs embeddings search <job-id> --vector-file vector.json --top-k 5`
+  posts a stored embedding vector to `/jobs/{id}/embeddings/search` so you can jump to the most relevant sections
+  without cracking open sqlite. Pass `--vector "[0.1,0.2,...]"` for inline JSON or `--json` when automation needs
+  structured matches.
+- `uv run python scripts/mdwb_cli.py diag <job-id>` prints CfT/Playwright metadata, capture/OCR/stitch timings,
+  warnings, and blocklist hits for a run (with `--json` for automation), matching the incident-response playbook in PLAN §20.

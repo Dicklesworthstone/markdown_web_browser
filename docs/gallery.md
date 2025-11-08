@@ -67,6 +67,11 @@ mdwb jobs replay manifest manifest.json
 mdwb jobs artifacts links job-abc123 --pretty
 ```
 
+### Download the tar bundle for offline debugging
+```bash
+mdwb jobs bundle job-abc123 --out bundles/job-abc123.tar.zst
+```
+
 ## Sample Output Structure
 
 ### Markdown Output (`out.md`)
@@ -270,8 +275,9 @@ To add your own examples to the gallery:
 
 1. Capture an interesting URL
 2. Save the manifest: `mdwb jobs artifacts manifest JOB_ID --out my-example.json`
-3. Document any special handling needed
-4. Submit a PR adding to this gallery
+3. Download the tar bundle so reviewers can reproduce the capture: `mdwb jobs bundle JOB_ID --out bundles/JOB_ID.tar.zst`
+4. Document any special handling needed
+5. Submit a PR adding to this gallery
 
 Please include:
 - URL (or type if sensitive)

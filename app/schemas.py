@@ -89,11 +89,57 @@ class ManifestTimings(BaseModel):
     total_ms: int | None = Field(default=None, ge=0)
 
 
+class ManifestSweepStats(BaseModel):
+    """Viewport sweep counters recorded for diagnostics."""
+
+    sweep_count: int = Field(ge=0, description="Number of viewport sweeps performed")
+    total_scroll_height: int = Field(ge=0, description="Final scroll height observed")
+    shrink_events: int = Field(ge=0, description="How often the page height shrank mid-run")
+    retry_attempts: int = Field(ge=0, description="Viewport sweep retries triggered by shrink events")
+    overlap_pairs: int = Field(ge=0, description="Adjacent tile pairs compared for overlap matching")
+    overlap_match_ratio: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="Ratio of overlap pairs that matched (duplicate seams indicator)",
+    )
+
+
+class ManifestOCRBatch(BaseModel):
+    """Per-request OCR telemetry persisted in manifests."""
+
+    tile_ids: list[str]
+    latency_ms: int = Field(ge=0)
+    status_code: int = Field(ge=0)
+    request_id: str | None = Field(default=None)
+    payload_bytes: int | None = Field(default=None, ge=0)
+    attempts: int = Field(default=1, ge=1)
+
+
+class ManifestOCRQuota(BaseModel):
+    """Quota accounting for hosted OCR usage."""
+
+    limit: int | None = Field(default=None, ge=1)
+    used: int | None = Field(default=None, ge=0)
+    threshold_ratio: float = Field(default=0.7, ge=0.0, le=1.0)
+    warning_triggered: bool = Field(default=False)
+
+
 class ManifestMetadata(BaseModel):
     """Top-level manifest payload stub until capture pipeline is wired."""
 
     environment: ManifestEnvironment
     timings: ManifestTimings = Field(default_factory=ManifestTimings)
+    sweep_stats: ManifestSweepStats | None = Field(
+        default=None,
+        description="Viewport sweep counters and overlap ratio metadata",
+    )
+    overlap_match_ratio: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="Shortcut for sweep_stats.overlap_match_ratio when summarizing",
+    )
     blocklist_version: str | None = Field(
         default=None,
         description="Version label for the selector blocklist used during capture",
@@ -105,6 +151,18 @@ class ManifestMetadata(BaseModel):
     warnings: list[ManifestWarning] = Field(
         default_factory=list,
         description="Structured warnings emitted by capture heuristics",
+    )
+    validation_failures: list[str] = Field(
+        default_factory=list,
+        description="Tile validation failures (checksums, PNG decode, dimensions)",
+    )
+    ocr_batches: list[ManifestOCRBatch] = Field(
+        default_factory=list,
+        description="Per-request OCR telemetry (request IDs, latency, payload sizes)",
+    )
+    ocr_quota: ManifestOCRQuota | None = Field(
+        default=None,
+        description="Snapshot of hosted OCR daily quota usage",
     )
 
 

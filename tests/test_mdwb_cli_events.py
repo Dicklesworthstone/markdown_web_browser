@@ -5,6 +5,8 @@ from datetime import datetime
 from pathlib import Path
 
 import httpx
+import pytest
+import typer
 from typer.testing import CliRunner
 
 from scripts import mdwb_cli
@@ -131,3 +133,76 @@ def test_log_event_formats_blocklist_and_sweep():
     assert "#cookie:2" in output
     assert "ratio 0.92" in output
     assert "Tile checksum mismatch" in output
+
+
+def test_watch_events_with_fallback_streams_via_sse(monkeypatch):
+    def fake_watch(*args, **kwargs):
+        raise httpx.RequestError("boom", request=httpx.Request("GET", "http://test"))
+
+    calls: dict[str, object] = {}
+
+    def fake_stream(job_id: str, settings: mdwb_cli.APISettings, raw: bool, hooks=None):  # noqa: ANN001
+        calls["job_id"] = job_id
+        calls["raw"] = raw
+
+    monkeypatch.setattr(mdwb_cli, "_watch_job_events_pretty", fake_watch)
+    monkeypatch.setattr(mdwb_cli, "_stream_job", fake_stream)
+
+    with mdwb_cli.console.capture() as capture:
+        mdwb_cli._watch_events_with_fallback(
+            "job123",
+            API_SETTINGS,
+            cursor=None,
+            follow=True,
+            interval=1.0,
+            raw=True,
+        )
+
+    output = capture.get()
+    assert "falling back to SSE stream" in output
+    assert calls == {"job_id": "job123", "raw": True}
+
+
+def test_watch_command_invokes_helper(monkeypatch):
+    invoked: list[tuple] = []
+    monkeypatch.setattr(mdwb_cli, "_resolve_settings", lambda api_base: API_SETTINGS)
+
+    def fake_helper(job_id, settings, cursor, follow, interval, raw, hooks):  # noqa: ANN001
+        invoked.append((job_id, cursor, follow, interval, raw, hooks))
+
+    monkeypatch.setattr(mdwb_cli, "_watch_events_with_fallback", fake_helper)
+
+    result = runner.invoke(mdwb_cli.cli, ["watch", "job123", "--interval", "0.5", "--raw", "--on", "snapshot=echo hi"])
+
+    assert result.exit_code == 0
+    assert invoked == [("job123", None, True, 0.5, True, {"snapshot": ["echo hi"]})]
+
+
+def test_parse_event_hooks_valid():
+    hooks = mdwb_cli._parse_event_hooks(["snapshot=echo hi", "state:DONE=touch done", "*=logger"])
+    assert hooks == {"snapshot": ["echo hi"], "state:DONE": ["touch done"], "*": ["logger"]}
+
+
+def test_parse_event_hooks_invalid():
+    with pytest.raises(typer.BadParameter):
+        mdwb_cli._parse_event_hooks(["novalue"])
+
+
+def test_trigger_event_hooks_runs_matching(monkeypatch):
+    recorded: list[tuple[str, str]] = []
+
+    def fake_run_hook(command, event, payload):  # noqa: ANN001
+        recorded.append((command, event))
+
+    monkeypatch.setattr(mdwb_cli, "_run_hook", fake_run_hook)
+    entry = {"event": "snapshot", "snapshot": {"state": "DONE"}}
+    hooks = {"snapshot": ["cmd1"], "state:DONE": ["cmd2"], "*": ["cmd3"]}
+    mdwb_cli._trigger_event_hooks(entry, hooks)
+    assert recorded == [("cmd1", "snapshot"), ("cmd2", "snapshot"), ("cmd3", "snapshot")]
+
+
+def test_trigger_event_hooks_ignores_non_match(monkeypatch):
+    recorded: list[str] = []
+    monkeypatch.setattr(mdwb_cli, "_run_hook", lambda cmd, event, payload: recorded.append(cmd))
+    mdwb_cli._trigger_event_hooks({"event": "tile"}, {"snapshot": ["cmd"]})
+    assert recorded == []

@@ -17,6 +17,9 @@ class StubClient:
     def get(self, path: str):  # noqa: ANN001
         return self.responses[path]
 
+    def post(self, path: str, json=None):  # noqa: ANN001
+        return self.responses[path]
+
 
 class StubResponse:
     def __init__(self, status_code: int, text: str = "", payload=None) -> None:
@@ -89,7 +92,7 @@ def test_jobs_replay_manifest(monkeypatch, tmp_path: Path):
     result = runner.invoke(mdwb_cli.cli, ["jobs", "replay", str(manifest_path)])
 
     assert result.exit_code == 0
-    assert "replay-1" in result.output
+    assert "Replay submitted" in result.output
 
 
 def test_jobs_bundle_writes_file(monkeypatch, tmp_path: Path):
@@ -107,3 +110,17 @@ def test_jobs_bundle_writes_file(monkeypatch, tmp_path: Path):
 
     assert result.exit_code == 0
     assert out_path.read_bytes() == b"bundle-bytes"
+
+
+def test_jobs_bundle_alias_defaults_output_path(monkeypatch, tmp_path: Path):
+    response = StubResponse(200, text="", payload=None)
+    response.content = b"default-bundle"
+    stub = StubClient({"/jobs/job000/artifact/bundle.tar.zst": response})
+    monkeypatch.setattr(mdwb_cli, "_client", lambda settings: stub)
+    monkeypatch.setattr(mdwb_cli, "_resolve_settings", lambda base: _fake_settings())
+
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        result = runner.invoke(mdwb_cli.cli, ["jobs", "bundle", "job000"])
+
+        assert result.exit_code == 0
+        assert Path("job000-bundle.tar.zst").read_bytes() == b"default-bundle"

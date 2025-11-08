@@ -5,6 +5,7 @@ const WARNING_LABELS = {
   'canvas-heavy': 'Canvas Heavy',
   'video-heavy': 'Video Heavy',
   'sticky-chrome': 'Sticky Overlay',
+  'ocr-quota': 'OCR Quota',
 };
 
 function setupTabs() {
@@ -57,6 +58,8 @@ function initSseBridge() {
   const validationListEl = root.querySelector('[data-validation-list]');
   const sweepSummaryEl = root.querySelector('[data-sweep-summary]');
   const validationSummaryEl = root.querySelector('[data-validation-summary]');
+  const ocrQuotaEl = root.querySelector('[data-ocr-quota]');
+  const ocrBatchesEl = root.querySelector('[data-ocr-batches]');
 
   const setStatus = (value, variant = 'info') => {
     statusEl.textContent = value;
@@ -77,6 +80,8 @@ function initSseBridge() {
           validationListEl,
           sweepSummaryEl,
           validationSummaryEl,
+          ocrQuotaEl,
+          ocrBatchesEl,
         });
         break;
       case 'raw':
@@ -194,6 +199,8 @@ function renderManifest(
     validationListEl,
     sweepSummaryEl,
     validationSummaryEl,
+    ocrQuotaEl,
+    ocrBatchesEl,
   },
 ) {
   if (!element) {
@@ -225,6 +232,8 @@ function renderManifest(
   renderValidationFailures(validationListEl, parsedPayload?.validation_failures);
   updateSweepSummary(sweepSummaryEl, parsedPayload);
   updateValidationSummary(validationSummaryEl, parsedPayload?.validation_failures);
+  renderOcrQuota(ocrQuotaEl, parsedPayload?.ocr_quota);
+  renderOcrBatches(ocrBatchesEl, parsedPayload?.ocr_batches);
   element.textContent = formatted;
 }
 
@@ -387,6 +396,98 @@ function renderBlocklistHits(container, payload) {
     row.append(left, right);
     container.appendChild(row);
   });
+}
+
+function renderOcrQuota(container, payload) {
+  if (!container) {
+    return;
+  }
+  let quota = payload;
+  if (typeof payload === 'string') {
+    try {
+      quota = JSON.parse(payload);
+    } catch {
+      quota = null;
+    }
+  }
+  container.innerHTML = '';
+  if (!quota || Object.values(quota).every((value) => value === null || value === undefined)) {
+    const p = document.createElement('p');
+    p.className = 'placeholder';
+    p.textContent = 'Quota data will appear once OCR completes.';
+    container.appendChild(p);
+    return;
+  }
+
+  const limit = quota.limit ?? '—';
+  const used = quota.used ?? '—';
+  const thresholdRatio = quota.threshold_ratio ?? 0;
+  const warning = Boolean(quota.warning_triggered);
+  const summary = document.createElement('div');
+  summary.className = 'ocr-quota__pill';
+  summary.textContent = `Limit: ${limit} • Used: ${used}`;
+  const threshold = document.createElement('div');
+  threshold.className = 'ocr-quota__pill';
+  threshold.textContent = `Warning at ${(Number(thresholdRatio) * 100).toFixed(0)}%`;
+  container.append(summary, threshold);
+  if (warning) {
+    const alert = document.createElement('strong');
+    alert.className = 'ocr-quota__warning';
+    alert.textContent = '⚠ 70% quota threshold exceeded';
+    container.append(alert);
+  }
+}
+
+function renderOcrBatches(container, payload) {
+  if (!container) {
+    return;
+  }
+  let batches = payload;
+  if (typeof payload === 'string') {
+    try {
+      batches = JSON.parse(payload);
+    } catch {
+      batches = null;
+    }
+  }
+  container.innerHTML = '';
+  if (!Array.isArray(batches) || !batches.length) {
+    const p = document.createElement('p');
+    p.className = 'placeholder';
+    p.textContent = 'No OCR batch data yet.';
+    container.appendChild(p);
+    return;
+  }
+  const table = document.createElement('table');
+  const thead = document.createElement('thead');
+  const headRow = document.createElement('tr');
+  ['Tile IDs', 'Latency (ms)', 'Status', 'Attempts', 'Request ID', 'Payload (bytes)'].forEach((label) => {
+    const th = document.createElement('th');
+    th.textContent = label;
+    headRow.appendChild(th);
+  });
+  thead.appendChild(headRow);
+  table.appendChild(thead);
+  const tbody = document.createElement('tbody');
+  batches.forEach((batch) => {
+    const tr = document.createElement('tr');
+    const cells = [
+      Array.isArray(batch.tile_ids) ? batch.tile_ids.join(', ') : '—',
+      batch.latency_ms ?? '—',
+      batch.status_code ?? '—',
+      batch.attempts ?? '—',
+      batch.request_id ?? '—',
+      batch.payload_bytes ?? '—',
+    ];
+    cells.forEach((value) => {
+      const td = document.createElement('td');
+      td.textContent = String(value);
+      tr.appendChild(td);
+    });
+    tbody.appendChild(tr);
+  });
+  table.appendChild(tbody);
+  container.appendChild(table);
 }
 
 function renderSweepStats(container, manifest) {

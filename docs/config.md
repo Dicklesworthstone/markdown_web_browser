@@ -24,6 +24,9 @@ print(settings.ocr.server_url)
 | `MDWB_API_KEY` | *(unset)* | Optional bearer token for `/jobs` HTTP calls (CLI + automation). |
 | `OCR_LOCAL_URL` | *(unset)* | Optional self-hosted olmOCR endpoint; overrides `OLMOCR_SERVER` when set. |
 | `OCR_USE_FP8` | `true` | Whether FP8 inference is enabled; surfaced via `environment.ocr_use_fp8`. |
+| `OCR_MAX_BATCH_TILES` | `3` | Maximum number of tiles bundled into each OCR HTTP request (helps keep payloads deterministic). |
+| `OCR_MAX_BATCH_BYTES` | `25000000` | Byte ceiling for a single OCR request; batches exceeding this size are split automatically. |
+| `OCR_DAILY_QUOTA_TILES` | *(unset)* | Optional hosted OCR quota (in tiles). When set, manifests emit warnings at 70 % usage. |
 | `OCR_MIN_CONCURRENCY` | `2` | Minimum OCR concurrency window (`environment.ocr_concurrency.min`). |
 | `OCR_MAX_CONCURRENCY` | `8` | Maximum OCR concurrency window (`environment.ocr_concurrency.max`). Must be ≥ min. |
 | `CACHE_ROOT` | `.cache` | Root directory for content-addressed artifacts (tiles, manifests, tar bundles). |
@@ -79,8 +82,10 @@ in `app/schemas.py` (see `ManifestEnvironment`, `ManifestTimings`, and
 * Screenshot style hash for the masked/blocked CSS bundle
 * Warning entries (canvas/video-heavy) with counts + thresholds so Ops can escalate overlays
 * Sweep stats (`sweep_stats`) that show shrink events, retry attempts, and overlap match ratios to explain seam trims or viewport restarts
+* `overlap_match_ratio` shortcut so dashboards/CLIs can summarize seam health without unpacking the stats block
 * `validation_failures` array that records any tile integrity errors caught by `validate_tiles()` and feeds the warning log even when no other warnings fired
 * OCR model + FP8 status + concurrency window
+* OCR request telemetry (`ocr_batches`) including latency, HTTP status, request IDs, and payload sizes, plus hosted quota status (`ocr_quota`) so ops can correlate throttling with DOM complexity
 * Timing metrics (`capture_ms`, `ocr_ms`, `stitch_ms`, `total_ms`) once stages
   execute
 
@@ -113,7 +118,17 @@ in `app/schemas.py` (see `ManifestEnvironment`, `ManifestTimings`, and
     "ocr_ms": 4230,
     "stitch_ms": 510,
     "total_ms": 6220
-  }
+  },
+  "sweep_stats": {
+    "sweep_count": 6,
+    "total_scroll_height": 13200,
+    "shrink_events": 1,
+    "retry_attempts": 1,
+    "overlap_pairs": 8,
+    "overlap_match_ratio": 0.94
+  },
+  "overlap_match_ratio": 0.94,
+  "validation_failures": []
 }
 ```
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from importlib import metadata
 from typing import Any, List, Optional, Sequence
 
@@ -84,6 +84,8 @@ class CaptureManifest:
     validation_failures: list[str]
     ocr_ms: int | None = None
     stitch_ms: int | None = None
+    ocr_batches: list[dict[str, object]] = field(default_factory=list)
+    ocr_quota: dict[str, object] | None = None
 
 
 @dataclass(slots=True)

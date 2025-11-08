@@ -198,6 +198,7 @@ _2025-11-08 — BrownStone (bd-dm9) introduced JSON-backed selector blocklist + 
 - Scroll shrink / poor overlap → capture now emits `scroll-shrink` and `overlap-low` warnings whenever viewport sweeps retry due to shrinking SPAs or overlap match ratios fall below the configured threshold (defaults: 1 shrink event, 0.65 ratio). _2025-11-08 — BrownStone (bd-dm9)._
 _2025-11-08 — WhiteSnow (bd-dm9) added sweep stats + `validation_failures` to CaptureManifest and the ops warning log so retries and duplicate seams show up even when no DOM warnings fire._
 _2025-11-08 — WhiteSnow (bd-dm9) updated the web UI manifest tab to render blocklist hits, sweep stats, and validation failures, and the SSE event feed now emits dedicated blocklist/sweep/validation events so the Events tab/CLI watchers stay in sync._
+_2025-11-08 — LilacSnow (bd-dm9) synced the public `ManifestMetadata` schema/docs/tests with the capture dataclass so sweep stats, overlap ratios, and validation failures flow through APIs, CLI output, and manifests without ad-hoc parsing._
 - Server overload → adaptive OCR concurrency, queue visibility, remote/local failover.
 - Partial results → stream partial Markdown as tiles finish; mark sections as incomplete with provenance comments.
 - Full-page retries → viewport sweep restarts when shrink detected; record both sweeps.
@@ -266,6 +267,7 @@ _2025-11-08 — FuchsiaMountain (bd-rn4) imported the upstream “Automated olmO
 _2025-11-08 — WhiteSnow (bd-y5b) hardened `scripts/olmocr_cli.py` optional handling + type hints so `uvx ty check` stays green after importing the upstream CLI helpers (detected server/model flags + stdout filtering)._
 
 _2025-11-08 — WhiteSnow (bd-dwf/kxv/xf0) added `mdwb warnings tail` + richer event logging, `mdwb jobs webhooks list/add/delete`, `mdwb fetch --webhook-url …`, and `mdwb jobs artifacts manifest|markdown|links` so agents can manage callbacks and download artifacts entirely via the CLI._
+_2025-11-08 — LilacSnow (bd-h4i) added `mdwb jobs bundle` (aliasing the artifacts helper) so ops can fetch `bundle.tar.zst` without remembering the longer subcommand; README/docs/ops/gallery now document the workflow._
 _2025-11-08 — Follow-up (GreenPond, bd-kxv docs) documented the new `mdwb fetch --webhook-url/--webhook-event` flags and the CLI’s non-zero exit codes/`--json` output for webhook deletion so automation scripts know how to wire the flow end-to-end. Tests: `tests/test_mdwb_cli_fetch.py`, `tests/test_mdwb_cli_webhooks.py`._
 
 ### 9.2 Agent JSON Contract
@@ -280,6 +282,8 @@ GET  /jobs/{id}/status
 _2025-11-08 — OrangeMountain (bd-3px/dwf) wired a persistent event log so `/jobs/{id}/events?since=<iso>` serves NDJSON snapshots and `/jobs/{id}/webhooks` registers signed callbacks (header `X-MDWB-Signature`). `scripts/mdwb_cli.py watch` streams the live NDJSON feed (with `--since/--follow` cursors) and falls back to SSE when the endpoint is unavailable; `mdwb events` outputs raw NDJSON for automation. The CLI now enforces required `.env` keys (`API_BASE_URL`, `OLMOCR_SERVER`, `OLMOCR_MODEL`, `OLMOCR_API_KEY`) via `_required_config()`, so ops get an immediate failure instead of silent defaults._
 _2025-11-08 — mdwb fetch gained `--webhook-url`/`--webhook-event` so operators can register callbacks as soon as a job is created; the CLI reuses `/jobs/{id}/webhooks` for each URL and reports failures inline. PinkCat (bd-kxv) added argument validation/tests so `--webhook-event` cannot be used without `--webhook-url` and the helper remains covered by pytest._
 _2025-11-08 — PinkCat (bd-tda) landed the initial replay helper, and PinkDog (bd-tda follow-up) reorganized it under `mdwb jobs replay manifest <manifest.json>` with Typer subgrouping, HTTP/2 toggles, `--json` output, and expanded pytest coverage so `/replay` flows no longer depend on the legacy shell script._
+_2025-11-08 — PinkDog (bd-vnx) added the missing `mdwb jobs embeddings search` CLI command so ops/agents can hit `/jobs/{id}/embeddings/search` directly (supports inline or file-based vectors, `--top-k`, and `--json` output)._
+_2025-11-08 — PinkDog (bd-w66) implemented `mdwb watch --on EVENT=COMMAND` (also available via `fetch --watch`) so lightweight automation can react to `snapshot`, `state:DONE`, or other custom events with shell hooks (commands receive `MDWB_EVENT_*` env vars)._
 _2025-11-08 — Added pytest coverage (`tests/test_mdwb_cli_events.py`) for the CLI event-tail helpers so `_iter_event_lines`, `_watch_job_events_pretty`, and `_cursor_from_line` keep working as the NDJSON feed evolves._
 - SSE: `event:state`, `event:tile`, `event:warning`
 - JSONLines: newline-delimited objects mirroring SSE for CLI `--follow`
@@ -516,6 +520,7 @@ _2025-11-08 — PinkCat (bd-tt4) adding pytest coverage for `scripts/check_env.p
 Below is a focused, pragmatic list of near-term upgrades. They map to the sections above so you can implement them without re-architecting.
 
 ### 19.1 OCR & Inference Upgrades (hosted olmOCR focus)
+> _Status 2025-11-08 — OrangeDog (bd: markdown_web_browser-716) shipped OCR batching (<25 MB payload guard), request-level telemetry (latency/status/request IDs), quota warnings at 70 % usage, FP8-aware retries (3s/9s), manifest fields `ocr_batches` + `ocr_quota`, and the `mdwb jobs ocr-metrics` CLI helper so ops can correlate throttling with DOM complexity without opening manifest files._
 - **Single provider clarity.** `olmOCR-2-7B-1025-FP8` via the hosted API is the only supported model for now. Keep the UI dropdown but mark other entries “future” to avoid confusion.
 - **Batching & concurrency.** Size OCR batches so each request stays <25 MB and target 6–8 in-flight requests (tunable per latency telemetry). Track per-request latency, HTTP status, and token usage in the manifest so you can correlate spikes with page complexity.
 - **Quota & retry budgets.** Implement token-rate alarms: warn when daily usage hits 70 % of quota, and cap retries at 2 with exponential backoff (3s, 9s). Log the remote request ID in the job manifest to speed up vendor support.
@@ -543,6 +548,7 @@ Below is a focused, pragmatic list of near-term upgrades. They map to the sectio
 - Upgrade provenance comments to `<!-- source: tile_i, y=1234, sha256=..., scale=2.0 -->` and add `/jobs/{id}/artifact/... ?highlight=tile_i,y0,y1` viewer helpers.
 
 ### 19.5 Hybrid Text Recovery (opt-in)
+> _Status 2025-11-08 — OrangeDog (bd: markdown_web_browser-ogf) wired DOM+OCR link blending so `links.json` and the Links tab highlight OCR-only/DOM-only deltas; OCR-derived links now come from the Markdown output once stitching completes._
 - Detect low-confidence OCR regions (symbol rate, low alpha ratio, hyphen density) and patch them with DOM text overlays scoped to the offending block (hero headings, captions, icon fonts).
 
 ### 19.6 Caching, Indexing, Retrieval Quality
@@ -621,6 +627,8 @@ _2025-11-08 — PinkCreek (bd-ug0) designing ops automation: smoke/latency job r
   - `OCRThrottleSpike`: `ocr_retry_total{reason="throttle"}` rate > 5/min.
   - `SSEDrop`: SSE heartbeat gap > 12s (monitor via HTMX ping endpoint).
 _2025-11-08 — WhiteCastle (bd-7sx) wired Prometheus instrumentation (`prometheus-fastapi-instrumentator` + background exporter on `PROMETHEUS_PORT`) and custom metrics covering capture/OCR/stitch histograms, warning/blocklist counters, SSE/NDJSON heartbeats, and job completion totals. `/metrics` now exposes the same registry for local smoke checks and CI._
+_2025-11-08 — WhiteCastle (bd-bb4) added `scripts/check_metrics.py` so CI/ops can ping `/metrics` + the standalone exporter with one command; docs/ops now reference the helper alongside the manual curl examples._
+_2025-11-08 — PinkDog (bd-oqr) added the `mdwb diag <job_id>` CLI command so on-call engineers can pull CfT/Playwright metadata, capture/OCR/stitch timings, warnings, and blocklist hits (with `--json` output) straight from the CLI per the Section 20 playbook._
 
 ### 20.3 Release & Regression Process
 - **Chrome for Testing pinning:** upgrade CfT monthly; run the viewport sweep regression test plus the full-page omission golden test before merging. Record the CfT tag in `manifest.json` and release notes.

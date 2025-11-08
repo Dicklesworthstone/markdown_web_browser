@@ -5,12 +5,14 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import time
 from collections import deque
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Optional, TextIO, Tuple
+from typing import Any, Iterable, Iterator, Mapping, Optional, TextIO, Tuple
 
 import httpx
 import typer
@@ -31,6 +33,10 @@ demo_cli = typer.Typer(help="Demo commands hitting the built-in /jobs/demo endpo
 cli.add_typer(demo_cli, name="demo")
 jobs_cli = typer.Typer(help="Job utilities (events/watch/replay).")
 cli.add_typer(jobs_cli, name="jobs")
+jobs_replay_cli = typer.Typer(help="Replay helpers (manifest, future inputs).")
+jobs_cli.add_typer(jobs_replay_cli, name="replay")
+jobs_embeddings_cli = typer.Typer(help="Embeddings utilities (search, future helpers).")
+jobs_cli.add_typer(jobs_embeddings_cli, name="embeddings")
 jobs_artifacts_cli = typer.Typer(help="Download manifests/markdown/links for jobs.")
 jobs_cli.add_typer(jobs_artifacts_cli, name="artifacts")
 jobs_webhooks_cli = typer.Typer(help="Manage job webhooks.")
@@ -81,6 +87,15 @@ def _client(settings: APISettings, http2: bool = True) -> httpx.Client:
     )
 
 
+@contextmanager
+def _client_ctx(settings: APISettings, *, http2: bool = True) -> Iterator[httpx.Client]:
+    client = _client(settings, http2=http2)
+    try:
+        yield client
+    finally:
+        client.close()
+
+
 def _print_job(job: dict) -> None:
     table = Table("Field", "Value", title=f"Job {job.get('id', 'unknown')}")
     for key in ("state", "url", "progress", "manifest", "warnings", "blocklist_hits"):
@@ -88,6 +103,41 @@ def _print_job(job: dict) -> None:
         if isinstance(value, (dict, list)):
             value = json.dumps(value, indent=2)
         table.add_row(key, str(value))
+    console.print(table)
+
+
+def _print_ocr_metrics(manifest: dict[str, Any], *, json_output: bool) -> None:
+    batches = manifest.get("ocr_batches") or []
+    quota = manifest.get("ocr_quota") or {}
+    if json_output:
+        console.print_json(data={"batches": batches, "quota": quota})
+        return
+
+    if quota:
+        quota_table = Table("Limit", "Used", "Threshold", "Warning", title="OCR Quota")
+        threshold = quota.get("threshold_ratio", 0)
+        quota_table.add_row(
+            str(quota.get("limit", "—")),
+            str(quota.get("used", "—")),
+            f"{float(threshold)*100:.0f}%",
+            "⚠" if quota.get("warning_triggered") else "—",
+        )
+        console.print(quota_table)
+
+    table = Table("Tile IDs", "Latency (ms)", "Status", "Attempts", "Request ID", "Payload (bytes)", title="OCR Batches")
+    if not batches:
+        table.add_row("—", "—", "—", "—", "—", "—")
+    else:
+        for batch in batches:
+            tile_ids = ", ".join(batch.get("tile_ids", []))
+            table.add_row(
+                tile_ids or "—",
+                str(batch.get("latency_ms", "—")),
+                str(batch.get("status_code", "—")),
+                str(batch.get("attempts", "—")),
+                batch.get("request_id") or "—",
+                str(batch.get("payload_bytes", "—")),
+            )
     console.print(table)
 
 
@@ -112,6 +162,124 @@ def _print_webhooks(records: Iterable[dict[str, Any]]) -> None:
     console.print(table)
 
 
+def _parse_vector_input(vector: str | None, vector_file: Path | None) -> list[float]:
+    """Parse embedding vector from inline JSON/whitespace or a file."""
+
+    raw = None
+    source = "--vector"
+    if vector_file is not None:
+        source = "--vector-file"
+        raw = vector_file.read_text(encoding="utf-8")
+    elif vector is not None:
+        raw = vector
+    if raw is None:
+        raise typer.BadParameter("Provide --vector or --vector-file", param_hint="--vector")
+
+    raw = raw.strip()
+    if not raw:
+        raise typer.BadParameter("Vector input is empty", param_hint=source)
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        parsed = None
+    else:
+        if isinstance(parsed, list):
+            try:
+                return [float(value) for value in parsed]
+            except (TypeError, ValueError) as exc:  # pragma: no cover - defensive
+                raise typer.BadParameter("Vector list must contain numbers", param_hint=source) from exc
+
+    parts = raw.replace(",", " ").split()
+    if not parts:
+        raise typer.BadParameter("Vector input is empty", param_hint=source)
+    try:
+        return [float(part) for part in parts]
+    except ValueError as exc:  # pragma: no cover - defensive
+        raise typer.BadParameter("Vector input must be numeric", param_hint=source) from exc
+
+
+def _print_embedding_matches(total_sections: int, matches: Iterable[dict[str, Any]]) -> None:
+    table = Table("Section", "Tiles", "Similarity", "Distance", title="Embedding Matches")
+    for match in matches:
+        tile_start = match.get("tile_start")
+        tile_end = match.get("tile_end")
+        if tile_start is None and tile_end is None:
+            tile_range = "—"
+        else:
+            start = tile_start if tile_start is not None else "?"
+            end = tile_end if tile_end is not None else "?"
+            tile_range = f"{start}–{end}"
+        similarity = match.get("similarity")
+        distance = match.get("distance")
+        table.add_row(
+            str(match.get("section_id", "—")),
+            tile_range,
+            f"{similarity:.3f}" if isinstance(similarity, (int, float)) else str(similarity),
+            f"{distance:.3f}" if isinstance(distance, (int, float)) else str(distance),
+        )
+    console.print(table)
+    console.print(f"[dim]Total sections indexed: {total_sections}[/]")
+
+
+def _parse_event_hooks(values: Optional[list[str]]) -> dict[str, list[str]]:
+    hooks: dict[str, list[str]] = {}
+    if not values:
+        return hooks
+    for spec in values:
+        if "=" not in spec:
+            raise typer.BadParameter("Use EVENT=COMMAND syntax for --on", param_hint="--on")
+        event, command = spec.split("=", 1)
+        event = event.strip()
+        command = command.strip()
+        if not event or not command:
+            raise typer.BadParameter("EVENT=COMMAND entries must be non-empty", param_hint="--on")
+        hooks.setdefault(event, []).append(command)
+    return hooks
+
+
+def _trigger_event_hooks(entry: Mapping[str, Any], hooks: Optional[dict[str, list[str]]]) -> None:
+    if not hooks:
+        return
+    event_name = entry.get("event")
+    if not isinstance(event_name, str):
+        if "snapshot" in entry:
+            event_name = "snapshot"
+        else:
+            return
+
+    commands: list[str] = []
+    commands.extend(hooks.get(event_name, []))
+
+    if event_name == "snapshot":
+        snapshot = entry.get("snapshot")
+        if isinstance(snapshot, dict):
+            state = snapshot.get("state")
+            if isinstance(state, str):
+                commands.extend(hooks.get(f"state:{state}", []))
+
+    commands.extend(hooks.get("*", []))
+
+    if not commands:
+        return
+
+    for command in commands:
+        _run_hook(command, event_name, entry)
+
+
+def _run_hook(command: str, event_name: str, payload: Mapping[str, Any]) -> None:
+    env = os.environ.copy()
+    env["MDWB_EVENT_NAME"] = event_name
+    try:
+        env["MDWB_EVENT_PAYLOAD"] = json.dumps(payload)
+    except Exception:  # pragma: no cover - defensive
+        env["MDWB_EVENT_PAYLOAD"] = str(payload)
+    try:
+        subprocess.run(command, shell=True, check=False, env=env)
+    except Exception as exc:  # pragma: no cover - defensive
+        console.print(f"[yellow]Hook command '{command}' failed: {exc}[/]")
+
+
 def _iter_sse(response: httpx.Response) -> Iterable[Tuple[str, str]]:
     event = "message"
     data_lines: list[str] = []
@@ -130,7 +298,13 @@ def _iter_sse(response: httpx.Response) -> Iterable[Tuple[str, str]]:
         yield event, "\n".join(data_lines)
 
 
-def _stream_job(job_id: str, settings: APISettings, *, raw: bool) -> None:
+def _stream_job(
+    job_id: str,
+    settings: APISettings,
+    *,
+    raw: bool,
+    hooks: Optional[dict[str, list[str]]] = None,
+) -> None:
     with httpx.Client(base_url=settings.base_url, timeout=None, headers=_auth_headers(settings)) as client:
         with client.stream("GET", f"/jobs/{job_id}/stream") as response:
             response.raise_for_status()
@@ -139,6 +313,13 @@ def _stream_job(job_id: str, settings: APISettings, *, raw: bool) -> None:
                     console.print(f"{event}\t{payload}")
                 else:
                     _log_event(event, payload)
+                if hooks:
+                    entry_payload: Mapping[str, Any]
+                    try:
+                        entry_payload = json.loads(payload)
+                    except json.JSONDecodeError:
+                        entry_payload = {"raw": payload}
+                    _trigger_event_hooks({"event": event, "payload": entry_payload}, hooks)
 
 
 def _iter_event_lines(
@@ -191,6 +372,7 @@ def _watch_job_events_pretty(
     follow: bool,
     interval: float,
     raw: bool,
+    hooks: Optional[dict[str, list[str]]] = None,
 ) -> None:
     terminal_states = {"DONE", "FAILED"}
     for line in _iter_event_lines(job_id, settings, cursor=cursor, follow=follow, interval=interval):
@@ -202,6 +384,7 @@ def _watch_job_events_pretty(
         except json.JSONDecodeError:
             console.print(line)
             continue
+        _trigger_event_hooks(entry, hooks)
         snapshot = entry.get("snapshot")
         if isinstance(snapshot, dict):
             _render_snapshot(snapshot)
@@ -220,6 +403,7 @@ def _watch_events_with_fallback(
     follow: bool,
     interval: float,
     raw: bool,
+    hooks: Optional[dict[str, list[str]]] = None,
 ) -> None:
     """Stream `/jobs/{id}/events`, falling back to SSE when unavailable."""
 
@@ -231,10 +415,11 @@ def _watch_events_with_fallback(
             follow=follow,
             interval=interval,
             raw=raw,
+            hooks=hooks,
         )
     except httpx.HTTPError as exc:
         console.print(f"[yellow]Events feed unavailable ({exc}); falling back to SSE stream.[/]")
-        _stream_job(job_id, settings, raw=raw)
+        _stream_job(job_id, settings, raw=raw, hooks=hooks)
 
 
 def _render_snapshot(snapshot: dict[str, Any]) -> None:
@@ -293,6 +478,11 @@ def fetch(
         "--webhook-event",
         help="States that trigger the registered webhooks (defaults to DONE/FAILED).",
     ),
+    on_event: Optional[list[str]] = typer.Option(
+        None,
+        "--on",
+        help="When using --watch, run COMMAND whenever EVENT fires (format EVENT=COMMAND). Repeat flag for multiple hooks.",
+    ),
 ) -> None:
     """Submit a new capture job and optionally stream progress."""
 
@@ -306,6 +496,12 @@ def fetch(
         payload["profile_id"] = profile
     if ocr_policy:
         payload["ocr"] = {"policy": ocr_policy}
+
+    hook_map = {}
+    if on_event:
+        hook_map = _parse_event_hooks(on_event)
+        if not watch:
+            raise typer.BadParameter("--on requires --watch so hooks have events to monitor.", param_hint="--on")
 
     response = client.post("/jobs", json=payload)
     response.raise_for_status()
@@ -331,6 +527,7 @@ def fetch(
             follow=True,
             interval=2.0,
             raw=raw,
+            hooks=hook_map or None,
         )
 
 
@@ -339,14 +536,29 @@ def show(
     job_id: str = typer.Argument(..., help="Job identifier"),
     api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
     http2: bool = typer.Option(True, "--http2/--no-http2"),
+    ocr_metrics: bool = typer.Option(False, "--ocr-metrics/--no-ocr-metrics", help="Print OCR batch telemetry when available."),
 ) -> None:
     """Display the latest snapshot for a real job."""
 
     settings = _resolve_settings(api_base)
+    snapshot = _fetch_job_snapshot(job_id, settings, http2=http2)
+    _print_job(snapshot)
+    if ocr_metrics:
+        manifest = snapshot.get("manifest")
+        if not manifest:
+            console.print("[yellow]Manifest not available yet; try again after the job completes.[/]")
+        else:
+            _print_ocr_metrics(manifest, json_output=False)
+
+
+def _fetch_job_snapshot(job_id: str, settings: APISettings, *, http2: bool = True) -> dict[str, Any]:
     client = _client(settings, http2=http2)
-    response = client.get(f"/jobs/{job_id}")
-    response.raise_for_status()
-    _print_job(response.json())
+    try:
+        response = client.get(f"/jobs/{job_id}")
+        response.raise_for_status()
+        return response.json()
+    finally:
+        client.close()
 
 
 @cli.command()
@@ -359,6 +571,47 @@ def stream(
 
     settings = _resolve_settings(api_base)
     _stream_job(job_id, settings, raw=raw)
+
+
+@cli.command()
+def diag(
+    job_id: str = typer.Argument(..., help="Job identifier"),
+    api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
+    json_output: bool = typer.Option(False, "--json/--no-json", help="Emit JSON payload instead of tables."),
+) -> None:
+    """Print manifest/environment details for a job."""
+
+    settings = _resolve_settings(api_base)
+    client = _client(settings)
+    response = client.get(f"/jobs/{job_id}")
+    if response.status_code == 404:
+        detail = _extract_detail(response) or f"Job {job_id} not found."
+        console.print(f"[red]{detail}[/]")
+        raise typer.Exit(1)
+    response.raise_for_status()
+    snapshot = response.json()
+
+    manifest = snapshot.get("manifest")
+    manifest_source = "snapshot"
+    manifest_error: str | None = None
+    if not manifest:
+        manifest_response = client.get(f"/jobs/{job_id}/manifest.json")
+        if manifest_response.status_code < 400:
+            manifest = manifest_response.json()
+            manifest_source = "manifest.json"
+        else:
+            manifest_error = _extract_detail(manifest_response) or "Manifest unavailable"
+
+    payload = {
+        "snapshot": snapshot,
+        "manifest": manifest,
+        "manifest_source": manifest_source,
+        "manifest_error": manifest_error,
+    }
+    if json_output:
+        console.print_json(data=payload)
+        return
+    _print_diag_report(snapshot, manifest, manifest_source, manifest_error)
 
 
 @cli.command()
@@ -386,10 +639,16 @@ def watch(
     follow: bool = typer.Option(True, "--follow/--once", help="Keep polling for new events instead of exiting."),
     interval: float = typer.Option(2.0, "--interval", help="Polling interval in seconds when following."),
     raw: bool = typer.Option(False, "--raw", help="Print raw NDJSON events instead of formatted output."),
+    on_event: Optional[list[str]] = typer.Option(
+        None,
+        "--on",
+        help="Run COMMAND when EVENT fires (format EVENT=COMMAND). Repeat flag to add multiple hooks.",
+    ),
 ) -> None:
     """Stream `/jobs/{id}/events` with optional fallback to SSE."""
 
     settings = _resolve_settings(api_base)
+    hook_map = _parse_event_hooks(on_event)
     _watch_events_with_fallback(
         job_id,
         settings,
@@ -397,6 +656,7 @@ def watch(
         follow=follow,
         interval=interval,
         raw=raw,
+        hooks=hook_map or None,
     )
 
 
@@ -533,6 +793,18 @@ def _write_binary_output(content: bytes, path: str | None, *, description: str) 
         console.print(f"[green]Saved {description} to {out_path}[/]")
     else:
         console.print(content.decode("utf-8", errors="ignore"))
+
+
+def _download_bundle(job_id: str, api_base: Optional[str], out: Optional[str]) -> None:
+    settings = _resolve_settings(api_base)
+    client = _client(settings)
+    response = client.get(f"/jobs/{job_id}/artifact/bundle.tar.zst")
+    if response.status_code == 404:
+        console.print(f"[red]Job {job_id} or bundle not found.[/]")
+        raise typer.Exit(code=1)
+    response.raise_for_status()
+    target = out or f"{job_id}-bundle.tar.zst"
+    _write_binary_output(response.content, target, description="bundle")
 
 
 def _register_webhooks_for_job(
@@ -676,6 +948,82 @@ def _format_validation_summary(values: Any) -> str:
     if not isinstance(values, list) or not values:
         return "-"
     return "; ".join(str(entry) for entry in values)
+
+
+def _format_progress_text(progress: Any) -> str:
+    if not isinstance(progress, dict):
+        return "-"
+    done = progress.get("done")
+    total = progress.get("total")
+    if done is None and total is None:
+        return "-"
+    if done is None:
+        return f"? / {total}"
+    if total is None:
+        return f"{done} / ?"
+    return f"{done} / {total}"
+
+
+def _print_diag_report(
+    snapshot: dict[str, Any],
+    manifest: dict[str, Any] | None,
+    manifest_source: str,
+    manifest_error: str | None,
+) -> None:
+    summary = Table("Field", "Value", title=f"Job {snapshot.get('id', 'unknown')}")
+    summary.add_row("URL", snapshot.get("url", "—"))
+    summary.add_row("State", str(snapshot.get("state", "—")))
+    summary.add_row("Progress", _format_progress_text(snapshot.get("progress")))
+    summary.add_row("Manifest Path", snapshot.get("manifest_path") or "—")
+    summary.add_row("Manifest Source", manifest_source if manifest else "not available")
+    if manifest_error:
+        summary.add_row("Manifest Error", manifest_error)
+    if snapshot.get("error"):
+        summary.add_row("Error", str(snapshot.get("error")))
+    console.print(summary)
+
+    env = (manifest or {}).get("environment")
+    if isinstance(env, dict):
+        env_table = Table("Field", "Value", title="Environment")
+        env_table.add_row("CfT", f"{env.get('cft_label', '—')} / {env.get('cft_version', '—')}")
+        env_table.add_row("Playwright", f"{env.get('playwright_channel', '—')} / {env.get('playwright_version', '—')}")
+        env_table.add_row("Browser Transport", env.get("browser_transport", "—"))
+        viewport = env.get("viewport") or {}
+        env_table.add_row(
+            "Viewport",
+            f"{viewport.get('width', '—')}×{viewport.get('height', '—')} @ {viewport.get('device_scale_factor', '—')}x",
+        )
+        env_table.add_row("Screenshot Style Hash", env.get("screenshot_style_hash", "—"))
+        console.print(env_table)
+
+    timings = (manifest or {}).get("timings")
+    if isinstance(timings, dict):
+        timings_table = Table("Stage", "Milliseconds", title="Timings")
+        timings_table.add_row("Capture", str(timings.get("capture_ms", "—")))
+        timings_table.add_row("OCR", str(timings.get("ocr_ms", "—")))
+        timings_table.add_row("Stitch", str(timings.get("stitch_ms", "—")))
+        timings_table.add_row("Total", str(timings.get("total_ms", "—")))
+        console.print(timings_table)
+
+    warnings = (manifest or {}).get("warnings") or []
+    if warnings:
+        warn_table = Table("Code", "Count", "Threshold", "Message", title="Warnings")
+        for entry in warnings:
+            if not isinstance(entry, dict):
+                warn_table.add_row(str(entry), "-", "-", "-")
+                continue
+            warn_table.add_row(
+                str(entry.get("code", "—")),
+                str(entry.get("count", "—")),
+                str(entry.get("threshold", "—")),
+                entry.get("message", "—"),
+            )
+        console.print(warn_table)
+    else:
+        console.print("[dim]No manifest warnings recorded.[/]")
+
+    blocklist_hits = (manifest or {}).get("blocklist_hits")
+    console.print(f"Blocklist Hits: {_format_blocklist(blocklist_hits)}")
 
 
 def _follow_warning_log(path: Path, *, json_output: bool, interval: float) -> None:
@@ -916,9 +1264,11 @@ def jobs_webhooks_delete(
     if response.status_code == 404:
         detail = _extract_detail(response) or "Webhook or job not found."
         _print_delete_error(detail, job_id, json_output)
+        return
     if response.status_code == 400:
         detail = _extract_detail(response) or "Webhook deletion rejected."
         _print_delete_error(detail, job_id, json_output)
+        return
     response.raise_for_status()
     body = response.json()
     if json_output:
@@ -991,22 +1341,48 @@ def jobs_links(
 def jobs_bundle(
     job_id: str = typer.Argument(..., help="Job identifier"),
     api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
-    out: Optional[str] = typer.Option("bundle.tar.zst", "--out", help="Write tar bundle to this path"),
+    out: Optional[str] = typer.Option(
+        None,
+        "--out",
+        help="Write tar bundle to this path (defaults to <job-id>-bundle.tar.zst).",
+    ),
 ) -> None:
+    _download_bundle(job_id, api_base, out)
+
+
+@jobs_cli.command("bundle")
+def jobs_bundle_alias(
+    job_id: str = typer.Argument(..., help="Job identifier"),
+    api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
+    out: Optional[str] = typer.Option(
+        None,
+        "--out",
+        help="Write tar bundle to this path (defaults to <job-id>-bundle.tar.zst).",
+    ),
+) -> None:
+    """Download the tar bundle (tiles, manifest, markdown, links) for a job."""
+
+    _download_bundle(job_id, api_base, out)
+
+
+@jobs_cli.command("ocr-metrics")
+def jobs_ocr_metrics(
+    job_id: str = typer.Argument(..., help="Job identifier"),
+    api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
+    json_output: bool = typer.Option(False, "--json", help="Emit OCR telemetry as JSON"),
+) -> None:
+    """Show OCR batch latency + quota telemetry for a job."""
+
     settings = _resolve_settings(api_base)
-    client = _client(settings)
-    response = client.get(f"/jobs/{job_id}/artifact/bundle.tar.zst")
-    if response.status_code == 404:
-        console.print(f"[red]Job {job_id} or bundle not found.[/]")
-        raise typer.Exit(code=1)
-    response.raise_for_status()
-    if not out:
-        out = f"{job_id}-bundle.tar.zst"
-    _write_binary_output(response.content, out, description="bundle")
+    snapshot = _fetch_job_snapshot(job_id, settings)
+    manifest = snapshot.get("manifest")
+    if not manifest:
+        raise typer.BadParameter("Manifest not available yet; rerun once the job completes.")
+    _print_ocr_metrics(manifest, json_output=json_output)
 
 
-@jobs_cli.command("replay")
-def jobs_replay(
+@jobs_replay_cli.command("manifest")
+def jobs_replay_manifest(
     manifest_path: Path = typer.Argument(
         ...,
         exists=True,
@@ -1043,6 +1419,50 @@ def jobs_replay(
         return
     console.print("[green]Replay submitted.[/]")
     _print_job(job)
+
+
+@jobs_embeddings_cli.command("search")
+def jobs_embeddings_search(
+    job_id: str = typer.Argument(..., help="Job identifier"),
+    vector: Optional[str] = typer.Option(
+        None,
+        "--vector",
+        help="Inline JSON/whitespace-separated floats representing the embedding vector.",
+    ),
+    vector_file: Optional[Path] = typer.Option(
+        None,
+        "--vector-file",
+        exists=True,
+        dir_okay=False,
+        readable=True,
+        resolve_path=True,
+        help="Path to a JSON/whitespace vector file.",
+    ),
+    top_k: int = typer.Option(5, "--top-k", "-k", help="Number of sections to return."),
+    api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
+    json_output: bool = typer.Option(False, "--json/--no-json", help="Emit JSON instead of a table."),
+) -> None:
+    """Search section embeddings for a job."""
+
+    vector_values = _parse_vector_input(vector, vector_file)
+    if top_k < 1:
+        raise typer.BadParameter("top-k must be at least 1", param_hint="--top-k")
+
+    settings = _resolve_settings(api_base)
+    client = _client(settings)
+    response = client.post(
+        f"/jobs/{job_id}/embeddings/search",
+        json={"vector": vector_values, "top_k": top_k},
+    )
+    if response.status_code >= 400:
+        detail = _extract_detail(response) or response.text or f"HTTP {response.status_code}"
+        console.print(f"[red]Embeddings search failed:[/] {detail}")
+        raise typer.Exit(1)
+    data = response.json()
+    if json_output:
+        console.print_json(data=data)
+        return
+    _print_embedding_matches(data.get("total_sections", 0), data.get("matches", []))
 
 
 def _print_delete_error(detail: str, job_id: str, json_output: bool) -> None:

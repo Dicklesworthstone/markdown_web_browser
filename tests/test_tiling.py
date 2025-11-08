@@ -11,7 +11,11 @@ try:  # pragma: no cover - exercised only when libvips missing
 except Exception as exc:  # noqa: BLE001
     pytest.skip(f"pyvips unavailable: {exc}", allow_module_level=True)
 else:
+    if not hasattr(_pyvips, "Image"):
+        pytest.skip("pyvips.Image not available", allow_module_level=True)
     pyvips = _pyvips  # type: Any
+    if not hasattr(getattr(pyvips, "Image", None), "black"):
+        pytest.skip("pyvips stub lacks Image.black; skipping tiler tests", allow_module_level=True)
 
 from app.tiler import TileSlice, validate_tiles
 

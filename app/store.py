@@ -56,6 +56,11 @@ class RunRecord(SQLModel, table=True):
     capture_ms: int | None = None
     ocr_ms: int | None = None
     stitch_ms: int | None = None
+    sweep_shrink_events: int | None = None
+    sweep_retry_attempts: int | None = None
+    sweep_overlap_pairs: int | None = None
+    overlap_match_ratio: float | None = None
+    validation_failure_count: int | None = None
 
 
 class LinkRecord(SQLModel, table=True):
@@ -156,6 +161,7 @@ class Store:
         self.engine = _create_engine(self.config.db_path)
         SQLModel.metadata.create_all(self.engine)
         self._ensure_vec_table()
+        self._ensure_run_columns()
 
     def _ensure_vec_table(self) -> None:
         ddl = text(
@@ -171,6 +177,25 @@ class Store:
         )
         with self.engine.begin() as conn:
             conn.exec_driver_sql(ddl.text)
+
+    def _ensure_run_columns(self) -> None:
+        """Add newly introduced run columns when upgrading existing databases."""
+
+        expected_types = {
+            "sweep_shrink_events": "INTEGER",
+            "sweep_retry_attempts": "INTEGER",
+            "sweep_overlap_pairs": "INTEGER",
+            "overlap_match_ratio": "REAL",
+            "validation_failure_count": "INTEGER",
+        }
+        with self.engine.begin() as conn:
+            existing = {
+                row[1]  # column name
+                for row in conn.exec_driver_sql("PRAGMA table_info(runs)")
+            }
+            for column, ddl in expected_types.items():
+                if column not in existing:
+                    conn.exec_driver_sql(f"ALTER TABLE runs ADD COLUMN {column} {ddl}")
 
     @contextmanager
     def session(self) -> Iterator[Session]:
@@ -537,6 +562,18 @@ def _apply_manifest_metadata(record: RunRecord, manifest: Mapping[str, object] |
 
     _set_int("tiles_total", manifest_dict.get("tiles_total"))
     _set_int("long_side_px", manifest_dict.get("long_side_px"))
+    sweep_stats = manifest_dict.get("sweep_stats")
+    if isinstance(sweep_stats, Mapping):
+        _set_int("sweep_shrink_events", sweep_stats.get("shrink_events"))
+        _set_int("sweep_retry_attempts", sweep_stats.get("retry_attempts"))
+        _set_int("sweep_overlap_pairs", sweep_stats.get("overlap_pairs"))
+        if sweep_stats.get("overlap_match_ratio") is not None:
+            _set("overlap_match_ratio", sweep_stats.get("overlap_match_ratio"))
+    if manifest_dict.get("overlap_match_ratio") is not None:
+        _set("overlap_match_ratio", manifest_dict.get("overlap_match_ratio"))
+    validation_failures = manifest_dict.get("validation_failures")
+    if isinstance(validation_failures, list):
+        _set_int("validation_failure_count", len(validation_failures))
 
 
 def _manifest_to_dict(manifest: Mapping[str, object] | Any) -> dict[str, Any]:

@@ -60,6 +60,9 @@ class OCRSettings:
     use_fp8: bool
     min_concurrency: int
     max_concurrency: int
+    max_batch_tiles: int
+    max_batch_bytes: int
+    daily_quota_tiles: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,6 +176,16 @@ def _csv_tuple(cfg: DecoupleConfig, key: str) -> tuple[str, ...]:
     return tuple(part.strip() for part in raw.split(",") if part.strip())
 
 
+def _optional_int(cfg: DecoupleConfig, key: str) -> int | None:
+    value = cfg(key, default=None)
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:  # pragma: no cover - defensive
+        raise ValueError(f"{key} must be an integer") from exc
+
+
 def _derive_screenshot_hash(
     *,
     explicit: str,
@@ -266,6 +279,9 @@ def get_settings(env_path: str = ".env") -> Settings:
         use_fp8=_bool(cfg, "OCR_USE_FP8", default=True),
         min_concurrency=_int(cfg, "OCR_MIN_CONCURRENCY", default=2),
         max_concurrency=_int(cfg, "OCR_MAX_CONCURRENCY", default=8),
+        max_batch_tiles=_int(cfg, "OCR_MAX_BATCH_TILES", default=3),
+        max_batch_bytes=_int(cfg, "OCR_MAX_BATCH_BYTES", default=25_000_000),
+        daily_quota_tiles=_optional_int(cfg, "OCR_DAILY_QUOTA_TILES"),
     )
     if ocr.max_concurrency < ocr.min_concurrency:
         msg = "OCR_MAX_CONCURRENCY must be >= OCR_MIN_CONCURRENCY"

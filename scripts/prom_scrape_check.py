@@ -4,32 +4,31 @@
 from __future__ import annotations
 
 import sys
-from typing import Optional
 
 import httpx
 
+from app.settings import get_settings
 from scripts import mdwb_cli
 
 
 def main() -> None:
     settings = mdwb_cli._resolve_settings(None)  # reuse CLI env loader
-    base_port = settings.base_url.rstrip("/").split(":")[-1]
-    exporter_port = mdwb_cli.config("PROMETHEUS_PORT", default=base_port)
-    urls = [
-        f"{settings.base_url.rstrip('/')}/metrics",
-        f"http://localhost:{exporter_port}/metrics",
-    ]
-    client = httpx.Client(timeout=5)
-    for url in urls:
-        try:
-            response = client.get(url)
-            response.raise_for_status()
-        except Exception as exc:  # noqa: BLE001
-            print(f"❌ metrics scrape failed: {url} ({exc})")
-            sys.exit(1)
-        else:
-            print(f"✅ metrics scrape ok: {url}")
-    client.close()
+    app_settings = get_settings()
+    base_url = settings.base_url.rstrip("/")
+    urls = [f"{base_url}/metrics"]
+    exporter_port = app_settings.telemetry.prometheus_port
+    if exporter_port:
+        urls.append(f"http://localhost:{exporter_port}/metrics")
+    with httpx.Client(timeout=5) as client:
+        for url in urls:
+            try:
+                response = client.get(url)
+                response.raise_for_status()
+            except Exception as exc:  # noqa: BLE001
+                print(f"❌ metrics scrape failed: {url} ({exc})")
+                sys.exit(1)
+            else:
+                print(f"✅ metrics scrape ok: {url}")
 
 
 if __name__ == "__main__":

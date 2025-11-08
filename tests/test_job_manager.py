@@ -63,6 +63,10 @@ except OSError:  # pyvips missing in CI
         warnings: list
         overlap_match_ratio: float
         validation_failures: list
+        ocr_ms: int | None = None
+        stitch_ms: int | None = None
+        ocr_batches: list | None = None
+        ocr_quota: dict | None = None
 
     @dataclass
     class CaptureResult:  # type: ignore[override]
@@ -110,6 +114,24 @@ async def _fake_runner(*, job_id: str, url: str, store: Store, config=None):  # 
         warnings=[],
         overlap_match_ratio=0.0,
         validation_failures=[],
+        ocr_ms=1200,
+        stitch_ms=300,
+        ocr_batches=[
+            {
+                "tile_ids": [f"{job_id}-tile-0000"],
+                "latency_ms": 850,
+                "status_code": 200,
+                "attempts": 1,
+                "payload_bytes": 2048,
+                "request_id": "req-demo",
+            }
+        ],
+        ocr_quota={
+            "limit": 10,
+            "used": 3,
+            "threshold_ratio": 0.7,
+            "warning_triggered": False,
+        },
     )
     return CaptureResult(tiles=[], manifest=manifest), []
 
@@ -209,6 +231,19 @@ async def test_job_manager_events_sequence_filter(tmp_path: Path):
     new_events = manager.get_events(job_id, min_sequence=last_seq)
     assert new_events
     assert new_events[0]["sequence"] > last_seq
+
+
+@pytest.mark.asyncio
+async def test_job_manager_emits_ocr_event(tmp_path: Path):
+    config = StorageConfig(cache_root=tmp_path / "cache", db_path=tmp_path / "runs.db")
+    manager = JobManager(store=Store(config), runner=_fake_runner)
+    snapshot = await manager.create_job(JobCreateRequest(url="https://example.com/ocr"))
+    job_id = snapshot["id"]
+    await manager._tasks[job_id]
+
+    events = manager.get_events(job_id)
+
+    assert any(entry.get("event") == "ocr_telemetry" for entry in events)
 
 
 @pytest.mark.asyncio

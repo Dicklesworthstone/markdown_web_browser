@@ -5,9 +5,19 @@ from __future__ import annotations
 import asyncio
 import hashlib
 from dataclasses import dataclass
-from typing import Iterable, List, Optional
+from typing import Any, Iterable, List, Optional, TYPE_CHECKING
 
-import pyvips
+try:  # pragma: no cover - exercised indirectly via helper
+    import pyvips as _pyvips  # type: ignore[import-not-found]
+except Exception as exc:  # pragma: no cover - missing native dependency
+    _PYVIPS = None
+    _PYVIPS_IMPORT_ERROR = exc
+else:  # pragma: no cover - import succeeds during normal runtime
+    _PYVIPS = _pyvips
+    _PYVIPS_IMPORT_ERROR = None
+
+if TYPE_CHECKING:  # pragma: no cover - typing aide only
+    import pyvips  # noqa: F401
 
 # PNG encode defaults that match PLAN §19.3 guidance.
 _PNG_ENCODE_ARGS = {
@@ -65,7 +75,8 @@ def _slice_sync(
     viewport_y_offset: int,
     target_long_side_px: int,
 ) -> List[TileSlice]:
-    image = pyvips.Image.new_from_buffer(image_bytes, "", access="sequential")
+    vips = _require_pyvips()
+    image = vips.Image.new_from_buffer(image_bytes, "", access="sequential")
 
     # Downscale only when the width exceeds the 1288 px guidance; height is handled via tiling.
     scale = 1.0
@@ -148,7 +159,7 @@ def _unscale(value: int, scale: float) -> float:
     return value / scale
 
 
-def _overlap_sha(image: pyvips.Image, *, position: str, overlap_px: int) -> Optional[str]:
+def _overlap_sha(image: Any, *, position: str, overlap_px: int) -> Optional[str]:
     if overlap_px <= 0:
         return None
 
@@ -169,15 +180,26 @@ def _overlap_sha(image: pyvips.Image, *, position: str, overlap_px: int) -> Opti
 def validate_tiles(tiles: Iterable[TileSlice]) -> None:
     """Ensure each tile's checksum matches bytes and pyvips can decode it."""
 
+    vips = _require_pyvips()
     for tile in tiles:
         if hashlib.sha256(tile.png_bytes).hexdigest() != tile.sha256:
             raise ValueError(f"Tile {tile.index} checksum mismatch")
         try:
-            image = pyvips.Image.new_from_buffer(tile.png_bytes, "", access="sequential")
-        except pyvips.Error as exc:  # pragma: no cover - depends on corrupted data
+            image = vips.Image.new_from_buffer(tile.png_bytes, "", access="sequential")
+        except Exception as exc:  # pragma: no cover - depends on corrupted data
             raise ValueError(f"Tile {tile.index} PNG decode failed") from exc
         if image.width != tile.width or image.height != tile.height:
             raise ValueError(
                 f"Tile {tile.index} dimension mismatch: expected {tile.width}x{tile.height},"
                 f" got {image.width}x{image.height}"
             )
+
+
+def _require_pyvips():
+    if _PYVIPS is None:
+        message = (
+            "pyvips/libvips is not installed or failed to load. "
+            "Install the libvips shared library (see PLAN §19.3) to enable tiling."
+        )
+        raise RuntimeError(message) from _PYVIPS_IMPORT_ERROR
+    return _PYVIPS
