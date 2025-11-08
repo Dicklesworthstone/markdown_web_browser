@@ -50,6 +50,7 @@ See `PLAN_TO_IMPLEMENT_MARKDOWN_WEB_BROWSER_PROJECT.md` §§2–5, 19 for the fu
 - `warnings --count 50` — tail `ops/warnings.jsonl` for capture/blocklist incidents.
 - `dom links --job-id <id>` — render the stored `links.json` (anchors/forms/headings/meta).
 - `jobs ocr-metrics <job-id> [--json]` — summarize OCR batch latency, request IDs, and quota usage from the manifest.
+- `resume status --root path [--limit 10 --json]` — inspect the resume state (done flags + optional work_index) that powers `fetch --resume`.
 - `demo snapshot|stream|events` — exercise the demo endpoints without hitting a live pipeline.
 
 The CLI reads `API_BASE_URL` + `MDWB_API_KEY` from `.env`; override with `--api-base` when targeting staging. For CUDA/vLLM workflows, see `docs/olmocr_cli_tool_documentation.md` and `docs/olmocr_cli_integration.md` for detailed setup + merge notes.

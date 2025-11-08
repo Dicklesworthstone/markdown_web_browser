@@ -151,6 +151,16 @@ class ResumeManager:
         done = sum(len(mapping.get(h, ())) for h in done_hashes if h in mapping)
         return done, total
 
+    def list_entries(self, limit: Optional[int] = None) -> list[str]:
+        mapping = self._load_index()
+        if mapping:
+            all_entries: list[str] = sorted({entry for entries in mapping.values() for entry in entries})
+        else:
+            all_entries = [f"hash:{value}" for value in sorted(self._done_hashes())]
+        if limit is not None and limit > 0:
+            return all_entries[:limit]
+        return all_entries
+
     def is_complete(self, entry: str) -> bool:
         group_hash = _resume_hash(entry)
         if group_hash not in self._done_hashes():
@@ -233,6 +243,45 @@ class ResumeManager:
         temp_path.write_bytes(compressed)
         temp_path.replace(self.index_path)
         self._index_cache = mapping
+
+
+@resume_cli.command("status")
+def resume_status(
+    root: Path = typer.Option(Path("."), "--root", "-r", help="Resume root containing done_flags/work_index."),
+    limit: int = typer.Option(10, min=0, help="Maximum entries to display (0 = unlimited)."),
+    json_output: bool = typer.Option(False, "--json/--no-json", help="Emit JSON instead of tables."),
+) -> None:
+    """Inspect the completion state tracked by --resume."""
+
+    manager = ResumeManager(root.resolve())
+    done, total = manager.status()
+    entry_limit = None if limit == 0 else limit
+    entries = manager.list_entries(entry_limit)
+    data = {
+        "root": str(manager.root),
+        "done_dir": str(manager.done_dir),
+        "index_path": str(manager.index_path),
+        "done": done,
+        "total": total,
+        "entries": entries,
+    }
+    if json_output:
+        console.print_json(data=data)
+        return
+
+    table = Table("Field", "Value", title="Resume Status")
+    table.add_row("Root", data["root"])
+    table.add_row("done_flags", data["done_dir"])
+    table.add_row("index", data["index_path"])
+    table.add_row("Completed", str(done))
+    table.add_row("Total", "?" if total is None else str(total))
+    console.print(table)
+    if entries:
+        console.print(f"Showing {len(entries)} entr{'y' if len(entries)==1 else 'ies'} (limit={'all' if entry_limit is None else entry_limit}):")
+        for entry in entries:
+            console.print(f"- {entry}")
+    else:
+        console.print("[dim]No resume entries recorded yet.[/]")
 
 
 def _print_job(job: dict) -> None:

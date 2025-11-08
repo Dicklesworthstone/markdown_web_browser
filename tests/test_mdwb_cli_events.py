@@ -97,6 +97,25 @@ def test_iter_event_lines_updates_cursor_and_closes_client(monkeypatch):
     assert fake_client.closed
 
 
+def test_client_ctx_preserves_explicit_timeout(monkeypatch):
+    captured: dict[str, object] = {}
+
+    class DummyClient:
+        def close(self) -> None:
+            captured["closed"] = True
+
+    def fake_client(settings, http2=True, timeout=None):  # noqa: ANN001
+        captured["timeout"] = timeout
+        return DummyClient()
+
+    monkeypatch.setattr(mdwb_cli, "_client", fake_client)
+    with mdwb_cli._client_ctx(API_SETTINGS, timeout=None):
+        pass
+
+    assert "closed" in captured
+    assert captured["timeout"] is None
+
+
 def test_watch_job_events_pretty_renders_snapshot(monkeypatch):
     events = [
         json.dumps(
@@ -149,7 +168,7 @@ def test_watch_events_with_fallback_streams_via_sse(monkeypatch):
 
     calls: dict[str, object] = {}
 
-    def fake_stream(job_id: str, settings: mdwb_cli.APISettings, raw: bool, hooks=None):  # noqa: ANN001
+    def fake_stream(job_id: str, settings: mdwb_cli.APISettings, raw: bool, hooks=None, **_):  # noqa: ANN001
         calls["job_id"] = job_id
         calls["raw"] = raw
 
