@@ -296,8 +296,11 @@ class JobManager:
                     if not record:
                         continue
 
-                    # Calculate elapsed time
-                    elapsed_seconds = (now - record.started_at).total_seconds()
+                    # Calculate elapsed time (SQLite strips timezone, so make it UTC-aware if needed)
+                    started_at = record.started_at
+                    if started_at.tzinfo is None:
+                        started_at = started_at.replace(tzinfo=timezone.utc)
+                    elapsed_seconds = (now - started_at).total_seconds()
 
                     if elapsed_seconds > self._job_timeout_seconds:
                         LOGGER.error(

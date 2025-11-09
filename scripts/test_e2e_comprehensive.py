@@ -1645,11 +1645,13 @@ async def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s                           # Run all tests
-  %(prog)s --interactive            # Interactive mode with confirmations
-  %(prog)s --parallel 4             # Run 4 tests in parallel
-  %(prog)s --api-url http://prod    # Test against production
-  %(prog)s --verbose                # Extra detailed output
+  %(prog)s                                          # Run all tests
+  %(prog)s --url https://finviz.com                # Test a specific URL
+  %(prog)s --url https://example.com --verbose     # Test URL with detailed output
+  %(prog)s --interactive                           # Interactive mode with confirmations
+  %(prog)s --parallel 4                            # Run 4 tests in parallel
+  %(prog)s --api-url http://prod                   # Test against production
+  %(prog)s --verbose                               # Extra detailed output
         """
     )
 
@@ -1657,6 +1659,10 @@ Examples:
         "--api-url",
         default="http://localhost:8000",
         help="API base URL to test"
+    )
+    parser.add_argument(
+        "--url",
+        help="Test a specific URL (creates custom test case, runs only this URL unless --category/--priority specified)"
     )
     parser.add_argument(
         "--interactive",
@@ -1696,21 +1702,60 @@ Examples:
         verbose=args.verbose
     )
 
-    # Setup test suite
-    runner.setup_test_suite()
+    # Setup test suite or create custom URL test
+    if args.url:
+        # Create a custom test case for the provided URL
+        parsed = urlparse(args.url)
+        domain = parsed.netloc or "custom"
 
-    # Filter tests if requested
-    if args.category:
-        runner.test_cases = [
-            tc for tc in runner.test_cases
-            if tc.category.value == args.category
-        ]
+        custom_test = TestCase(
+            id="custom_url_001",
+            name=f"Custom URL Test: {domain}",
+            description=f"Quick test of user-provided URL: {args.url}",
+            category=TestCategory.FUNCTIONAL,
+            priority=TestPriority.HIGH,
+            url=args.url,
+            timeout=90.0,
+            expected_tiles_min=1,
+            validation_level=ValidationLevel.THOROUGH,
+            tags={"custom", "user-provided"}
+        )
 
-    if args.priority:
-        runner.test_cases = [
-            tc for tc in runner.test_cases
-            if tc.priority.value <= args.priority
-        ]
+        # If no other filters specified, run ONLY the custom URL test
+        if not args.category and not args.priority:
+            runner.test_cases = [custom_test]
+        else:
+            # If filters specified, add custom test to full suite and apply filters
+            runner.setup_test_suite()
+            runner.test_cases.append(custom_test)
+
+            if args.category:
+                runner.test_cases = [
+                    tc for tc in runner.test_cases
+                    if tc.category.value == args.category
+                ]
+
+            if args.priority:
+                runner.test_cases = [
+                    tc for tc in runner.test_cases
+                    if tc.priority.value <= args.priority
+                ]
+    else:
+        # Normal flow: setup full test suite
+        runner.setup_test_suite()
+
+        # Filter tests if requested
+        if args.category:
+            runner.test_cases = [
+                tc for tc in runner.test_cases
+                if tc.category.value == args.category
+            ]
+
+        if args.priority:
+            runner.test_cases = [
+                tc for tc in runner.test_cases
+                if tc.priority.value <= args.priority
+            ]
 
     # Run tests
     await runner.run_all_tests()
