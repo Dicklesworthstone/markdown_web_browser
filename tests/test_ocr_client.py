@@ -2,19 +2,16 @@
 
 from __future__ import annotations
 
-import asyncio
-import base64
-import os
-from pathlib import Path
-from typing import Any, Iterator
-
-import httpx
-import pytest
-from PIL import Image
 import io
+import os
+from typing import Iterator
 
-from app.ocr_client import OCRBatchTelemetry, OCRRequest, reset_quota_tracker, submit_tiles
-from app.settings import get_settings, Settings
+import pytest
+from PIL import Image, ImageDraw, ImageFont
+from playwright.async_api import async_playwright
+
+from app.ocr_client import OCRRequest, reset_quota_tracker, submit_tiles
+from app.settings import get_settings
 
 
 @pytest.fixture(autouse=True)
@@ -26,17 +23,35 @@ def _reset_quota_tracker_fixture() -> Iterator[None]:
 
 def create_real_test_image(width: int = 1280, height: int = 720, text: str = "Test") -> bytes:
     """Create a real PNG image with text for testing."""
-    from PIL import Image, ImageDraw, ImageFont
-
     # Create white image
     img = Image.new('RGB', (width, height), color='white')
     draw = ImageDraw.Draw(img)
 
-    # Try to use a font, fall back to default if not available
-    try:
-        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 48)
-    except:
-        font = ImageFont.load_default()
+    # Try to use a system font, fall back to default if not available
+    font_size = 48
+    font = None
+
+    # Try multiple font paths for cross-platform compatibility
+    font_paths = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",  # Linux
+        "/System/Library/Fonts/Helvetica.ttc",  # macOS
+        "C:\\Windows\\Fonts\\Arial.ttf",  # Windows
+    ]
+
+    for font_path in font_paths:
+        try:
+            font = ImageFont.truetype(font_path, font_size)
+            break
+        except (IOError, OSError):
+            continue
+
+    if font is None:
+        # Use default font as last resort
+        try:
+            font = ImageFont.load_default(size=font_size)
+        except TypeError:
+            # Older PIL versions don't support size parameter
+            font = ImageFont.load_default()
 
     # Add some text
     draw.text((50, 50), text, fill='black', font=font)
@@ -46,11 +61,12 @@ def create_real_test_image(width: int = 1280, height: int = 720, text: str = "Te
     # Convert to PNG bytes
     img_bytes = io.BytesIO()
     img.save(img_bytes, format='PNG')
+    img_bytes.seek(0)  # Important: seek to beginning
     return img_bytes.getvalue()
 
 
 @pytest.mark.asyncio
-@pytest.mark.skipif(not os.getenv("OCR_API_KEY"), reason="Requires real OCR API key")
+@pytest.mark.skipif(not os.getenv("OLMOCR_API_KEY"), reason="Requires real OCR API key")
 async def test_real_ocr_api_single_image():
     """Test with real OCR API using a real image."""
     settings = get_settings()
@@ -86,7 +102,7 @@ async def test_real_ocr_api_single_image():
 
 
 @pytest.mark.asyncio
-@pytest.mark.skipif(not os.getenv("OCR_API_KEY"), reason="Requires real OCR API key")
+@pytest.mark.skipif(not os.getenv("OLMOCR_API_KEY"), reason="Requires real OCR API key")
 async def test_real_ocr_api_multiple_images():
     """Test with real OCR API using multiple real images."""
     settings = get_settings()
@@ -119,25 +135,26 @@ async def test_real_ocr_api_multiple_images():
 
 
 @pytest.mark.asyncio
-@pytest.mark.skipif(not os.getenv("OCR_API_KEY"), reason="Requires real OCR API key")
+@pytest.mark.skipif(not os.getenv("OLMOCR_API_KEY"), reason="Requires real OCR API key")
 async def test_real_ocr_api_with_actual_webpage_screenshot():
     """Test with a real screenshot from an actual website."""
     settings = get_settings()
 
-    # Use playwright to capture a real website
-    from playwright.async_api import async_playwright
+    # Use playwright to capture a real website with proper cleanup
+    browser = None
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch()
+            page = await browser.new_page()
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch()
-        page = await browser.new_page()
+            # Navigate to a real website
+            await page.goto("https://example.com")
 
-        # Navigate to a real website
-        await page.goto("https://example.com")
-
-        # Take a real screenshot
-        screenshot_bytes = await page.screenshot(full_page=True)
-
-        await browser.close()
+            # Take a real screenshot
+            screenshot_bytes = await page.screenshot(full_page=True)
+    finally:
+        if browser:
+            await browser.close()
 
     # Submit real screenshot to OCR
     request = OCRRequest(
@@ -163,7 +180,7 @@ async def test_real_ocr_api_with_actual_webpage_screenshot():
 
 
 @pytest.mark.asyncio
-@pytest.mark.skipif(not os.getenv("OCR_API_KEY"), reason="Requires real OCR API key")
+@pytest.mark.skipif(not os.getenv("OLMOCR_API_KEY"), reason="Requires real OCR API key")
 async def test_real_ocr_api_error_handling():
     """Test error handling with real OCR API."""
     settings = get_settings()
@@ -188,7 +205,7 @@ async def test_real_ocr_api_error_handling():
 
 
 @pytest.mark.asyncio
-@pytest.mark.skipif(not os.getenv("OCR_API_KEY"), reason="Requires real OCR API key")
+@pytest.mark.skipif(not os.getenv("OLMOCR_API_KEY"), reason="Requires real OCR API key")
 async def test_real_ocr_api_concurrent_requests():
     """Test concurrent requests to real OCR API."""
     settings = get_settings()
