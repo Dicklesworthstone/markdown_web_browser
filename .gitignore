@@ -218,4 +218,5 @@ out/
 # Cryptographic signing keys (Ed25519 key pairs for bundle signing)
 signing-*.key
 signing-*.pub
-test_report_*ops/warnings.jsonl
+test_report_*
+ops/warnings.jsonl
