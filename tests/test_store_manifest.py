@@ -118,6 +118,11 @@ def test_store_persists_sweep_and_validation_metadata(tmp_path: Path) -> None:
         },
         "overlap_match_ratio": 0.87,
         "validation_failures": ["tile 3 checksum mismatch", "tile 5 decode failed"],
+        "seam_markers": [
+            {"tile_index": 0, "position": "top", "hash": "aaa111"},
+            {"tile_index": 1, "position": "bottom", "hash": "bbb222"},
+            {"tile_index": 2, "position": "top", "hash": "bbb222"},
+        ],
     }
 
     store.write_manifest(job_id="run-123", manifest=manifest)
@@ -129,6 +134,8 @@ def test_store_persists_sweep_and_validation_metadata(tmp_path: Path) -> None:
     assert record.sweep_overlap_pairs == 6
     assert record.overlap_match_ratio == 0.87
     assert record.validation_failure_count == 2
+    assert record.seam_marker_count == 3
+    assert record.seam_hash_count == 2
 
 
 def _sample_manifest_metadata() -> ManifestMetadata:
@@ -174,6 +181,10 @@ def _sample_manifest_metadata() -> ManifestMetadata:
             )
         ],
         ocr_quota=ManifestOCRQuota(limit=100000, used=6000, threshold_ratio=0.7, warning_triggered=False),
+        seam_markers=[
+            {"tile_index": 0, "position": "top", "hash": "ccc111"},
+            {"tile_index": 1, "position": "bottom", "hash": "ddd222"},
+        ],
     )
 
 
@@ -195,6 +206,8 @@ def test_store_accepts_pydantic_manifest(tmp_path: Path) -> None:
     assert record.ocr_ms == 4200
     assert record.overlap_match_ratio == 0.91
     assert record.validation_failure_count == 1
+    assert record.seam_marker_count == 2
+    assert record.seam_hash_count == 2
 
     saved = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert saved["environment"]["viewport"]["device_scale_factor"] == 2

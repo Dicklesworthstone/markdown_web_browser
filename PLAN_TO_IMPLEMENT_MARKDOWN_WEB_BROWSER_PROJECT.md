@@ -652,6 +652,7 @@ _2025-11-09 — PinkCastle (bd-b9e follow-up) hardened the stitcher: table heade
 > _Status 2025-11-08 — OrangeDog (bd: markdown_web_browser-ogf) wired DOM+OCR link blending so `links.json` and the Links tab highlight OCR-only/DOM-only deltas; OCR-derived links now come from the Markdown output once stitching completes._
 - _2025-11-08 — BlueMountain (bd-805) opened to implement the low-confidence OCR detectors + DOM text overlays so headings/captions can be patched automatically when OCR struggles._
 - _2025-11-09 — BlueMountain (bd-805) delivered the first hybrid recovery pass: low-confidence heuristics now patch Markdown with DOM text (manifest `dom_assists`, event + CLI diag output, and highlight links for quick inspection)._ 
+- _2025-11-09 — PinkCastle (bd-805 follow-up) added spaced-letter/code-fence guards plus manifest/SSE summaries so CLI/UI panels show DOM-assist counts, reason buckets, and sample text without cracking manifests._
 - Detect low-confidence OCR regions (symbol rate, low alpha ratio, hyphen density) and patch them with DOM text overlays scoped to the offending block (hero headings, captions, icon fonts).
 
 ### 19.6 Caching, Indexing, Retrieval Quality

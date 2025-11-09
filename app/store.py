@@ -64,6 +64,8 @@ class RunRecord(SQLModel, table=True):
     validation_failure_count: int | None = None
     profile_id: str | None = None
     cache_key: str | None = None
+    seam_marker_count: int | None = None
+    seam_hash_count: int | None = None
 
 
 class LinkRecord(SQLModel, table=True):
@@ -197,6 +199,8 @@ class Store:
             "profile_id": "TEXT",
             "cache_key": "TEXT",
             "server_runtime": "TEXT",
+            "seam_marker_count": "INTEGER",
+            "seam_hash_count": "INTEGER",
         }
         with self.engine.begin() as conn:
             existing = {
@@ -289,6 +293,8 @@ class Store:
             validation_failure_count=source.validation_failure_count,
             profile_id=source.profile_id,
             cache_key=source.cache_key,
+            seam_marker_count=source.seam_marker_count,
+            seam_hash_count=source.seam_hash_count,
         )
         with self.session() as session:
             session.add(cloned)
@@ -701,6 +707,19 @@ def _apply_manifest_metadata(record: RunRecord, manifest: Mapping[str, object] |
     validation_failures = manifest_dict.get("validation_failures")
     if isinstance(validation_failures, list):
         _set_int("validation_failure_count", len(validation_failures))
+    seam_markers = manifest_dict.get("seam_markers")
+    if isinstance(seam_markers, list):
+        _set_int("seam_marker_count", len(seam_markers))
+        hashes = {
+            entry.get("hash")
+            for entry in seam_markers
+            if isinstance(entry, Mapping) and entry.get("hash")
+        }
+        if hashes:
+            _set_int("seam_hash_count", len(hashes))
+    else:
+        _set_int("seam_marker_count", manifest_dict.get("seam_marker_count"))
+        _set_int("seam_hash_count", manifest_dict.get("seam_hash_count"))
 
 
 def _manifest_to_dict(manifest: Mapping[str, object] | Any) -> dict[str, Any]:

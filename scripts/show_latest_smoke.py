@@ -169,6 +169,27 @@ def _print_weekly_summary(summary: dict[str, Any]) -> None:
                         p95=_format_ms(hashes_block.get("p95")),
                     )
                 )
+        slo = entry.get("slo") or {}
+        if slo:
+            capture_status = "OK" if slo.get("capture_ok") else "⚠️"
+            if slo.get("capture_budget_ms") is not None:
+                typer.echo(
+                    "  Capture SLO: {status} (p99={p99}, budget={budget})".format(
+                        status=capture_status,
+                        p99=_format_ms(slo.get("capture_p99_ms")),
+                        budget=_format_ms(slo.get("capture_budget_ms")),
+                    )
+                )
+            ocr_budget = slo.get("ocr_budget_ms")
+            if ocr_budget is not None:
+                ocr_status = "OK" if slo.get("ocr_ok") else "⚠️"
+                typer.echo(
+                    "  OCR SLO: {status} (p99={p99}, budget={budget})".format(
+                        status=ocr_status,
+                        p99=_format_ms(slo.get("ocr_p99_ms")),
+                        budget=_format_ms(ocr_budget),
+                    )
+                )
 
 
 @app.command()

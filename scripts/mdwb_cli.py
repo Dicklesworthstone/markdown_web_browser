@@ -1407,6 +1407,7 @@ def _print_warning_records(records: list[dict[str, Any]], *, json_output: bool) 
     table.add_column("blocklist")
     table.add_column("sweep")
     table.add_column("validation")
+    table.add_column("dom")
     table.add_column("seams", overflow="fold")
     for row in _warning_rows(records):
         table.add_row(*row)
@@ -1415,7 +1416,7 @@ def _print_warning_records(records: list[dict[str, Any]], *, json_output: bool) 
 
 def _warning_rows(
     records: Iterable[dict[str, Any]]
-) -> Iterable[tuple[str, str, str, str, str, str, str]]:
+) -> Iterable[tuple[str, str, str, str, str, str, str, str]]:
     for record in records:
         timestamp = record.get("timestamp", "-")
         job = record.get("job_id", "-")
@@ -1423,8 +1424,9 @@ def _warning_rows(
         blocklist = _format_blocklist(record.get("blocklist_hits"))
         sweep = _format_sweep_summary(record)
         validation = _format_validation_summary(record.get("validation_failures"))
+        dom_summary = _format_dom_assist_summary(record.get("dom_assist_summary"))
         seams = _format_seam_log_summary(record.get("seam_markers"))
-        yield (str(timestamp), str(job), warnings, blocklist, sweep, validation, seams)
+        yield (str(timestamp), str(job), warnings, blocklist, sweep, validation, dom_summary, seams)
 
 
 def _augment_warning_record(record: dict[str, Any]) -> dict[str, Any]:
@@ -1444,6 +1446,9 @@ def _augment_warning_record(record: dict[str, Any]) -> dict[str, Any]:
     seam_summary = record.get("seam_markers")
     if isinstance(seam_summary, Mapping):
         enriched["seam_summary_text"] = _format_seam_log_summary(seam_summary)
+    dom_summary = record.get("dom_assist_summary")
+    if isinstance(dom_summary, Mapping):
+        enriched["dom_assist_summary_text"] = _format_dom_assist_summary(dom_summary)
     return enriched
 
 
@@ -1498,6 +1503,28 @@ def _format_blocklist(values: Any) -> str:
         return "-"
     parts = [f"{selector}:{count}" for selector, count in values.items()]
     return ", ".join(parts)
+
+
+def _format_dom_assist_summary(summary: Any) -> str:
+    if not isinstance(summary, Mapping) or not summary:
+        return "-"
+    count = summary.get("count")
+    reasons = summary.get("reasons") or []
+    reason_counts = summary.get("reason_counts") or []
+    if isinstance(reason_counts, list) and reason_counts:
+        formatted_counts = ", ".join(
+            f"{entry.get('reason', 'unknown')}({entry.get('count', '')})" for entry in reason_counts
+        )
+    elif reasons:
+        formatted_counts = ", ".join(str(reason) for reason in reasons)
+    else:
+        formatted_counts = "-"
+    sample = summary.get("sample") or {}
+    sample_reason = sample.get("reason")
+    parts = [f"{count} assist(s)" if count is not None else "assists", formatted_counts]
+    if sample_reason:
+        parts.append(f"sample={sample_reason}")
+    return " | ".join(part for part in parts if part and part != "-")
 
 
 def _format_sweep_summary(record: dict[str, Any]) -> str:

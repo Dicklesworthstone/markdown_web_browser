@@ -385,8 +385,22 @@ def update_weekly_summary(config: dict[str, Any], window_days: int = 7) -> None:
     for category, entries in sorted(metrics.items()):
         capture_values = [entry["capture_ms"] for entry in entries if entry.get("capture_ms") is not None]
         total_values = [entry["total_ms"] for entry in entries if entry.get("total_ms") is not None]
-        seam_counts = [entry.get("seam_marker_count") for entry in entries if isinstance(entry.get("seam_marker_count"), (int, float))]
-        seam_hash_counts = [entry.get("seam_hash_count") for entry in entries if isinstance(entry.get("seam_hash_count"), (int, float))]
+        seam_counts = [
+            entry.get("seam_marker_count")
+            for entry in entries
+            if isinstance(entry.get("seam_marker_count"), (int, float))
+        ]
+        seam_hash_counts = [
+            entry.get("seam_hash_count")
+            for entry in entries
+            if isinstance(entry.get("seam_hash_count"), (int, float))
+        ]
+        ocr_values = []
+        for entry in entries:
+            timings_block = entry.get("timings") or {}
+            ocr_value = timings_block.get("ocr_ms")
+            if isinstance(ocr_value, (int, float)):
+                ocr_values.append(ocr_value)
         budget = budgets.get(category)
         category_entry: dict[str, Any] = {
             "name": category,
@@ -395,12 +409,39 @@ def update_weekly_summary(config: dict[str, Any], window_days: int = 7) -> None:
             "capture_ms": {
                 "p50": _percentile(capture_values, 0.5),
                 "p95": _percentile(capture_values, 0.95),
+                "p99": _percentile(capture_values, 0.99),
             },
             "total_ms": {
                 "p50": _percentile(total_values, 0.5),
                 "p95": _percentile(total_values, 0.95),
+                "p99": _percentile(total_values, 0.99),
             },
         }
+        if ocr_values:
+            category_entry["ocr_ms"] = {
+                "p50": _percentile(ocr_values, 0.5),
+                "p95": _percentile(ocr_values, 0.95),
+                "p99": _percentile(ocr_values, 0.99),
+            }
+        capture_p95 = category_entry["capture_ms"]["p95"]
+        capture_p99 = category_entry["capture_ms"]["p99"]
+        ocr_p95 = category_entry.get("ocr_ms", {}).get("p95")
+        ocr_p99 = category_entry.get("ocr_ms", {}).get("p99")
+        slo_block: dict[str, Any] = {}
+        if capture_p95 is not None:
+            capture_budget = capture_p95 * 2
+            slo_block["capture_budget_ms"] = capture_budget
+            slo_block["capture_p99_ms"] = capture_p99
+            slo_block["capture_ok"] = (
+                capture_p99 is not None and capture_budget is not None and capture_p99 <= capture_budget
+            )
+        if ocr_p95 is not None:
+            ocr_budget = ocr_p95 * 2
+            slo_block["ocr_budget_ms"] = ocr_budget
+            slo_block["ocr_p99_ms"] = ocr_p99
+            slo_block["ocr_ok"] = ocr_p99 is not None and ocr_budget is not None and ocr_p99 <= ocr_budget
+        if slo_block:
+            category_entry["slo"] = slo_block
         seam_block: dict[str, Any] = {}
         if seam_counts:
             seam_block["count"] = {

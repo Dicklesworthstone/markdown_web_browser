@@ -54,11 +54,20 @@ def _write_pointer_files(root: Path, *, include_weekly: bool = True, over_budget
                     "name": "Docs",
                     "runs": 5,
                     "budget_ms": 20000,
-                    "capture_ms": {"p50": 11000, "p95": 15000},
-                    "total_ms": {"p50": 19000, "p95": 26000 if over_budget else 18000},
+                    "capture_ms": {"p50": 11000, "p95": 15000, "p99": 18000},
+                    "total_ms": {"p50": 19000, "p95": 26000 if over_budget else 18000, "p99": 30000},
+                    "ocr_ms": {"p50": 6000, "p95": 9000, "p99": 12000},
                     "seam_markers": {
                         "count": {"p50": 1, "p95": 2},
                         "hashes": {"p50": 1, "p95": 1},
+                    },
+                    "slo": {
+                        "capture_budget_ms": 30000,
+                        "capture_p99_ms": 32000 if over_budget else 20000,
+                        "capture_ok": not over_budget,
+                        "ocr_budget_ms": 18000,
+                        "ocr_p99_ms": 15000,
+                        "ocr_ok": True,
                     },
                 }
             ],
@@ -117,6 +126,8 @@ def test_show_latest_smoke_weekly_highlights_over_budget(tmp_path: Path):
     assert "Weekly Summary" in result.output
     assert "⚠️ over budget" in result.output
     assert "Seam markers p50/p95: 1/2" in result.output
+    assert "Capture SLO:" in result.output
+    assert "OCR SLO:" in result.output
 
 
 def test_show_latest_smoke_weekly_missing_file(tmp_path: Path):
@@ -150,6 +161,9 @@ def test_show_latest_smoke_json_output(tmp_path: Path):
     assert "weekly_summary" in payload
     weekly_seams = payload["weekly_summary"]["categories"][0]["seam_markers"]
     assert weekly_seams["count"]["p95"] == 2
+    slo = payload["weekly_summary"]["categories"][0]["slo"]
+    assert slo["capture_ok"] is True
+    assert slo["ocr_ok"] is True
 
 
 def test_show_latest_smoke_manifest_missing(tmp_path: Path):

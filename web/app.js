@@ -71,6 +71,8 @@ function initSseHandlers() {
   const ocrAutotuneEl = root.querySelector('[data-ocr-autotune]');
   const seamSummaryEl = root.querySelector('[data-seam-summary]');
   const seamTableEl = root.querySelector('[data-seam-table]');
+  const domAssistSummaryEl = root.querySelector('[data-dom-assist-summary]');
+  const domAssistTableEl = root.querySelector('[data-dom-assist-table]');
 
   const setStatus = (value, variant = 'info') => {
     statusEl.textContent = value;
@@ -93,6 +95,8 @@ function initSseHandlers() {
           validationSummaryEl,
           seamSummaryEl,
           seamTableEl,
+          domAssistSummaryEl,
+          domAssistTableEl,
           ocrQuotaEl,
           ocrBatchesEl,
           ocrAutotuneEl,
@@ -187,6 +191,7 @@ function initSseHandlers() {
       event: 'dom_assist',
       data,
     });
+    renderDomAssistSummary(domAssistSummaryEl, domAssistTableEl, data);
   };
 
   const eventHandlers = {
@@ -280,6 +285,8 @@ function renderManifest(
     validationSummaryEl,
     seamSummaryEl,
     seamTableEl,
+    domAssistSummaryEl,
+    domAssistTableEl,
     ocrQuotaEl,
     ocrBatchesEl,
     ocrAutotuneEl,
@@ -316,6 +323,7 @@ function renderManifest(
   updateValidationSummary(validationSummaryEl, parsedPayload?.validation_failures);
   renderSeamSummary(seamSummaryEl, parsedPayload?.seam_markers);
   renderSeamMarkers(seamTableEl, parsedPayload?.seam_markers);
+  renderDomAssistSummary(domAssistSummaryEl, domAssistTableEl, parsedPayload?.dom_assist_summary);
   renderOcrQuota(ocrQuotaEl, parsedPayload?.ocr_quota);
   renderOcrBatches(ocrBatchesEl, parsedPayload?.ocr_batches);
   renderOcrAutotune(ocrAutotuneEl, parsedPayload?.ocr_autotune);
@@ -1683,4 +1691,46 @@ function sleep(ms) {
   return new Promise((resolve) => {
     setTimeout(resolve, ms);
   });
+}
+function renderDomAssistSummary(summaryEl, tableEl, summary) {
+  const hasData = summary && typeof summary.count === 'number' && summary.count > 0;
+  if (summaryEl) {
+    if (!hasData) {
+      summaryEl.textContent = 'No DOM assists recorded yet.';
+      summaryEl.classList.add('placeholder');
+    } else {
+      summaryEl.textContent = `${summary.count} assist${summary.count === 1 ? '' : 's'} · ${summary.reasons?.length || 0} reason${summary.reasons?.length === 1 ? '' : 's'}`;
+      summaryEl.classList.remove('placeholder');
+    }
+  }
+  if (!tableEl) {
+    return;
+  }
+  if (!hasData) {
+    tableEl.innerHTML = '<p class="placeholder">DOM assist reasons will appear here once assists trigger.</p>';
+    return;
+  }
+  const rows = Array.isArray(summary.reason_counts) && summary.reason_counts.length
+    ? summary.reason_counts
+    : (summary.reasons || []).map((reason) => ({ reason, count: '' }));
+  const sample = summary.sample || {};
+  const sampleRow = sample.dom_text
+    ? `<div class="dom-assist-table__note">Sample (${sample.reason || 'unknown'}): <code>${escapeHtml(sample.dom_text)}</code></div>`
+    : '';
+  const table = [
+    '<table>',
+    '<thead><tr><th>Reason</th><th>Count</th></tr></thead>',
+    '<tbody>',
+    ...rows.map((entry) => `<tr><td>${escapeHtml(String(entry.reason ?? 'unknown'))}</td><td>${entry.count ?? ''}</td></tr>`),
+    '</tbody></table>',
+    sampleRow,
+  ].join('');
+  tableEl.innerHTML = table;
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
 }

@@ -416,11 +416,36 @@ body {
   margin-bottom: 0.5rem;
 }
 
+.dom-assist-panel {
+  margin-top: 1rem;
+  border: 1px solid var(--border);
+  border-radius: 0.6rem;
+  padding: 0.75rem;
+  background: rgba(15, 23, 42, 0.5);
+}
+
+.dom-assist-panel h3 {
+  margin-bottom: 0.5rem;
+  font-size: 0.95rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+}
+
+.dom-assist-summary {
+  font-size: 0.85rem;
+  color: var(--muted);
+  margin-bottom: 0.5rem;
+}
+
+.dom-assist-table table,
 .seam-table table {
   width: 100%;
   border-collapse: collapse;
 }
 
+.dom-assist-table th,
+.dom-assist-table td,
 .seam-table th,
 .seam-table td {
   border: 1px solid var(--border);
@@ -429,11 +454,13 @@ body {
   text-align: left;
 }
 
+.dom-assist-table code,
 .seam-table code {
   font-family: "JetBrains Mono", "SFMono-Regular", ui-monospace, monospace;
   font-size: 0.8rem;
 }
 
+.dom-assist-table__note,
 .seam-table__note {
   margin-top: 0.35rem;
   font-size: 0.8rem;

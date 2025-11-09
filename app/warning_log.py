@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 import json
@@ -45,6 +46,9 @@ def append_warning_log(
     if overlap_ratio is None and sweep_stats:
         overlap_ratio = sweep_stats.get("overlap_match_ratio")
     seam_summary = _summarize_seam_markers(getattr(manifest, "seam_markers", None))
+    dom_summary = getattr(manifest, "dom_assist_summary", None)
+    if not dom_summary:
+        dom_summary = summarize_dom_assists(getattr(manifest, "dom_assists", None))
 
     should_log = bool(warnings or blocklist_hits or validation_failures)
     if not should_log and sweep_stats:
@@ -85,6 +89,8 @@ def append_warning_log(
         record["validation_failures"] = validation_failures
     if seam_summary:
         record["seam_markers"] = seam_summary
+    if dom_summary:
+        record["dom_assist_summary"] = dom_summary
 
     log_path = settings.logging.warning_log_path
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -141,3 +147,34 @@ def _summarize_seam_markers(markers: Any, *, sample_limit: int = 3) -> dict[str,
         "unique_hashes": len(hashes) or None,
         "sample": sample,
     }
+
+
+def summarize_dom_assists(entries: Sequence[Any] | None) -> dict[str, Any] | None:
+    if not entries:
+        return None
+    normalized: list[dict[str, Any]] = []
+    for entry in entries:
+        if entry is None:
+            continue
+        if isinstance(entry, Mapping):
+            normalized.append(dict(entry))
+        elif is_dataclass(entry):
+            normalized.append(asdict(entry))
+    if not normalized:
+        return None
+    counter = Counter(str(item.get("reason", "unknown")) for item in normalized)
+    summary: dict[str, Any] = {
+        "count": len(normalized),
+        "reasons": sorted(reason for reason in counter if isinstance(reason, str)),
+        "reason_counts": [
+            {"reason": reason, "count": count} for reason, count in counter.most_common()
+        ],
+    }
+    sample = next((entry for entry in normalized if entry.get("reason")), normalized[0])
+    summary["sample"] = {
+        "tile_index": sample.get("tile_index"),
+        "line": sample.get("line"),
+        "reason": sample.get("reason"),
+        "dom_text": sample.get("dom_text"),
+    }
+    return summary

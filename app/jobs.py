@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections import Counter
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict
 from datetime import datetime, timezone
 from enum import Enum
 from importlib import metadata
@@ -37,43 +36,12 @@ from app.schemas import JobCreateRequest, ManifestMetadata
 from app.settings import Settings, settings as global_settings
 from app.store import Store, build_store
 from app.stitch import stitch_markdown
-from app.warning_log import append_warning_log
+from app.warning_log import append_warning_log, summarize_dom_assists
 
 LOGGER = logging.getLogger(__name__)
 
 WebhookSender = Callable[[str, dict[str, Any]], Awaitable[None]]
 _EVENT_HISTORY_LIMIT = 500
-
-
-def summarize_dom_assists(entries: Sequence[Any] | None) -> dict[str, Any] | None:
-    if not entries:
-        return None
-    normalized: list[dict[str, Any]] = []
-    for entry in entries:
-        if entry is None:
-            continue
-        if isinstance(entry, Mapping):
-            normalized.append(dict(entry))
-        elif is_dataclass(entry):
-            normalized.append(asdict(entry))
-    if not normalized:
-        return None
-    counter = Counter(str(item.get("reason", "unknown")) for item in normalized)
-    summary: dict[str, Any] = {
-        "count": len(normalized),
-        "reasons": sorted(reason for reason in counter if isinstance(reason, str)),
-        "reason_counts": [
-            {"reason": reason, "count": count} for reason, count in counter.most_common()
-        ],
-    }
-    sample = next((entry for entry in normalized if entry.get("reason")), normalized[0])
-    summary["sample"] = {
-        "tile_index": sample.get("tile_index"),
-        "line": sample.get("line"),
-        "reason": sample.get("reason"),
-        "dom_text": sample.get("dom_text"),
-    }
-    return summary
 
 try:  # Playwright may be missing in some CI environments
     PLAYWRIGHT_VERSION = metadata.version("playwright")
