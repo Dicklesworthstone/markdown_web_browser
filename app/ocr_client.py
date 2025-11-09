@@ -15,7 +15,7 @@ import httpx
 from app.settings import Settings, get_settings
 
 LOGGER = logging.getLogger(__name__)
-DEFAULT_ENDPOINT_SUFFIX = "/v1/ocr"
+DEFAULT_ENDPOINT_SUFFIX = "/chat/completions"  # OpenAI-compatible endpoint
 REQUEST_TIMEOUT = httpx.Timeout(connect=10.0, read=60.0, write=30.0, pool=10.0)
 _BACKOFF_SCHEDULE = (3.0, 9.0)
 _MAX_ATTEMPTS = len(_BACKOFF_SCHEDULE) + 1
@@ -374,10 +374,26 @@ async def _submit_batch(
 
 
 def _build_payload(tiles: Sequence[_EncodedTile], *, use_fp8: bool) -> dict:
+    # OpenAI-compatible vision format (send first tile, batching handled at higher level)
+    tile = tiles[0]
+
+    # Add allenai/ prefix if not present (for DeepInfra)
+    model = tile.model
+    if not model.startswith("allenai/") and "olmOCR" in model:
+        model = f"allenai/{model.split('-FP8')[0]}"  # Remove -FP8 suffix and add prefix
+
     return {
-        "model": tiles[0].model,
-        "input": [{"id": tile.tile_id, "image": tile.image_b64} for tile in tiles],
-        "options": {"fp8": use_fp8},
+        "model": model,
+        "messages": [{
+            "role": "user",
+            "content": [{
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/png;base64,{tile.image_b64}"
+                }
+            }]
+        }],
+        "max_tokens": 4096
     }
 
 
@@ -435,6 +451,17 @@ def _extract_markdown_batch(response_json: dict, tile_ids: Sequence[str]) -> lis
 
     if not isinstance(response_json, dict):
         raise ValueError("OCR response must be a JSON object")
+
+    # OpenAI-compatible format: {"choices": [{"message": {"content": "..."}}]}
+    choices = response_json.get("choices")
+    if isinstance(choices, list) and len(choices) > 0:
+        choice = choices[0]
+        if isinstance(choice, dict):
+            message = choice.get("message")
+            if isinstance(message, dict):
+                content = message.get("content")
+                if content is not None:
+                    return [str(content)]
 
     def _extract_from_entry(entry: dict) -> str | None:
         if not isinstance(entry, dict):
