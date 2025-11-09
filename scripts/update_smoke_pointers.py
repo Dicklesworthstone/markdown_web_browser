@@ -11,7 +11,7 @@ from pathlib import Path
 
 import typer
 
-from scripts.compute_slo import compute_slo_summary, load_budgets
+from scripts.compute_slo import compute_slo_summary, load_budgets, write_prom_metrics
 
 app = typer.Typer(help="Copy summary/manifest/metrics from a run directory into the latest_* pointers.")
 
@@ -56,6 +56,15 @@ def _compute_slo_summary(
     return payload
 
 
+def _sync_prom_export(prom_path: Path) -> None:
+    export_target = os.environ.get("MDWB_SLO_PROM_EXPORT")
+    if not export_target or not prom_path.exists():
+        return
+    dest = Path(export_target)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(prom_path, dest)
+
+
 @app.command()
 def update(
     source: Path = typer.Argument(..., help="Run directory containing summary/manifest/metrics files."),
@@ -69,6 +78,16 @@ def update(
         True,
         "--compute-slo/--no-compute-slo",
         help="When enabled, recompute latest_slo_summary.json using the updated manifest pointer.",
+    ),
+    weekly_slo_source: Path = typer.Option(
+        None,
+        "--weekly-slo-source",
+        help="Optional weekly_slo.json file to copy (defaults to <source>/weekly_slo.json).",
+    ),
+    weekly_slo_prom_source: Path = typer.Option(
+        None,
+        "--weekly-slo-prom-source",
+        help="Optional weekly_slo.prom file to copy (defaults to <source>/weekly_slo.prom).",
     ),
     budget_file: Path | None = typer.Option(
         None,
@@ -86,6 +105,8 @@ def update(
     summary_src = source / "summary.md"
     manifest_src = source / "manifest_index.json"
     metrics_src = source / "metrics.json"
+    slo_summary_src = source / "slo_summary.json"
+    slo_prom_src = source / "slo.prom"
 
     _copy_file(summary_src, root_path / "latest_summary.md", required=True)
     latest_manifest = root_path / "latest_manifest_index.json"
@@ -99,6 +120,19 @@ def update(
         weekly_dest = root_path / "weekly_summary.json"
         _copy_file(weekly_source, weekly_dest, required=True)
 
+    weekly_slo_src = weekly_slo_source or (source / "weekly_slo.json")
+    weekly_slo_dest = root_path / "weekly_slo.json"
+    if weekly_slo_source and not weekly_slo_src.exists():
+        raise typer.BadParameter(f"Required file missing: {weekly_slo_src}")
+    if weekly_slo_src.exists():
+        _copy_file(weekly_slo_src, weekly_slo_dest, required=False)
+        prom_source = weekly_slo_prom_source or (source / "weekly_slo.prom")
+        if weekly_slo_prom_source and not prom_source.exists():
+            raise typer.BadParameter(f"Required file missing: {prom_source}")
+        weekly_prom_dest = root_path / "weekly_slo.prom"
+        if prom_source.exists():
+            _copy_file(prom_source, weekly_prom_dest, required=False)
+
     if compute_slo:
         slo_payload = _compute_slo_summary(
             manifest_path=latest_manifest,
@@ -107,6 +141,15 @@ def update(
         )
         slo_dest = root_path / "latest_slo_summary.json"
         slo_dest.write_text(json.dumps(slo_payload, indent=2), encoding="utf-8")
+        prom_dest = root_path / "latest_slo.prom"
+        write_prom_metrics(summary=slo_payload, output_path=prom_dest)
+        _sync_prom_export(prom_dest)
+    else:
+        _copy_file(slo_summary_src, root_path / "latest_slo_summary.json", required=False)
+        dest_prom = root_path / "latest_slo.prom"
+        _copy_file(slo_prom_src, dest_prom, required=False)
+        if dest_prom.exists():
+            _sync_prom_export(dest_prom)
 
     typer.secho(
         f"Updated pointers under {root_path} using run {source}", fg=typer.colors.GREEN

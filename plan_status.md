@@ -14,6 +14,6 @@
 - bd-805: hybrid text recovery heuristics bead opened (PLAN §19.5).
 - bd-90m: OCR concurrency autotune + HTTP/2 reuse bead opened (PLAN §§8/19.8).
 - bd-692/bd-we4/bd-n5c: seam watermark instrumentation landed (2025-11-09), semantic post-process toggle + crawl mode still open.
-- bd-md3: capture/OCR SLO dashboard bead opened (PLAN §20.1).
+- bd-md3: capture/OCR SLO dashboard bead now generating `weekly_slo.json`/`.prom`, surfaced via `show_latest_smoke --slo`, and enforced by `scripts/check_metrics.py --check-weekly-slo` (PLAN §20.1).
 - bd-0jc: overlap window + hyphen guard research bead opened (PLAN §17).
 - bd-hki: Generative E2E guardrail tests partially landed (fixtures + MDWB_RUN_E2E_GENERATED toggle).

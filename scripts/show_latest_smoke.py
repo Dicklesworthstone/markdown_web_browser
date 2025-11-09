@@ -81,8 +81,11 @@ def _augment_manifest_row(row: dict[str, Any]) -> dict[str, Any]:
             data.pop("overlap_match_ratio", None)
     else:
         data.pop("overlap_match_ratio", None)
-    seam_summary: dict[str, int | None] | None = None
-    if isinstance(data.get("seam_marker_count"), int):
+    seam_summary: dict[str, Any] | None = None
+    raw_summary = data.get("seam_markers_summary")
+    if isinstance(raw_summary, dict):
+        seam_summary = dict(raw_summary)
+    elif isinstance(data.get("seam_marker_count"), int):
         seam_summary = {
             "count": data["seam_marker_count"],
             "unique_hashes": data.get("seam_hash_count"),
@@ -90,11 +93,19 @@ def _augment_manifest_row(row: dict[str, Any]) -> dict[str, Any]:
     else:
         seam_summary = _summarize_seam_markers(data.get("seam_markers"))
     if seam_summary:
-        data["seam_marker_count"] = seam_summary["count"]
-        data["seam_hash_count"] = seam_summary["unique_hashes"]
+        data["seam_marker_count"] = seam_summary.get("count")
+        data["seam_hash_count"] = seam_summary.get("unique_hashes")
+        event_count = seam_summary.get("event_count")
+        if isinstance(event_count, (int, float)):
+            data["seam_event_count"] = int(event_count)
+        elif isinstance(data.get("seam_event_count"), int):
+            pass
+        else:
+            data.pop("seam_event_count", None)
     else:
         data.pop("seam_marker_count", None)
         data.pop("seam_hash_count", None)
+        data.pop("seam_event_count", None)
     return data
 
 
@@ -173,6 +184,14 @@ def _print_weekly_summary(summary: dict[str, Any]) -> None:
                     "  Seam hashes p50/p95: {p50}/{p95}".format(
                         p50=_format_ms(hashes_block.get("p50")),
                         p95=_format_ms(hashes_block.get("p95")),
+                    )
+                )
+            events_block = seam_block.get("events") or {}
+            if events_block:
+                typer.echo(
+                    "  Seam events p50/p95: {p50}/{p95}".format(
+                        p50=_format_ms(events_block.get("p50")),
+                        p95=_format_ms(events_block.get("p95")),
                     )
                 )
         slo = entry.get("slo") or {}
@@ -307,6 +326,9 @@ def show(
                         extras.append(f"seams={seam_count} hashes={hash_count}")
                     else:
                         extras.append(f"seams={seam_count}")
+                    event_count = row.get("seam_event_count")
+                    if isinstance(event_count, int) and event_count > 0:
+                        extras.append(f"seam_events={event_count}")
                 extra_text = f" [{', '.join(extras)}]" if extras else ""
                 typer.echo(
                     " - {category}: {url} (capture_ms={capture_ms}, total_ms={total_ms}){extras}".format(

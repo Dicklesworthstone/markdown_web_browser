@@ -77,6 +77,7 @@ class JobSnapshot(TypedDict, total=False):
     error: str | None
     profile_id: str | None
     cache_hit: bool
+    cache_source_job_id: str | None
     seam_marker_count: int | None
     seam_hash_count: int | None
     seam_markers: list[dict[str, object]]
@@ -111,8 +112,10 @@ def build_initial_snapshot(
         snapshot["profile_id"] = profile_id
     if cache_hit:
         snapshot["cache_hit"] = True
+    snapshot["cache_source_job_id"] = None
     snapshot["seam_marker_count"] = None
     snapshot["seam_hash_count"] = None
+    snapshot["seam_markers"] = []
     if manifest:
         manifest.profile_id = profile_id
         manifest.cache_hit = cache_hit

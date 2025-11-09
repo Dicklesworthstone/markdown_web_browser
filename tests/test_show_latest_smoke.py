@@ -38,6 +38,11 @@ def _write_pointer_files(
             "validation_failures": ["tile checksum mismatch"],
             "seam_marker_count": 2,
             "seam_hash_count": 2,
+            "seam_markers_summary": {
+                "count": 2,
+                "unique_hashes": 2,
+                "event_count": 1,
+            },
         },
         {
             "category": "apps",
@@ -49,6 +54,8 @@ def _write_pointer_files(
     if use_seam_marker_list:
         manifest_rows[0].pop("seam_marker_count", None)
         manifest_rows[0].pop("seam_hash_count", None)
+        manifest_rows[0].pop("seam_markers_summary", None)
+        manifest_rows[0].pop("seam_event_count", None)
         manifest_rows[0]["seam_markers"] = [
             {"hash": "tile-a"},
             {"hash": "tile-b"},
@@ -75,6 +82,7 @@ def _write_pointer_files(
                     "seam_markers": {
                         "count": {"p50": 1, "p95": 2},
                         "hashes": {"p50": 1, "p95": 1},
+                        "events": {"p50": 0, "p95": 1},
                     },
                     "slo": {
                         "capture_budget_ms": 30000,
@@ -161,6 +169,7 @@ def test_show_latest_smoke_weekly_highlights_over_budget(tmp_path: Path):
     assert "Weekly Summary" in result.output
     assert "⚠️ over budget" in result.output
     assert "Seam markers p50/p95: 1/2" in result.output
+    assert "Seam events p50/p95: 0/1" in result.output
     assert "Capture SLO:" in result.output
     assert "OCR SLO:" in result.output
 
@@ -209,11 +218,13 @@ def test_show_latest_smoke_json_output(tmp_path: Path):
     assert payload["manifest"][0]["validation_failure_count"] == 1
     assert payload["manifest"][0]["seam_marker_count"] == 2
     assert payload["manifest"][0]["seam_hash_count"] == 2
+    assert payload["manifest"][0]["seam_event_count"] == 1
     assert "metrics" in payload
     assert "weekly_summary" in payload
     assert "slo_summary" in payload
     weekly_seams = payload["weekly_summary"]["categories"][0]["seam_markers"]
     assert weekly_seams["count"]["p95"] == 2
+    assert weekly_seams["events"]["p95"] == 1
     slo = payload["weekly_summary"]["categories"][0]["slo"]
     assert slo["capture_ok"] is True
     assert slo["ocr_ok"] is True
@@ -249,6 +260,7 @@ def test_show_latest_smoke_json_summarizes_raw_seam_markers(tmp_path: Path):
     payload = json.loads(result.output)
     assert payload["manifest"][0]["seam_marker_count"] == 3
     assert payload["manifest"][0]["seam_hash_count"] == 2
+    assert "seam_event_count" not in payload["manifest"][0]
 
 
 def test_show_latest_smoke_metrics_missing_json(tmp_path: Path):

@@ -12,13 +12,15 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from scripts import olmocr_cli, compute_slo
 
 PRODUCTION_SET_PATH = Path("benchmarks/production_set.json")
 PRODUCTION_ROOT = Path("benchmarks/production")
 WEEKLY_SUMMARY_PATH = PRODUCTION_ROOT / "weekly_summary.json"
+WEEKLY_SLO_PATH = PRODUCTION_ROOT / "weekly_slo.json"
+WEEKLY_SLO_PROM_PATH = PRODUCTION_ROOT / "weekly_slo.prom"
 
 
 def _load_production_set() -> dict[str, Any]:
@@ -65,6 +67,8 @@ class RunRecord:
     timings: dict[str, Any] | None
     seam_marker_count: int | None = None
     seam_hash_count: int | None = None
+    seam_event_count: int | None = None
+    seam_markers_summary: dict[str, Any] | None = None
 
 
 def _ensure_date_dir(date_str: str) -> Path:
@@ -96,9 +100,17 @@ def _slug_from_url(url_entry: dict[str, str]) -> str:
 
 def _manifest_metrics(
     manifest_path: Path,
-) -> tuple[int | None, int | None, dict[str, Any] | None, int | None, int | None]:
+) -> tuple[
+    int | None,
+    int | None,
+    dict[str, Any] | None,
+    int | None,
+    int | None,
+    int | None,
+    dict[str, Any] | None,
+]:
     if not manifest_path.exists():
-        return None, None, None, None, None
+        return None, None, None, None, None, None, None
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     timings = manifest.get("timings") or {}
     capture_ms = timings.get("capture_ms")
@@ -108,6 +120,8 @@ def _manifest_metrics(
         total_ms = sum(value for value in partials if value is not None)
     seam_marker_count: int | None = None
     seam_hash_count: int | None = None
+    seam_event_count: int | None = None
+    seam_summary: dict[str, Any] | None = None
     seam_markers = manifest.get("seam_markers")
     if isinstance(seam_markers, list) and seam_markers:
         seam_marker_count = len(seam_markers)
@@ -118,7 +132,29 @@ def _manifest_metrics(
         }
         seam_hashes.discard(None)
         seam_hash_count = len(seam_hashes) if seam_hashes else None
-    return capture_ms, total_ms, timings, seam_marker_count, seam_hash_count
+    summary_field = manifest.get("seam_markers_summary")
+    if isinstance(summary_field, dict):
+        seam_summary = dict(summary_field)
+        summary_event = seam_summary.get("event_count")
+        if isinstance(summary_event, (int, float)):
+            seam_event_count = int(summary_event)
+    if seam_event_count is None:
+        inline_count = manifest.get("seam_event_count")
+        if isinstance(inline_count, (int, float)):
+            seam_event_count = int(inline_count)
+    seam_events = manifest.get("seam_marker_events")
+    if seam_event_count is None and isinstance(seam_events, list):
+        seam_event_count = len(seam_events)
+
+    return (
+        capture_ms,
+        total_ms,
+        timings,
+        seam_marker_count,
+        seam_hash_count,
+        seam_event_count,
+        seam_summary,
+    )
 
 
 def run_category(
@@ -154,6 +190,8 @@ def run_category(
             timings,
             seam_marker_count,
             seam_hash_count,
+            seam_event_count,
+            seam_summary,
         ) = _manifest_metrics(manifest_path)
         results.append(
             RunRecord(
@@ -169,6 +207,8 @@ def run_category(
                 timings=timings,
                 seam_marker_count=seam_marker_count,
                 seam_hash_count=seam_hash_count,
+                seam_event_count=seam_event_count,
+                seam_markers_summary=seam_summary,
             )
         )
     return results
@@ -253,6 +293,10 @@ def write_manifest_index(date_dir: Path, records: list[RunRecord]) -> Path:
             entry["seam_marker_count"] = record.seam_marker_count
         if record.seam_hash_count is not None:
             entry["seam_hash_count"] = record.seam_hash_count
+        if record.seam_event_count is not None:
+            entry["seam_event_count"] = record.seam_event_count
+        if record.seam_markers_summary:
+            entry["seam_markers_summary"] = record.seam_markers_summary
         payload.append(entry)
     index_path = date_dir / "manifest_index.json"
     index_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -359,6 +403,8 @@ def update_latest_markers(date_dir: Path) -> None:
         "metrics.json": PRODUCTION_ROOT / "latest_metrics.json",
         "slo_summary.json": PRODUCTION_ROOT / "latest_slo_summary.json",
         "slo.prom": PRODUCTION_ROOT / "latest_slo.prom",
+        "weekly_slo.json": WEEKLY_SLO_PATH,
+        "weekly_slo.prom": WEEKLY_SLO_PROM_PATH,
     }
     for filename, dest in copies.items():
         src = date_dir / filename
@@ -415,6 +461,21 @@ def update_weekly_summary(config: dict[str, Any], window_days: int = 7) -> None:
             for entry in entries
             if isinstance(entry.get("seam_hash_count"), (int, float))
         ]
+        seam_event_counts: list[float] = []
+        for entry in entries:
+            summary = entry.get("seam_markers_summary")
+            if isinstance(summary, dict):
+                event_value = summary.get("event_count")
+                if isinstance(event_value, (int, float)):
+                    seam_event_counts.append(float(event_value))
+                    continue
+            event_value = entry.get("seam_event_count")
+            if isinstance(event_value, (int, float)):
+                seam_event_counts.append(float(event_value))
+                continue
+            events_field = entry.get("seam_marker_events")
+            if isinstance(events_field, list):
+                seam_event_counts.append(float(len(events_field)))
         ocr_values = []
         for entry in entries:
             timings_block = entry.get("timings") or {}
@@ -473,11 +534,38 @@ def update_weekly_summary(config: dict[str, Any], window_days: int = 7) -> None:
                 "p50": _percentile(seam_hash_counts, 0.5),
                 "p95": _percentile(seam_hash_counts, 0.95),
             }
+        if seam_event_counts:
+            seam_block["events"] = {
+                "p50": _percentile(seam_event_counts, 0.5),
+                "p95": _percentile(seam_event_counts, 0.95),
+            }
         if seam_block:
             category_entry["seam_markers"] = seam_block
         categories_summary.append(category_entry)
 
     WEEKLY_SUMMARY_PATH.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+
+def update_weekly_slo_summary(budget_map: Mapping[str, int], window_days: int = 7) -> None:
+    history_dirs = _collect_history(window_days)
+    entries: list[dict[str, Any]] = []
+    for history_dir in history_dirs:
+        manifest_path = history_dir / "manifest_index.json"
+        if not manifest_path.exists():
+            continue
+        records = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if isinstance(records, list):
+            entries.extend(records)
+    if not entries:
+        return
+    summary = compute_slo.compute_slo_summary(entries, budget_map=dict(budget_map))
+    payload = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "window_days": window_days,
+        "summary": summary,
+    }
+    WEEKLY_SLO_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    compute_slo.write_prom_metrics(summary=summary, output_path=WEEKLY_SLO_PROM_PATH)
 
 
 def main() -> None:

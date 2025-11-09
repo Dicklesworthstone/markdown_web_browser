@@ -29,6 +29,7 @@ bd-we4 Semantic post-processing toggle — open to design the optional LLM/post-
 bd-n5c Depth-1 crawl mode — open to build the allowlisted single-hop crawl orchestration in PLAN §15.
 bd-md3 Capture/OCR SLO dashboards — open to automate the §20.1 SLO/error-budget calculations and dashboards. 2025-11-09 update: PinkHill documented the seam marker telemetry workflow (README/docs/ops) so weekly seam count/hash percentiles can feed Grafana/Prom alerts alongside capture/OCR SLOs; next step is wiring the exporters to publish those values directly.
 bd-0jc Overlap & hyphenation guard research — open to run the PLAN §17 experiments on overlap windows + hyphen guards and feed new defaults/tests.
+bd-0jc Overlap & hyphenation guard research — 2025-11-09 RedCreek auditing `app/stitch.py` overlap/SSIM windows + hyphen safeguards, drafting experiment plan + test coverage before proposing new defaults.
 
 bd-co1 Resume/watch review — 2025-11-09 GreenLake audited ResumeManager: done_flags now record JSON payloads so resume status can display real URLs without rewriting work_index, orphan detection skips known entries, and tests/test_mdwb_cli_resume.py covers the new flag behavior.
 

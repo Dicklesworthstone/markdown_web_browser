@@ -51,3 +51,5 @@ Starting bd-x6v cache reuse work now - GreenMountain
 
 2025-11-09 — GreenLake (bd-md3) added scripts/compute_slo.py + tests/test_compute_slo.py to generate capture/OCR SLO summaries, Prometheus textfiles, and docs/ops/README guidance for running the new CLI.
 2025-11-09 — GreenLake wired scripts/run_smoke.py to call scripts/compute_slo.py after each smoke (writes slo_summary.json + slo.prom to latest markers) so dashboards/alerting always see fresh mdwb_slo_* metrics.
+2025-11-09 — RedCreek (bd-0jc) started the overlap/SSIM window + hyphen guard research: auditing current `app/stitch.py` heuristics/tests, documenting experiment plan before changing defaults.
+2025-11-09 — RedCreek (bd-0jc) drafted the experiment plan: compare overlap windows 80/120/160 px and SSIM cutoffs (0.60/0.70/0.80) using nightly smoke manifests + stitched Markdown diffs, while replaying hyphen-heavy DOM assist cases (news articles + dashboards) to see when the hyphen guard should skip (code fences, blockquotes, list items). Preparing automation to collect those stats before tweaking defaults.
