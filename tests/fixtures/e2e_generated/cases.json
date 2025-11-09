@@ -1,0 +1,8 @@
+[
+  {
+    "name": "sample-doc",
+    "baseline": "tests/fixtures/e2e_generated/sample.baseline.md",
+    "candidate": "tests/fixtures/e2e_generated/sample.current.md",
+    "tolerance": 0.02
+  }
+]

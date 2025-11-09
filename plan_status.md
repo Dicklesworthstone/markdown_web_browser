@@ -6,7 +6,14 @@
 - bd-9ke: POST /replay API implemented (PLAN §§4/9/21.5).
 - bd-cls: profile_id passthrough implemented (PLAN §7).
 - bd-2p3: Links tab actions bead opened (PLAN §5).
-- bd-4wx: HTMX SSE extension bead opened (PLAN §19.7).
+- bd-4wx: HTMX SSE extension bead landed (PLAN §19.7) — UI now uses `hx-ext="sse"` with dom_assist summaries.
 - bd-hki: Generative E2E guardrail suite bead opened (PLAN §14).
 - bd-l9n: Granian runtime toggle bead opened (PLAN §19.8).
 - bd-e0q: release/regression checklist bead opened (PLAN §20.3).
+- bd-b9e: DOM-guided heading leveling/provenance bead opened (PLAN §19.4).
+- bd-805: hybrid text recovery heuristics bead opened (PLAN §19.5).
+- bd-90m: OCR concurrency autotune + HTTP/2 reuse bead opened (PLAN §§8/19.8).
+- bd-692/bd-we4/bd-n5c: PLAN §15 enhancement beads opened for seam watermarks, semantic post-process toggle, and crawl mode.
+- bd-md3: capture/OCR SLO dashboard bead opened (PLAN §20.1).
+- bd-0jc: overlap window + hyphen guard research bead opened (PLAN §17).
+- bd-hki: Generative E2E guardrail tests partially landed (fixtures + MDWB_RUN_E2E_GENERATED toggle).

@@ -13,9 +13,10 @@ Render any URL with a deterministic Chrome-for-Testing profile, tile the page in
 2. Playwright (Chromium CfT, viewport 1280×2000, DPR 2, reduced motion) performs a deterministic viewport sweep.
 3. `pyvips` slices sweeps into ≤1288 px tiles with ≈120 px overlap; each tile carries offsets, DPR, hashes.
 4. The OCR client submits tiles (HTTP/2) to hosted or local olmOCR, with retries + concurrency autotune.
-5. Stitcher merges Markdown, trims overlaps via SSIM + fuzzy text comparisons, injects provenance comments, and builds the Links Appendix.
+5. Stitcher merges Markdown, aligns headings with the DOM outline, trims overlaps via SSIM + fuzzy text comparisons, injects provenance comments (with tile metadata + highlight links), and builds the Links Appendix.
 6. `Store` writes artifacts under a content-addressed path and updates sqlite + sqlite-vec metadata for embeddings search.
 7. `/jobs/{id}`, `/jobs/{id}/stream`, `/jobs/{id}/events`, `/jobs/{id}/links.json`, etc., feed the HTMX UI, CLI, and agent automations.
+8. The browser shell relies on the HTMX SSE extension, so real-time updates (state, manifest, warning pills) are declaratively wired via `hx-ext="sse"` without bespoke `EventSource` code.
 
 See `PLAN_TO_IMPLEMENT_MARKDOWN_WEB_BROWSER_PROJECT.md` §§2–5, 19 for the full breakdown.
 
@@ -30,8 +31,8 @@ See `PLAN_TO_IMPLEMENT_MARKDOWN_WEB_BROWSER_PROJECT.md` §§2–5, 19 for the fu
    - Fill in OCR creds, `API_BASE_URL`, CfT label/build, screenshot style hash overrides, webhook secret, etc.
    - Settings are loaded exclusively via `python-decouple` (`app/settings.py`), so keep `.env` private.
 3. **Run the API/UI**
-   - `uv run python -m app.main`
-   - Open `http://localhost:8000` for the HTMX/Alpine interface.
+   - `scripts/dev_run.sh` (defaults to uvicorn with reload). Open `http://localhost:8000` for the HTMX/Alpine interface.
+   - For production-style smoke, flip to Granian: `SERVER_IMPL=granian UVICORN_RELOAD=false HOST=0.0.0.0 PORT=8000 scripts/dev_run.sh --workers 4 --granian-runtime-threads 2`. This wraps `scripts/run_server.py`, so the same flags work in CI or systemd units.
 4. **Trigger a capture**
    - UI Run button posts `/jobs`.
    - CLI example: `uv run python scripts/mdwb_cli.py fetch https://example.com --watch`
@@ -40,6 +41,18 @@ See `PLAN_TO_IMPLEMENT_MARKDOWN_WEB_BROWSER_PROJECT.md` §§2–5, 19 for the fu
 - The UI profile dropdown and CLI `--profile <id>` flag reuse login/storage state under `CACHE_ROOT/profiles/<id>/storage_state.json`. Pick distinct IDs for red/blue teams or authenticated personas.
 - Profiles are recorded in `manifest.profile_id`, surfaced via `/jobs/{id}`/SSE/CLI diagnostics, and stored in `runs.db` so ops can audit which captures used which credentials.
 - Storage directories are slugged automatically (`[A-Za-z0-9._-]`), so feel free to pass human-friendly names (e.g., `agent.alpha`).
+
+### Links tab (domain grouping + actions)
+- Links now stream into domain-grouped sections so it is easy to scan anchors/forms per host (relative URLs and fragments fall into `(relative)` / `(fragment)` buckets).
+- Coverage badges highlight whether a link came from the DOM, OCR, or both, and raise warnings for text mismatches; attribute badges summarize `target`/`rel` metadata, which is useful when triaging overlays or sandbox issues.
+- Each row exposes inline actions:
+  - **Open in new job** populates the toolbar URL field and immediately triggers a capture run.
+  - **Copy Markdown** copies the Markdown anchor (or best-effort fallback) to the clipboard.
+  - **Mark crawled** toggles a local badge + dimmed state so agents can keep track of which URLs they have already followed; the selection persists in `localStorage`.
+
+### OCR concurrency autotune
+- The OCR client now starts at `OCR_MIN_CONCURRENCY` and automatically scales up toward `OCR_MAX_CONCURRENCY` when latency is healthy, or throttles when responses turn slow/errored. The live Events tab and Manifest view both stream these adjustments so you can see when the controller steps in.
+- Manifests (`ocr_autotune`) and CLI commands (`mdwb diag`, `mdwb jobs ocr-metrics`) include the initial/peak/final limits plus a short history of adjustments. Use `MDWB_SERVER_IMPL=granian` + higher worker counts when you want the autotune headroom to matter.
 
 ### Cache reuse
 - `POST /jobs` now deduplicates captures using a content-address (`url + CfT + viewport + DSF + OCR model + profile`). By default the CLI enables this, so identical requests return immediately with `cache_hit=true` and reuse existing artifacts.
@@ -53,7 +66,7 @@ See `PLAN_TO_IMPLEMENT_MARKDOWN_WEB_BROWSER_PROJECT.md` §§2–5, 19 for the fu
 - `fetch <url> --webhook-url https://... [--webhook-event DONE --webhook-event FAILED]` — register callbacks right after the job is created.
 - `show <job-id> [--ocr-metrics]` — dump the latest job snapshot, optionally with OCR batch/quota telemetry.
 - `stream <job-id>` — follow the SSE feed.
-- `watch <job-id>` / `events <job-id> --follow --since <ISO>` — tail the `/jobs/{id}/events` NDJSON log (use `--on EVENT=COMMAND` for hooks; add `--no-progress` to suppress the percent/ETA overlay, `--reuse-session` to keep a single HTTP client).
+- `watch <job-id>` / `events <job-id> --follow --since <ISO>` — tail the `/jobs/{id}/events` NDJSON log (use `--on EVENT=COMMAND` for hooks; add `--no-progress` to suppress the percent/ETA overlay, `--reuse-session` to keep a single HTTP client). DOM-assist events now print counts/reasons so you immediately see when hybrid recovery patched a tile.
 - `diag <job-id>` — print CfT/Playwright metadata, capture/OCR timings, warnings, and blocklist hits for incident triage.
 - `jobs replay manifest <manifest.json>` — resubmit a stored manifest via `/replay` with validation/JSON output support.
 - `jobs embeddings search <job-id> --vector-file vector.json [--top-k 5]` — search sqlite-vec section embeddings for a run (supports inline `--vector` strings and `--json` output).
@@ -92,6 +105,12 @@ npx playwright test --config=playwright.config.mjs  # or PLAYWRIGHT_BIN=/path/to
 if you need to invoke the Node-based runner; otherwise the script prefers `npx playwright test --config=playwright.config.mjs`
 (which inherits the defaults from PLAN/AGENTS: viewport 1280×2000, DPR 2, reduced motion, light scheme, mask selectors, CDP/BiDi transport via `PLAYWRIGHT_TRANSPORT`). When Node Playwright isn’t installed it falls back to `uv run playwright test` and prints a warning if the Python CLI lacks `test`.
 When you already know libvips isn’t available in a minimal container, export `SKIP_LIBVIPS_CHECK=1` to bypass the preflight warning. Set `MDWB_CHECK_METRICS=1` (optionally `CHECK_METRICS_TIMEOUT=<seconds>`) to append the Prometheus health check. To run the rich CLI E2E suite locally/CI, set `MDWB_RUN_E2E=1` so `run_checks.sh` executes `tests/test_e2e_cli.py` after the standard subset; the run emits FlowLogger tables so grab the `run_checks` log in CI for postmortems.
+
+- The bundled pytest targets now include the store/manifest persistence suite (`tests/test_store_manifest.py`, `tests/test_manifest_contract.py`),
+  the Prometheus CLI health checks (`tests/test_check_metrics.py`), and the ops regressions for `show_latest_smoke`/`update_smoke_pointers` in addition
+  to the CLI coverage. This keeps RunRecord fields, smoke pointer tooling, and metrics hooks under CI without needing a live API server.
+
+- Playwright defaults to the Chrome for Testing build. Leave `PLAYWRIGHT_CHANNEL` unset (or set it to `cft`) so local smoke runs match the capture pipeline; if you have to fall back to stock Chromium, set `PLAYWRIGHT_CHANNEL=chromium` or use a comma-separated preference such as `PLAYWRIGHT_CHANNEL="chromium,cft"`. Likewise, keep `PLAYWRIGHT_TRANSPORT=cdp` unless you are explicitly exercising WebDriver BiDi—when you do, a value like `PLAYWRIGHT_TRANSPORT="bidi,cdp"` makes the preferred/fallback order obvious to anyone reading CI metadata.
 
 - Every `run_checks` invocation now emits `tmp/pytest_report.xml` and `tmp/pytest_summary.json`
   (override with `PYTEST_JUNIT_PATH`/`PYTEST_SUMMARY_PATH`). The JSON digest lists totals and the first few
@@ -148,11 +167,13 @@ uv run python scripts/run_smoke.py --date $(date -u +%Y-%m-%d) --category docs_a
 
 ## Artifacts you should expect per job
 - `artifact/tiles/tile_*.png` — viewport-sweep tiles (≤1288 px long side) with overlap + SHA metadata.
-- `out.md` — final Markdown with provenance comments (`<!-- source: tile_i ... -->`) and Links Appendix.
+- `/jobs/{id}/artifact/highlight?tile=…&y0=…&y1=…` — quick HTML viewer that overlays the region referenced by each provenance comment (handy for code reviews and incident reports).
+- `out.md` — final Markdown with DOM-guided heading normalization plus provenance comments (`<!-- source: tile_i ... , path=…, highlight=/jobs/... -->`) and Links Appendix.
 - `links.json` — anchors/forms/headings/meta harvested from the DOM snapshot.
 - `manifest.json` — CfT label/build, Playwright version, screenshot style hash, warnings, sweep stats, timings.
 - `dom_snapshot.html` — raw DOM capture used for link diffs and hybrid recovery (when enabled).
 - `bundle.tar.zst` — optional tarball for incidents/export (`Store.build_bundle`).
+- Markdown output now includes seam markers (`<!-- seam-marker … -->`) and enriched provenance comments (`viewport_y`, `overlap_px`, highlight links) plus detailed `<!-- table-header-trimmed reason=… -->` breadcrumbs so reviewers can jump straight to stitched regions.
 
 Use `mdwb jobs bundle …` or `mdwb jobs artifacts manifest …` (or `/jobs/{id}/artifact/...`) to reproduce a job locally and fetch its artifacts for debugging.
 
@@ -165,6 +186,7 @@ Use `mdwb jobs bundle …` or `mdwb jobs artifacts manifest …` (or `/jobs/{id}
 - `PLAN_TO_IMPLEMENT_MARKDOWN_WEB_BROWSER_PROJECT.md` — canonical spec + incremental upgrades.
 - `docs/architecture.md` — best practices + data flow diagrams.
 - `docs/blocklist.md`, `docs/config.md`, `docs/models.yaml`, `docs/ops.md`, `docs/olmocr_cli.md` — supporting specs.
+- `docs/release_checklist.md` — step-by-step release & regression runbook (CfT/Playwright/model toggles, smoke commands, artifact list).
 
 ## Troubleshooting cheatsheet
 - **Playwright/CfT mismatch:** Run `playwright install chromium --with-deps --channel=cft` and confirm `CFT_VERSION`/`CFT_LABEL` match the installed build. If CfT labels shifted, update `.env` + manifests before rerunning.

@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import base64
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Sequence, cast
 
 import httpx
@@ -59,6 +60,7 @@ class SubmitTilesResult:
     markdown_chunks: list[str]
     batches: list[OCRBatchTelemetry]
     quota: OCRQuotaStatus
+    autotune: "OcrAutotuneSnapshot | None" = None
 
 
 @dataclass(slots=True)
@@ -69,6 +71,32 @@ class _EncodedTile:
     image_b64: str
     size_bytes: int
     model: str | None
+
+
+@dataclass(slots=True)
+class OcrAutotuneEvent:
+    previous_limit: int
+    new_limit: int
+    reason: str
+    status_code: int
+    latency_ms: int
+    attempts: int
+
+
+@dataclass(slots=True)
+class OcrAutotuneSnapshot:
+    initial_limit: int
+    final_limit: int
+    peak_limit: int
+    events: list[OcrAutotuneEvent] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "initial_limit": self.initial_limit,
+            "final_limit": self.final_limit,
+            "peak_limit": self.peak_limit,
+            "events": [event.__dict__ for event in self.events],
+        }
 
 
 class _QuotaTracker:
@@ -108,6 +136,111 @@ class _QuotaTracker:
 _quota_tracker = _QuotaTracker()
 
 
+class _AutotuneController:
+    """Latency/error-based concurrency controller."""
+
+    def __init__(self, *, min_limit: int, max_limit: int) -> None:
+        self._min = max(1, min_limit)
+        self._max = max(self._min, max_limit)
+        self._initial = self._min
+        self._current = self._min
+        self._peak = self._min
+        self._events: list[OcrAutotuneEvent] = []
+        self._success_streak = 0
+
+    @property
+    def current(self) -> int:
+        return self._current
+
+    def observe(self, telemetry: OCRBatchTelemetry) -> OcrAutotuneEvent | None:
+        status = telemetry.status_code
+        latency = telemetry.latency_ms
+        attempts = telemetry.attempts
+        new_limit = self._current
+        reason: str | None = None
+
+        if status in {408, 429} or status >= 500:
+            new_limit = max(self._min, self._current - 1)
+            reason = f"http-{status}"
+            self._success_streak = 0
+        elif attempts > 1:
+            new_limit = max(self._min, self._current - 1)
+            reason = "retry"
+            self._success_streak = 0
+        elif latency >= 7000:
+            new_limit = max(self._min, self._current - 1)
+            reason = "slow"
+            self._success_streak = 0
+        else:
+            self._success_streak += 1
+            if self._success_streak >= 2 and latency <= 3500 and self._current < self._max:
+                new_limit = min(self._max, self._current + 1)
+                reason = "healthy"
+
+        if new_limit == self._current or reason is None:
+            return None
+
+        event = OcrAutotuneEvent(
+            previous_limit=self._current,
+            new_limit=new_limit,
+            reason=reason,
+            status_code=status,
+            latency_ms=latency,
+            attempts=attempts,
+        )
+        self._current = new_limit
+        self._peak = max(self._peak, self._current)
+        self._events.append(event)
+        if len(self._events) > 50:
+            del self._events[: len(self._events) - 50]
+        return event
+
+    def snapshot(self) -> OcrAutotuneSnapshot:
+        return OcrAutotuneSnapshot(
+            initial_limit=self._initial,
+            final_limit=self._current,
+            peak_limit=self._peak,
+            events=list(self._events),
+        )
+
+
+class _AdaptiveLimiter:
+    """Async semaphore wrapper with adjustable concurrency."""
+
+    def __init__(self, controller: _AutotuneController) -> None:
+        self._controller = controller
+        self._semaphore = asyncio.Semaphore(controller.current)
+        self._pending_reduction = 0
+        self._limit_lock = asyncio.Lock()
+
+    @asynccontextmanager
+    async def slot(self):
+        await self._semaphore.acquire()
+        try:
+            yield
+        finally:
+            if self._pending_reduction > 0:
+                self._pending_reduction -= 1
+            else:
+                self._semaphore.release()
+
+    async def record(self, telemetry: OCRBatchTelemetry) -> OcrAutotuneEvent | None:
+        event = self._controller.observe(telemetry)
+        if not event:
+            return None
+        async with self._limit_lock:
+            diff = event.new_limit - event.previous_limit
+            if diff > 0:
+                for _ in range(diff):
+                    self._semaphore.release()
+            elif diff < 0:
+                self._pending_reduction += -diff
+        return event
+
+    def snapshot(self) -> OcrAutotuneSnapshot:
+        return self._controller.snapshot()
+
+
 async def submit_tiles(
     *,
     requests: Sequence[OCRRequest],
@@ -131,8 +264,9 @@ async def submit_tiles(
     owns_client = client is None
     http_client = client or httpx.AsyncClient(timeout=REQUEST_TIMEOUT, http2=True)
 
-    limit = max(1, cfg.ocr.max_concurrency, cfg.ocr.min_concurrency or 0)
-    semaphore = asyncio.Semaphore(limit)
+    min_limit = max(1, cfg.ocr.min_concurrency)
+    max_limit = max(min_limit, cfg.ocr.max_concurrency)
+    limiter = _AdaptiveLimiter(_AutotuneController(min_limit=min_limit, max_limit=max_limit))
     encoded_tiles = [_encode_request(req, cfg) for req in requests]
     batches = _group_tiles(
         encoded_tiles,
@@ -144,7 +278,7 @@ async def submit_tiles(
     markdown_by_id: dict[str, str] = {req.tile_id: "" for req in requests}
 
     async def _submit(group: list[_EncodedTile]) -> None:
-        async with semaphore:
+        async with limiter.slot():
             batch_result = await _submit_batch(
                 group,
                 endpoint=endpoint,
@@ -152,9 +286,10 @@ async def submit_tiles(
                 http_client=http_client,
                 use_fp8=cfg.ocr.use_fp8,
             )
-            telemetry.append(batch_result.telemetry)
-            for tile_id, chunk in zip(batch_result.tile_ids, batch_result.markdown, strict=True):
-                markdown_by_id[tile_id] = chunk
+        telemetry.append(batch_result.telemetry)
+        for tile_id, chunk in zip(batch_result.tile_ids, batch_result.markdown, strict=True):
+            markdown_by_id[tile_id] = chunk
+        await limiter.record(batch_result.telemetry)
 
     try:
         await asyncio.gather(*(_submit(group) for group in batches))
@@ -168,6 +303,7 @@ async def submit_tiles(
         markdown_chunks=markdown_chunks,
         batches=telemetry,
         quota=quota_status,
+        autotune=limiter.snapshot(),
     )
 
 

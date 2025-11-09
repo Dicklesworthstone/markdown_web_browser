@@ -18,6 +18,8 @@ PYTEST_TARGETS=(
   tests/test_mdwb_cli_artifacts.py
   tests/test_agent_scripts.py
   tests/test_update_smoke_pointers.py
+  tests/test_show_latest_smoke.py
+  tests/test_check_metrics.py
   tests/test_mdwb_cli_diag.py
   tests/test_mdwb_cli_embeddings.py
   tests/test_mdwb_cli_ocr.py
@@ -27,7 +29,9 @@ PYTEST_TARGETS=(
   tests/test_mdwb_cli_resume.py
   tests/test_olmocr_cli_config.py
   tests/test_check_env.py
-  tests/test_show_latest_smoke.py
+  tests/test_store_manifest.py
+  tests/test_capture_sweeps.py
+  tests/test_manifest_contract.py
   tests/test_metrics.py
   tests/test_api_webhooks.py
   tests/test_report_pytest_summary.py
@@ -96,6 +100,14 @@ if [[ "${MDWB_RUN_E2E:-0}" == "1" ]]; then
 else
   echo "→ pytest (e2e)"
   echo "SKIP: Set MDWB_RUN_E2E=1 to include tests/test_e2e_cli.py"
+  echo
+fi
+
+if [[ "${MDWB_RUN_E2E_GENERATED:-0}" == "1" ]]; then
+  run_step "pytest (e2e generated)" uv run pytest tests/test_e2e_generated.py
+else
+  echo "→ pytest (e2e generated)"
+  echo "SKIP: Set MDWB_RUN_E2E_GENERATED=1 to include tests/test_e2e_generated.py"
   echo
 fi
 

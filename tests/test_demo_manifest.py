@@ -1,3 +1,4 @@
+import json
 import sys
 import types
 
@@ -41,3 +42,22 @@ def test_snapshot_events_include_manifest_breadcrumbs():
     assert "blocklist" in events
     assert "sweep" in events
     assert "validation" in events
+    assert "dom_assist" not in events  # no assists in this snapshot
+
+
+def test_snapshot_events_surface_dom_assist_summary():
+    snapshot = {
+        "state": "DONE",
+        "manifest": {
+            "dom_assists": [
+                {"tile_index": 0, "line": 3, "reason": "low-alpha"},
+                {"tile_index": 1, "line": 1, "reason": "punctuation"},
+            ]
+        },
+    }
+
+    events = dict(_snapshot_events(snapshot))
+
+    assert "dom_assist" in events
+    summary = json.loads(events["dom_assist"])
+    assert summary["count"] == 2

@@ -76,6 +76,10 @@ class ManifestEnvironment(BaseModel):
 
     cft_version: str = Field(description="Chrome for Testing label+build")
     cft_label: str = Field(description="Chrome for Testing track label")
+    server_runtime: str = Field(
+        default="uvicorn",
+        description="ASGI server runtime handling the job (e.g., uvicorn or granian)",
+    )
     playwright_channel: str = Field(description="Playwright browser channel")
     playwright_version: str | None = Field(default=None, description="Resolved Playwright version at runtime")
     browser_transport: str = Field(description="Browser transport (cdp or bidi)")
@@ -208,6 +212,10 @@ class ManifestMetadata(BaseModel):
     cache_key: str | None = Field(
         default=None,
         description="Deterministic hash used to look up cached captures",
+    )
+    dom_assists: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="DOM overlays injected to repair low-confidence OCR spans",
     )
 
 

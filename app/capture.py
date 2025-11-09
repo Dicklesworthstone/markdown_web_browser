@@ -94,6 +94,8 @@ class CaptureManifest:
     stitch_ms: int | None = None
     ocr_batches: list[dict[str, object]] = field(default_factory=list)
     ocr_quota: dict[str, object] | None = None
+    dom_assists: list[dict[str, object]] = field(default_factory=list)
+    ocr_autotune: dict[str, object] | None = None
 
 
 @dataclass(slots=True)

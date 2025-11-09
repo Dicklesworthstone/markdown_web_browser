@@ -9,7 +9,7 @@ from typing import Any, Iterator
 import httpx
 import pytest
 
-from app.ocr_client import OCRRequest, reset_quota_tracker, submit_tiles
+from app.ocr_client import OCRBatchTelemetry, OCRRequest, reset_quota_tracker, submit_tiles, _BatchResult
 from app.settings import (
     BrowserSettings,
     LoggingSettings,
@@ -85,6 +85,7 @@ def _dummy_settings(
         warnings=warning_settings,
         logging=logging_settings,
         webhook_secret="test-secret",
+        server_runtime="pytest",
     )
 
 
@@ -118,6 +119,7 @@ async def test_submit_tiles_posts_base64_payload() -> None:
         )
 
     assert result.markdown_chunks == ["tile md"]
+    assert result.autotune is not None
     assert captured["url"].endswith("/v1/ocr")
     payload = captured["body"]
     assert payload["model"] == "olmOCR-2-7B-1025-FP8"
@@ -176,6 +178,45 @@ async def test_submit_tiles_respects_concurrency_limit() -> None:
 
     assert result.markdown_chunks == [f"tile-{idx}" for idx in range(4)]
     assert fake_client.max_inflight <= 2
+    assert result.autotune is not None
+
+
+@pytest.mark.asyncio
+async def test_submit_tiles_autotune_adjusts_limits(monkeypatch) -> None:
+    sequence = [
+        {"status": 200, "latency": 1500, "attempts": 1},
+        {"status": 200, "latency": 1400, "attempts": 1},
+        {"status": 200, "latency": 1200, "attempts": 1},
+        {"status": 500, "latency": 3200, "attempts": 1},
+    ]
+
+    async def fake_submit_batch(tiles, **kwargs):  # noqa: ANN001
+        data = sequence.pop(0)
+        telemetry = OCRBatchTelemetry(
+            tile_ids=tuple(tile.tile_id for tile in tiles),
+            latency_ms=data["latency"],
+            status_code=data["status"],
+            request_id="req",
+            payload_bytes=1024,
+            attempts=data["attempts"],
+        )
+        markdown = [tile.tile_id for tile in tiles]
+        return _BatchResult(tile_ids=telemetry.tile_ids, markdown=markdown, telemetry=telemetry)
+
+    monkeypatch.setattr("app.ocr_client._submit_batch", fake_submit_batch)
+
+    requests = [OCRRequest(tile_id=f"tile-{idx}", tile_bytes=b"data") for idx in range(4)]
+    settings = _dummy_settings(max_concurrency=3, max_batch_tiles=1)
+
+    async with httpx.AsyncClient() as fake_client:
+        result = await submit_tiles(requests=requests, settings=settings, client=fake_client)
+
+    autotune = result.autotune
+    assert autotune is not None
+    assert autotune.peak_limit >= 3
+    assert autotune.final_limit <= autotune.peak_limit
+    assert any(event.reason == "healthy" for event in autotune.events)
+    assert any(event.reason.startswith("http-") for event in autotune.events)
 
 
 @pytest.mark.asyncio

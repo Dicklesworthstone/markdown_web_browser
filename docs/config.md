@@ -33,8 +33,8 @@ print(settings.ocr.server_url)
 | `RUNS_DB_PATH` | `runs.db` | SQLite file storing `runs`, `links`, and sqlite-vec embeddings. |
 | `CFT_VERSION` | `chrome-130.0.6723.69` | Chrome for Testing label/build pinned for Playwright; log in every manifest. |
 | `CFT_LABEL` | `Stable-1` | CfT channel label surfaced in `environment.cft_label`. |
-| `PLAYWRIGHT_CHANNEL` | `cft` | Browser channel launched by Playwright. |
-| `PLAYWRIGHT_TRANSPORT` | `cdp` | Transport used to drive Chromium (`cdp` or `bidi`); needed for ops escalations. |
+| `PLAYWRIGHT_CHANNEL` | `cft` | Browser channel launched by Playwright. Accepts a comma-separated preference list (e.g., `cft,chromium`) so operators can note the fallback order when CfT isn’t available locally. |
+| `PLAYWRIGHT_TRANSPORT` | `cdp` | Transport used to drive Chromium (`cdp` or `bidi`). Also accepts comma-separated preferences (e.g., `bidi,cdp`) so CI metadata clarifies the intended fallback. |
 | `CAPTURE_VIEWPORT_WIDTH` | `1280` | Pixel width for captures + manifest `viewport.width`. |
 | `CAPTURE_VIEWPORT_HEIGHT` | `2000` | Pixel height for captures + manifest `viewport.height`. |
 | `CAPTURE_DEVICE_SCALE_FACTOR` | `2` | DSF used for capture; feeds screenshot style hash + manifest viewport block. |
@@ -59,6 +59,10 @@ print(settings.ocr.server_url)
 | `PROMETHEUS_PORT` | `9000` | Port for the standalone Prometheus exporter (the API also exposes `/metrics`). |
 | `HTMX_SSE_HEARTBEAT_MS` | `4000` | Interval (ms) for SSE heartbeat events streamed to the UI. |
 | `WEBHOOK_SECRET` | `mdwb-dev-webhook` | Shared secret used to sign `/jobs/{id}/webhooks` callbacks. |
+| `MDWB_SERVER_IMPL` | `uvicorn` | API server runtime used by `scripts/run_server.py` (`uvicorn` for dev, `granian` for higher throughput). |
+| `MDWB_SERVER_WORKERS` | `1` | Worker processes for the launcher (set higher in production or when using Granian). |
+| `MDWB_GRANIAN_RUNTIME_THREADS` | `1` | Runtime threads per worker when running under Granian. |
+| `MDWB_SERVER_LOG_LEVEL` | `info` | Verbosity for both runtimes; mirrors `--log-level`. |
 
 Add any new variables to `.env.example`, document them here, and update the
 manifest schema if they need to be echoed downstream.
@@ -89,6 +93,7 @@ in `app/schemas.py` (see `ManifestEnvironment`, `ManifestTimings`, and
 * Timing metrics (`capture_ms`, `ocr_ms`, `stitch_ms`, `total_ms`) once stages
   execute
 * Cache metadata (`cache_hit`, `cache_key`) so dashboards/CLI output can distinguish fresh captures from cache replays
+* DOM assist overlays (`dom_assists`) indicating which tiles/lines were patched with DOM text (reason + replacement) so ops/debuggers can audit hybrid recovery events
 
 ```jsonc
 {
@@ -130,6 +135,9 @@ in `app/schemas.py` (see `ManifestEnvironment`, `ManifestTimings`, and
   },
   "overlap_match_ratio": 0.94,
   "validation_failures": [],
+  "dom_assists": [
+    {"tile_index": 0, "line": 3, "reason": "low-alpha", "dom_text": "Revenue Q4", "original_text": "Rev3nue?" }
+  ],
   "cache_hit": false,
   "cache_key": "cache-<sha1>"
 }
@@ -148,6 +156,8 @@ in `app/schemas.py` (see `ManifestEnvironment`, `ManifestTimings`, and
   correlate spikes.
 * Prometheus + HTMX SSE heartbeat intervals come directly from this config—keep
   dashboards/tests in sync with any changes.
+* `MDWB_SERVER_IMPL` controls whether `scripts/run_server.py` launches uvicorn or Granian. The chosen runtime is echoed into manifests (`environment.server_runtime`) and stored in SQLite so cache hits/logs can be filtered by server type.
 * The warning/blocklist JSONL log now includes `sweep_stats`, overlap ratios, and any `validation_failures`, so Ops can spot retries or seam duplication even when DOM warnings don’t fire. Ensure the log rotation/search tooling ingests the new keys.
 * Prometheus scraping now covers capture/OCR/stitch latencies, warning/blocklist totals, SSE heartbeats, and job completions. Scrape `/metrics` directly or hit the exporter bound to `PROMETHEUS_PORT` when you need a dedicated port.
 * Persistent Chromium profiles live under `CACHE_ROOT/profiles/<id>/storage_state.json`. The UI dropdown and CLI `--profile` flag reuse these directories, and manifests/RunRecords echo `profile_id` so audits can trace which persona captured a run.
+* OCR manifests now include `ocr_autotune` (initial/final/peak concurrency plus the most recent adjustments). The CLI + UI render this block so operators know when the controller scaled up/down; set `OCR_MIN_CONCURRENCY`/`OCR_MAX_CONCURRENCY` to shape the window and override via env when debugging throttling.

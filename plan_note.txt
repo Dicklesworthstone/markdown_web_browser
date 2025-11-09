@@ -3,3 +3,26 @@ PLAN §22 note landed (2025-11-08, bd-h2m/3pr/a2e):
 - Status line included: `_2025-11-08 — BlueHill (bd-h2m/3pr/a2e) added the weekly view + MDWB_SMOKE_ROOT/--root override, JSON output, and check command so ops can inspect or validate summary/manifest/weekly data from one CLI invocation._`
 
 2025-11-08 — GreenMountain (bd-x6v) starting content-addressed cache reuse
+
+Starting bd-x6v cache reuse work now - GreenMountain
+2025-11-08 — ChartreuseCastle (bd-0o0) aligned the shared Playwright config with the CfT defaults (channel `cft` + optional comma-separated fallbacks) and documented the transport/channel env semantics in README/docs/ops/config so PLAN §§3.1–3.4 match AGENTS.
+
+2025-11-09 — GreenMountain (bd-hki) added fixtures + MDWB_RUN_E2E_GENERATED toggle for generative E2E tests
+
+2025-11-09 — GreenMountain continued bd-hki generative guardrail work
+
+2025-11-09 — GreenMountain added generative guardrail fixtures/tests (bd-hki)
+
+2025-11-09 — GreenMountain (bd-90m) starting OCR concurrency autotune + HTTP/2 tuning
+
+2025-11-09 — RedDog (bd-2p3) delivered LinkRecord metadata + domain-grouped Links tab (coverage/attribute badges, open job/copy/crawled actions) with local crawl tracking and README/PLAN updates.
+
+2025-11-09 — RedDog (bd-l9n) added scripts/run_server.py + SERVER_IMPL/Granian docs, recorded server_runtime in manifests/DB, and updated ops/config/README.
+
+2025-11-09 — RedDog (bd-90m) shipped OCR concurrency autotune (controller, manifest/SSE/CLI/UI updates + tests).
+
+2025-11-09 — RedDog (bd-e0q) published docs/release_checklist.md and linked it from README/PLAN for the release/regression workflow.
+
+2025-11-09 — RedDog (bd-b9e) added seam markers, stricter table header trimming, and richer provenance comments per PLAN §19.4.
+
+2025-11-09 — GreenMountain resumed bd-90m OCR concurrency autotune work

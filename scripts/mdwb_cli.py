@@ -431,8 +431,9 @@ def _print_job(job: dict) -> None:
 def _print_ocr_metrics(manifest: dict[str, Any], *, json_output: bool) -> None:
     batches = manifest.get("ocr_batches") or []
     quota = manifest.get("ocr_quota") or {}
+    autotune = manifest.get("ocr_autotune") or {}
     if json_output:
-        console.print_json(data={"batches": batches, "quota": quota})
+        console.print_json(data={"batches": batches, "quota": quota, "autotune": autotune})
         return
 
     if quota:
@@ -445,6 +446,8 @@ def _print_ocr_metrics(manifest: dict[str, Any], *, json_output: bool) -> None:
             "⚠" if quota.get("warning_triggered") else "—",
         )
         console.print(quota_table)
+
+    _print_ocr_autotune(autotune)
 
     table = Table("Tile IDs", "Latency (ms)", "Status", "Attempts", "Request ID", "Payload (bytes)", title="OCR Batches")
     if not batches:
@@ -464,10 +467,49 @@ def _print_ocr_metrics(manifest: dict[str, Any], *, json_output: bool) -> None:
 
 
 def _print_links(links: Iterable[dict]) -> None:
-    table = Table("Text", "Href", "Source", "Δ", title="Links")
+    table = Table("Text", "Href", "Domain", "Source", "Δ", "Target", "Rel", title="Links")
     for row in links:
-        table.add_row(row.get("text", ""), row.get("href", ""), row.get("source", ""), row.get("delta", ""))
+        rel_tokens = row.get("rel")
+        if isinstance(rel_tokens, (list, tuple)):
+            rel_value = ", ".join(str(token) for token in rel_tokens if token)
+        else:
+            rel_value = row.get("rel", "") or ""
+        table.add_row(
+            row.get("text", ""),
+            row.get("href", ""),
+            row.get("domain", ""),
+            row.get("source", ""),
+            row.get("delta", ""),
+            row.get("target", ""),
+            rel_value,
+        )
     console.print(table)
+
+
+def _print_ocr_autotune(autotune: Mapping[str, Any] | None) -> None:
+    if not autotune:
+        console.print("[dim]No OCR concurrency telemetry recorded yet.[/]")
+        return
+    summary = Table("Metric", "Value", title="OCR Concurrency Autotune")
+    summary.add_row("Initial", str(autotune.get("initial_limit", "—")))
+    summary.add_row("Peak", str(autotune.get("peak_limit", "—")))
+    summary.add_row("Final", str(autotune.get("final_limit", "—")))
+    summary.add_row("Events", str(len(autotune.get("events") or []) or autotune.get("event_count", 0)))
+    console.print(summary)
+    events = autotune.get("events") or []
+    if not isinstance(events, list) or not events:
+        return
+    event_table = Table("Δ", "Reason", "Status", "Latency", title="Recent Autotune Events")
+    for entry in events[-5:][::-1]:
+        if not isinstance(entry, Mapping):
+            continue
+        event_table.add_row(
+            f"{entry.get('previous_limit', '—')}→{entry.get('new_limit', '—')}",
+            str(entry.get("reason", "—")),
+            str(entry.get("status_code", "—")),
+            f"{entry.get('latency_ms', '—')} ms",
+        )
+    console.print(event_table)
 
 
 def _print_webhooks(records: Iterable[dict[str, Any]]) -> None:
@@ -745,6 +787,10 @@ def _watch_job_events_pretty(
             console.print(line)
             continue
         _trigger_event_hooks(entry, hooks)
+        event_name = entry.get("event")
+        if isinstance(event_name, str) and event_name == "dom_assist":
+            _print_dom_assist_event(entry)
+            continue
         snapshot = entry.get("snapshot")
         if isinstance(snapshot, dict):
             _render_snapshot(snapshot, meter=progress_meter)
@@ -1522,6 +1568,47 @@ def _print_diag_report(
 
     blocklist_hits = (manifest or {}).get("blocklist_hits")
     console.print(f"Blocklist Hits: {_format_blocklist(blocklist_hits)}")
+
+    dom_assists = (manifest or {}).get("dom_assists") or []
+    if dom_assists:
+        assist_table = Table("Tile", "Line", "Reason", "Replacement", title="DOM Assists")
+        for entry in dom_assists[:10]:
+            if not isinstance(entry, dict):
+                continue
+            assist_table.add_row(
+                str(entry.get("tile_index", "—")),
+                str(entry.get("line", "—")),
+                str(entry.get("reason", "—")),
+                entry.get("dom_text", "—"),
+            )
+        if len(dom_assists) > 10:
+            assist_table.caption = f"Showing 10 of {len(dom_assists)} entries"
+        console.print(assist_table)
+    else:
+        console.print("[dim]No DOM assists recorded.[/]")
+
+    autotune_data = (manifest or {}).get("ocr_autotune")
+    _print_ocr_autotune(autotune_data)
+
+
+def _print_dom_assist_event(entry: Mapping[str, Any]) -> None:
+    data = entry.get("data")
+    if not isinstance(data, Mapping):
+        console.print_json(data=entry)
+        return
+    count = data.get("count")
+    reasons = data.get("reasons") or []
+    sample = data.get("sample") or {}
+    table = Table("Metric", "Value", title="DOM Assist Summary")
+    table.add_row("Total", str(count or 0))
+    if reasons:
+        table.add_row("Reasons", ", ".join(str(reason) for reason in reasons))
+    tile_info = sample.get("tile_index")
+    if tile_info is not None:
+        table.add_row("Sample Tile", str(tile_info))
+    if sample.get("reason"):
+        table.add_row("Sample Reason", str(sample.get("reason")))
+    console.print(table)
 
 
 def _follow_warning_log(path: Path, *, json_output: bool, interval: float) -> None:

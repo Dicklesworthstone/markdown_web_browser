@@ -581,45 +581,201 @@ body {
   font-size: 0.9rem;
 }
 
-.links-table table {
+.links-table {
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+}
+
+.link-group {
+  border: 1px solid var(--border);
+  border-radius: 0.75rem;
+  background: rgba(15, 23, 42, 0.5);
+  overflow: hidden;
+}
+
+.link-group__header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0.8rem 1rem;
+  border-bottom: 1px solid rgba(248, 250, 252, 0.08);
+}
+
+.link-group__header h3 {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 600;
+  color: #f8fafc;
+  letter-spacing: 0.03em;
+}
+
+.link-group__count {
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+.link-group__table {
   width: 100%;
   border-collapse: collapse;
   font-size: 0.9rem;
 }
 
-.links-table th,
-.links-table td {
-  border: 1px solid var(--border);
-  padding: 0.5rem;
+.link-group__table th,
+.link-group__table td {
+  padding: 0.85rem 1rem;
   text-align: left;
+  border-top: 1px solid rgba(248, 250, 252, 0.06);
+  vertical-align: top;
 }
 
-.links-table th {
+.link-group__table th {
   text-transform: uppercase;
-  font-size: 0.75rem;
+  font-size: 0.72rem;
   letter-spacing: 0.08em;
   color: var(--muted);
-  background: rgba(15, 23, 42, 0.7);
 }
 
-.badge {
+.link-entry__text {
+  font-weight: 600;
+  margin-bottom: 0.2rem;
+}
+
+.link-entry__href {
+  font-size: 0.8rem;
+  color: var(--accent);
+  text-decoration: none;
+  word-break: break-all;
+}
+
+.link-entry__href:hover {
+  text-decoration: underline;
+}
+
+.link-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.link-action {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0.25rem 0.85rem;
+  font-size: 0.78rem;
+  background: transparent;
+  color: #f1f5f9;
+  cursor: pointer;
+  transition: background 0.2s ease, color 0.2s ease;
+}
+
+.link-action:hover {
+  background: rgba(59, 130, 246, 0.2);
+  color: #bfdbfe;
+}
+
+.link-row--crawled {
+  opacity: 0.7;
+}
+
+.link-badge {
   display: inline-flex;
   align-items: center;
-  gap: 0.35rem;
-  padding: 0.15rem 0.6rem;
+  padding: 0.1rem 0.55rem;
   border-radius: 999px;
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  margin-right: 0.35rem;
+  margin-bottom: 0.3rem;
+  border: 1px solid transparent;
+}
+
+.link-badge--success {
+  background: rgba(16, 185, 129, 0.15);
+  color: #34d399;
+  border-color: rgba(16, 185, 129, 0.4);
+}
+
+.link-badge--info {
+  background: rgba(59, 130, 246, 0.12);
+  color: #93c5fd;
+  border-color: rgba(59, 130, 246, 0.35);
+}
+
+.link-badge--warning {
+  background: rgba(245, 158, 11, 0.15);
+  color: #fbbf24;
+  border-color: rgba(245, 158, 11, 0.4);
+}
+
+.link-badge--error {
+  background: rgba(248, 113, 113, 0.15);
+  color: #fca5a5;
+  border-color: rgba(248, 113, 113, 0.35);
+}
+
+.link-badge--muted {
+  background: rgba(148, 163, 184, 0.12);
+  color: #cbd5f5;
+  border-color: rgba(148, 163, 184, 0.35);
+}
+
+.ocr-autotune {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  margin-top: 0.8rem;
+}
+
+.ocr-autotune__summary {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 0.5rem;
+}
+
+.ocr-autotune__summary div {
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  padding: 0.45rem;
+  background: rgba(15, 23, 42, 0.5);
   font-size: 0.8rem;
+}
+
+.ocr-autotune__summary span {
+  display: block;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-size: 0.65rem;
+}
+
+.ocr-autotune__summary strong {
+  font-size: 1rem;
   font-weight: 600;
 }
 
-.badge--info {
-  background: rgba(56, 189, 248, 0.15);
-  color: var(--accent);
-  border: 1px solid var(--accent-muted);
+.ocr-autotune__events {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
 }
 
-.badge--warn {
-  background: rgba(251, 191, 36, 0.2);
-  color: #fbbf24;
-  border: 1px solid rgba(251, 191, 36, 0.4);
+.ocr-autotune__events li {
+  display: flex;
+  justify-content: space-between;
+  padding: 0.45rem 0.75rem;
+  border-top: 1px solid rgba(248, 250, 252, 0.06);
+  font-size: 0.8rem;
+}
+
+.ocr-autotune__events li:first-child {
+  border-top: none;
+}
+
+.ocr-autotune__event-reason {
+  font-weight: 600;
 }

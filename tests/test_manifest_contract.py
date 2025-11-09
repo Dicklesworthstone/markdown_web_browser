@@ -60,6 +60,15 @@ def test_manifest_metadata_accepts_blocklist_and_warnings() -> None:
             )
         ],
         ocr_quota=ManifestOCRQuota(limit=500000, used=200000, threshold_ratio=0.7, warning_triggered=False),
+        dom_assists=[
+            {
+                "tile_index": 0,
+                "line": 3,
+                "reason": "low-alpha",
+                "dom_text": "Revenue Q4",
+                "original_text": "Rev3nue?",
+            }
+        ],
     )
 
     assert manifest.blocklist_version == "2025-11-07"
@@ -72,3 +81,4 @@ def test_manifest_metadata_accepts_blocklist_and_warnings() -> None:
     assert manifest.ocr_batches[0].request_id == "req-abc"
     assert manifest.ocr_quota is not None
     assert manifest.ocr_quota.limit == 500000
+    assert manifest.dom_assists[0]["reason"] == "low-alpha"

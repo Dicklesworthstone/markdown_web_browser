@@ -68,3 +68,25 @@ def test_delete_webhook_errors(monkeypatch, error, expected_status):
     )
 
     assert response.status_code == expected_status
+
+
+def test_artifact_highlight_page(monkeypatch, tmp_path):
+    tile_path = tmp_path / "tile.png"
+    tile_path.write_bytes(b"fake")
+
+    class StubStore:
+        def resolve_artifact(self, job_id: str, relative_path: str):
+            assert job_id == "job-123"
+            assert relative_path == "artifact/tiles/tile_0001.png"
+            return tile_path
+
+    monkeypatch.setattr(app_main, "store", StubStore())
+    client = TestClient(app_main.app)
+
+    response = client.get(
+        "/jobs/job-123/artifact/highlight",
+        params={"tile": "artifact/tiles/tile_0001.png", "y0": 5, "y1": 25},
+    )
+
+    assert response.status_code == 200
+    assert "y=5 → y=25" in response.text

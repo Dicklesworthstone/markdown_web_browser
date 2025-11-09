@@ -193,6 +193,8 @@ _2025-11-08 — Added BeautifulSoup-powered DOM snapshot parsing so `extract_lin
 _2025-11-08 — FuchsiaMountain (bd-co1) hardened the live monitoring surfaces: the UI Events tab now consumes `/jobs/{id}/events` via a streaming NDJSON reader (heartbeat/health badges + reconnect cues), the Manifest tab surfaces sweep stats + validation alerts pulled from the stream, and the Links/Manifest panels auto-refresh whenever a job transitions into a terminal state._
 
 _2025-11-08 — RedBear (bd-2p3) opened to deliver the missing Links tab actions, per-domain grouping, and DOM-vs-OCR badges promised in §5._
+_2025-11-09 — RedDog (bd-2p3) kicking off the LinkRecord metadata uplift + domain-grouped Links tab with inline actions (open job, copy Markdown, mark crawled) and DOM/OCR badges._
+_2025-11-09 — RedDog (bd-2p3) shipped LinkRecord metadata (rel/target/kind/domain), domain-grouped Links tab UI with badges + action buttons, persisted “mark crawled” state, and README notes covering the new workflow._
 
 ---
 
@@ -497,6 +499,7 @@ _2025-11-08 — RedSnow (bd-ug0.1) aligning the mdwb_cli test stubs with the `_c
 _2025-11-08 — WhiteDog (bd-ptest-cli) added pytest coverage for `mdwb stream`, the `_iter_sse`/`_stream_job` helpers, `mdwb demo snapshot/links`, the diag manifest-fallback error path, and the warnings CLI missing-log path (tests/test_mdwb_cli_events.py, tests/test_mdwb_cli_show.py, tests/test_mdwb_cli_diag.py, tests/test_mdwb_cli_warnings.py) so every Typer command listed in §14.1 stays under run_checks without relying on the live API._
 _2025-11-08 — WhiteDog (bd-ptest-cli) also added regression coverage for the new pytest summary helper (`tests/test_report_pytest_summary.py`) so run_checks’ JUnit/JSON artifacts stay reliable._
 _2025-11-08 — WhiteDog (bd-ptest-reporting) taught `scripts/run_checks.sh` to emit a reusable pytest JUnit + JSON summary (`tmp/pytest_report.xml`, `tmp/pytest_summary.json`) via `scripts/report_pytest_summary.py`, so CI/Agent Mail can reference failing test names without re-running the suite._
+_2025-11-08 — ChartreuseCastle (bd-ptest-prom/bd-ptest-store/bd-ptest-ops) stacked persistence + ops coverage: `tests/test_store_manifest.py` and `tests/test_manifest_contract.py` now assert RunRecord sweep/timing/validation metadata, `tests/test_check_metrics.py` exercises the Prometheus health-check CLI (API base/exporter overrides, JSON summaries, trailing slashes), and `scripts/run_checks.sh`’s target list now includes the smoke pointer helpers (`tests/test_show_latest_smoke.py`, `tests/test_update_smoke_pointers.py`) plus the new Prom/store suites while deduplicating the e2e hook. README + docs/ops note the expanded coverage and pytest summary artifacts._
 
 - **Golden pages:** static docs, sticky headers, SPAs with virtualized lists, huge tables, canvas charts.
 - **Assertions:** headings preserved, no duplicate sections at seams, DOM vs OCR link delta < 10%, tables recognized, provenance comments present.
@@ -545,6 +548,8 @@ When adding code to these areas:
 - Crawl mode: depth-1 link expansion with domain allowlist and concurrency caps.
 - PDF capture improvements deferred (Section 19.12).
 
+_2025-11-08 — BlueMountain (bd-692, bd-we4, bd-n5c) opened beads for the seam watermarks, semantic post-processing toggle, and depth-1 crawl mode so these §15 bullets move beyond wishlist status._
+
 ---
 
 ## 16. Rationale: Why Screenshot-First Wins
@@ -563,6 +568,8 @@ When adding code to these areas:
 - Whether hyphenation fixes harm code blocks/inline math; need guardrails/tests.
 - Best concurrency vs rate-limit curve for remote FP8 endpoint vs local toolkit.
 - How much DOM text patching (Section 19.5) we can do before hallucinating mismatches.
+
+_2025-11-08 — BlueMountain (bd-0jc) opened to run the overlap/SSIM + hyphenation guard experiments and feed the findings back into defaults/tests._
 
 ---
 
@@ -603,12 +610,16 @@ Below is a focused, pragmatic list of near-term upgrades. They map to the sectio
 - Compute SSIM in overlap strips (≈120 px) to auto-trim duplicate lines.
 
 ### 19.4 Stitching: Safer Merges & Provenance
+_2025-11-08 — BlueMountain (bd-b9e) opened to land DOM-guided heading leveling, SSIM-gated table merges, richer provenance comments, and the artifact highlight helper promised in this section._
+_2025-11-09 — RedDog (bd-b9e) delivered the seam markers + enriched provenance comments and overlap-aware table header trimming so reviewers can see exactly where tiles merged and why headers were dropped._
 - DOM-guided heading leveling that stores the original line in an HTML comment right above normalized content.
 - Table merge heuristics keyed on repeated header rows + high SSIM; otherwise keep blocks separate.
 - Upgrade provenance comments to `<!-- source: tile_i, y=1234, sha256=..., scale=2.0 -->` and add `/jobs/{id}/artifact/... ?highlight=tile_i,y0,y1` viewer helpers.
 
 ### 19.5 Hybrid Text Recovery (opt-in)
 > _Status 2025-11-08 — OrangeDog (bd: markdown_web_browser-ogf) wired DOM+OCR link blending so `links.json` and the Links tab highlight OCR-only/DOM-only deltas; OCR-derived links now come from the Markdown output once stitching completes._
+- _2025-11-08 — BlueMountain (bd-805) opened to implement the low-confidence OCR detectors + DOM text overlays so headings/captions can be patched automatically when OCR struggles._
+- _2025-11-09 — BlueMountain (bd-805) delivered the first hybrid recovery pass: low-confidence heuristics now patch Markdown with DOM text (manifest `dom_assists`, event + CLI diag output, and highlight links for quick inspection)._ 
 - Detect low-confidence OCR regions (symbol rate, low alpha ratio, hyphen density) and patch them with DOM text overlays scoped to the offending block (hero headings, captions, icon fonts).
 
 ### 19.6 Caching, Indexing, Retrieval Quality
@@ -626,6 +637,7 @@ Below is a focused, pragmatic list of near-term upgrades. They map to the sectio
 - Enhance the Links tab with per-domain grouping, target rel column, and "DOM vs OCR delta" badge.
 
 _2025-11-08 — RedBear (bd-4wx) opened to swap the bespoke EventSource wiring for the HTMX SSE extension so §19.7 becomes reality._
+_2025-11-09 — BlueMountain (bd-4wx) landed the HTMX SSE integration: `hx-ext="sse"` drives `/jobs/{id}/stream`, the JS bridge now listens to `htmx:sse*` events (including dom_assist summaries), and the manual EventSource shim is gone._
 
 ### 19.8 Performance & Concurrency
 - Offer Granian as an alternative ASGI server, document when to use it, and expose toggles in ops docs.
@@ -633,6 +645,9 @@ _2025-11-08 — RedBear (bd-4wx) opened to swap the bespoke EventSource wiring f
 - Enable HTTP/2 in httpx, reuse connections, gzip Markdown streams.
 
 _2025-11-08 — RedBear (bd-l9n) is covering the Granian toggle/runbook so §19.8 has a concrete deployment story._
+_2025-11-09 — RedDog (bd-l9n) shipped `scripts/run_server.py` + `SERVER_IMPL` toggles, updated `scripts/dev_run.sh`, manifests (`environment.server_runtime`), SQLite columns, and README/docs/ops so ops can choose uvicorn vs Granian with documented flags + tests._
+_2025-11-08 — BlueMountain (bd-90m) opened to wire the OCR concurrency autotune + HTTP/2 reuse so the remaining §19.8 bullets have an owner._
+_2025-11-09 — RedDog (bd-90m) delivered the adaptive OCR concurrency controller (manifest `ocr_autotune`, SSE/CLI/UI surfacing, regression tests) so the pipeline scales between `OCR_MIN_CONCURRENCY`/`OCR_MAX_CONCURRENCY` automatically._
 
 ### 19.9 Robustness & Anti-Flakiness
 - Maintain versioned CSS/selector blocklists (JSON) with per-domain overrides; inject via screenshot style or `page.addStyleTag`.
@@ -683,6 +698,7 @@ _2025-11-08 — PinkCreek (bd-ug0) designing ops automation: smoke/latency job r
 - **SLO definition:** 99% of jobs finish within 2× the rolling 7-day p95 for that URL category (news, docs, app). Track both capture latency and OCR latency separately.
 - **Error budgets:** Dedicate 25% of weekly engineering time to burn-down whenever error budget drops below 90%; prioritize CfT drift, overlay blocklists, or OCR timeout spikes.
 - **Budget attribution:** Manifest fields (`capture_ms`, `tiling_ms`, `ocr_ms`, `stitch_ms`) roll up into BigQuery/duckdb so you can attribute regressions to either Playwright upgrades or model changes.
+_2025-11-08 — BlueMountain (bd-md3) opened to automate these SLO rollups + dashboards so error-budget tracking isn’t manual._
 
 ### 20.2 Monitoring & Alerting
 - **Metrics:** expose `/metrics` with Prometheus counters and histograms (tiles_processed_total, ocr_retry_total, capture_duration_seconds_bucket). Include labels for model, CfT version, and concurrency tier.
@@ -710,7 +726,7 @@ _2025-11-08 — PinkDog (bd-oqr) added the `mdwb diag <job_id>` CLI command so o
 - **Screenshot stabilization checklist:** before tagging a release, verify (a) `[aria-busy=true]` nodes clear, (b) volatile widgets (clocks, tickers, ads) are masked via Playwright config, (c) animation disabling + caret hiding is enabled, and (d) CSS blocklist entries were reviewed/updated (`docs/blocklist.md`). Document completion in release notes.
 - **CLI verification:** For capture/OCR fixes, run `scripts/olmocr_cli.py run` against at least two URLs in the production smoke set to ensure the hosted API + CLI workflow stay healthy. Log request IDs in the release notes for traceability.
 
-_2025-11-08 — RedBear (bd-e0q) is drafting the release/regression checklist doc so §20.3 has a concrete runbook instead of bullets._
+_2025-11-09 — RedDog (bd-e0q) added `docs/release_checklist.md` capturing the full CfT/Playwright/model release workflow (config capture, test matrix, artifact list, sign-off steps) and linked it from README/docs so §20.3 now points at a concrete runbook._
 
 ### 20.4 Incident Response Ladder
 1. **Acknowledge:** SSE/UI banner plus PagerDuty page when capture or OCR SLO alert fires.

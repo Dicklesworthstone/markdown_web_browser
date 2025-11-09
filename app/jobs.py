@@ -25,6 +25,8 @@ from app.capture_warnings import CaptureWarningEntry
 from app.dom_links import (
     LinkRecord,
     blend_dom_with_ocr,
+    extract_dom_text_overlays,
+    extract_headings_from_html,
     extract_links_from_dom,
     extract_links_from_markdown,
     serialize_links,
@@ -283,6 +285,7 @@ class JobManager:
             snapshot["cache_hit"] = bool(capture_result.manifest.cache_hit)
             self._broadcast(job_id)
             self._emit_ocr_event(job_id, capture_result.manifest)
+            self._emit_dom_assist_event(job_id, capture_result.manifest)
             self._set_state(job_id, JobState.DONE)
             storage.update_status(job_id=job_id, status=JobState.DONE, finished_at=datetime.now(timezone.utc))
         except Exception as exc:  # pragma: no cover - surfaced to API callers
@@ -471,6 +474,24 @@ class JobManager:
             return
         self._record_custom_event(job_id, "ocr_telemetry", summary)
 
+    def _emit_dom_assist_event(self, job_id: str, manifest: CaptureManifest) -> None:
+        assists = getattr(manifest, "dom_assists", None)
+        if not assists:
+            return
+        reasons = {entry.get("reason", "unknown") for entry in assists if isinstance(entry, dict)}
+        summary = {
+            "count": len(assists),
+            "reasons": sorted(reason for reason in reasons if isinstance(reason, str)),
+        }
+        sample = assists[0] if isinstance(assists[0], dict) else None
+        if sample:
+            summary["sample"] = {
+                "tile_index": sample.get("tile_index"),
+                "line": sample.get("line"),
+                "reason": sample.get("reason"),
+            }
+        self._record_custom_event(job_id, "dom_assist", summary)
+
     def _maybe_trigger_webhooks(self, job_id: str, payload: JobSnapshot) -> None:
         sender = self._webhook_sender
         if sender is None:
@@ -598,8 +619,40 @@ async def _run_ocr_pipeline(
     ocr_ms = int((time.perf_counter() - ocr_start) * 1000)
     _apply_ocr_metadata(capture_result.manifest, ocr_output)
 
+    dom_headings = None
+    dom_overlays = None
+    dom_snapshot = capture_result.dom_snapshot
+    if dom_snapshot:
+        try:
+            dom_headings = extract_headings_from_html(dom_snapshot)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            LOGGER.warning("Failed to parse DOM headings for %s: %s", job_id, exc)
+        try:
+            dom_overlays = extract_dom_text_overlays(dom_snapshot)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            LOGGER.warning("Failed to parse DOM overlays for %s: %s", job_id, exc)
+
     stitch_start = time.perf_counter()
-    markdown = stitch_markdown(ocr_output.markdown_chunks, tiles)
+    stitch_result = stitch_markdown(
+        ocr_output.markdown_chunks,
+        tiles,
+        dom_headings=dom_headings,
+        dom_overlays=dom_overlays,
+        job_id=job_id,
+    )
+    markdown = stitch_result.markdown
+    dom_assists = stitch_result.dom_assists
+    if dom_assists:
+        capture_result.manifest.dom_assists = [
+            {
+                "tile_index": entry.tile_index,
+                "line": entry.line,
+                "reason": entry.reason,
+                "dom_text": entry.dom_text,
+                "original_text": entry.original_text,
+            }
+            for entry in dom_assists
+        ]
     stitch_ms = int((time.perf_counter() - stitch_start) * 1000)
     ocr_links = extract_links_from_markdown(markdown)
     return markdown, ocr_ms, stitch_ms, ocr_links
@@ -625,6 +678,8 @@ def _apply_ocr_metadata(manifest: CaptureManifest, result: SubmitTilesResult) ->
         "threshold_ratio": result.quota.threshold_ratio,
         "warning_triggered": result.quota.warning_triggered,
     }
+    if result.autotune:
+        manifest.ocr_autotune = result.autotune.to_dict()
     if result.quota.warning_triggered and result.quota.limit and result.quota.used is not None:
         manifest.warnings.append(
             CaptureWarningEntry(
@@ -743,6 +798,17 @@ def _summarize_ocr_batches(manifest: CaptureManifest) -> dict[str, Any] | None:
         summary["quota_used"] = quota.get("used")
         summary["quota_limit"] = quota.get("limit")
         summary["quota_warning"] = bool(quota.get("warning_triggered"))
+    autotune = getattr(manifest, "ocr_autotune", None) or {}
+    if autotune:
+        events = autotune.get("events") or []
+        summary["autotune"] = {
+            "initial_limit": autotune.get("initial_limit"),
+            "final_limit": autotune.get("final_limit"),
+            "peak_limit": autotune.get("peak_limit"),
+            "event_count": len(events),
+        }
+        if events:
+            summary["autotune"]["last_event"] = events[-1]
     return summary
 
 

@@ -18,12 +18,12 @@ HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8000}"
 APP_MODULE="${APP_MODULE:-app.main:app}"
 UVICORN_RELOAD="${UVICORN_RELOAD:-true}"
+SERVER_IMPL="${SERVER_IMPL:-${MDWB_SERVER_IMPL:-uvicorn}}"
 
-cmd=(uv run uvicorn "$APP_MODULE" --host "$HOST" --port "$PORT")
+export MDWB_SERVER_RELOAD="$UVICORN_RELOAD"
+export MDWB_SERVER_IMPL="$SERVER_IMPL"
 
-if [[ "${UVICORN_RELOAD,,}" == "true" ]]; then
-  cmd+=(--reload)
-fi
+cmd=(uv run python scripts/run_server.py --server "$SERVER_IMPL" --host "$HOST" --port "$PORT" --app "$APP_MODULE")
 
 if [[ $# -gt 0 ]]; then
   cmd+=("$@")

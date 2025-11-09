@@ -49,6 +49,7 @@ class RunRecord(SQLModel, table=True):
     cft_version: str | None = None
     playwright_version: str | None = None
     browser_transport: str | None = None
+    server_runtime: str | None = None
     screenshot_style_hash: str | None = None
     long_side_px: int | None = None
     device_scale_factor: int | None = None
@@ -195,6 +196,7 @@ class Store:
             "validation_failure_count": "INTEGER",
             "profile_id": "TEXT",
             "cache_key": "TEXT",
+            "server_runtime": "TEXT",
         }
         with self.engine.begin() as conn:
             existing = {
@@ -272,6 +274,7 @@ class Store:
             cft_version=source.cft_version,
             playwright_version=source.playwright_version,
             browser_transport=source.browser_transport,
+            server_runtime=source.server_runtime,
             screenshot_style_hash=source.screenshot_style_hash,
             long_side_px=source.long_side_px,
             device_scale_factor=source.device_scale_factor,
@@ -515,14 +518,24 @@ class Store:
             raise FileNotFoundError(target)
         return target
 
-    def insert_links(self, *, job_id: str, links: Iterable[Mapping[str, str]]) -> None:
+    def insert_links(self, *, job_id: str, links: Iterable[Mapping[str, object]]) -> None:
+        def _coerce_rel(value: object | None) -> str | None:
+            if value is None:
+                return None
+            if isinstance(value, str):
+                return value
+            if isinstance(value, (list, tuple, set)):
+                tokens = [str(token).strip() for token in value if token]
+                return " ".join(token for token in tokens if token)
+            return str(value)
+
         records = [
             LinkRecord(
                 run_id=job_id,
-                href=item.get("href", ""),
-                text=item.get("text", ""),
-                rel=item.get("rel"),
-                source=item.get("source", "dom"),
+                href=str(item.get("href", "")),
+                text=str(item.get("text", "")),
+                rel=_coerce_rel(item.get("rel")),
+                source=str(item.get("source", "dom")),
             )
             for item in links
         ]
@@ -642,6 +655,7 @@ def _apply_manifest_metadata(record: RunRecord, manifest: Mapping[str, object] |
     if isinstance(environment, Mapping):
         _set("cft_version", environment.get("cft_version"))
         _set("cft_label", environment.get("cft_label"))
+        _set("server_runtime", environment.get("server_runtime"))
         _set("playwright_version", environment.get("playwright_version"))
         _set("browser_transport", environment.get("browser_transport"))
         _set("screenshot_style_hash", environment.get("screenshot_style_hash"))
@@ -653,6 +667,7 @@ def _apply_manifest_metadata(record: RunRecord, manifest: Mapping[str, object] |
     else:  # legacy flat manifests
         _set("cft_version", manifest_dict.get("cft_version"))
         _set("cft_label", manifest_dict.get("cft_label"))
+        _set("server_runtime", manifest_dict.get("server_runtime"))
         _set("playwright_version", manifest_dict.get("playwright_version"))
         _set("browser_transport", manifest_dict.get("browser_transport"))
         _set("screenshot_style_hash", manifest_dict.get("screenshot_style_hash"))

@@ -7,6 +7,9 @@ const WARNING_LABELS = {
   'sticky-chrome': 'Sticky Overlay',
   'ocr-quota': 'OCR Quota',
 };
+const LOCAL_STORAGE_CRAWLED_KEY = 'mdwb:crawled-links';
+const LINK_ACTION_EVENT = 'mdwb:link-open';
+const crawledLinks = new Set(loadCrawledLinkIds());
 
 function setupTabs() {
   const tabButtons = Array.from(document.querySelectorAll('[data-tab-target]'));
@@ -39,12 +42,17 @@ function setupTabs() {
   activate(tabButtons[0].dataset.tabTarget);
 }
 
-function initSseBridge() {
+function initSseHandlers() {
   const root = document.querySelector('[data-stream-root]');
   const statusEl = document.getElementById('job-sse-status');
   if (!root || !statusEl) {
     return null;
   }
+  if (typeof window.htmx === 'undefined') {
+    console.warn('htmx not available; SSE extension disabled');
+    return null;
+  }
+
   const embeddingsPanel = initEmbeddingsPanel(root);
   const eventsPanel = initEventsPanel(root);
 
@@ -60,6 +68,7 @@ function initSseBridge() {
   const validationSummaryEl = root.querySelector('[data-validation-summary]');
   const ocrQuotaEl = root.querySelector('[data-ocr-quota]');
   const ocrBatchesEl = root.querySelector('[data-ocr-batches]');
+  const ocrAutotuneEl = root.querySelector('[data-ocr-autotune]');
 
   const setStatus = (value, variant = 'info') => {
     statusEl.textContent = value;
@@ -82,6 +91,7 @@ function initSseBridge() {
           validationSummaryEl,
           ocrQuotaEl,
           ocrBatchesEl,
+          ocrAutotuneEl,
         });
         break;
       case 'raw':
@@ -108,9 +118,6 @@ function initSseBridge() {
   };
 
   const refreshLinks = async (jobId) => {
-    if (!root) {
-      return;
-    }
     const template = root.dataset.linksTemplate || '/jobs/{job_id}/links.json';
     try {
       const data = await fetchTemplateJson(template, jobId);
@@ -121,9 +128,6 @@ function initSseBridge() {
   };
 
   const refreshManifest = async (jobId) => {
-    if (!root) {
-      return;
-    }
     const template = root.dataset.manifestTemplate || '/jobs/{job_id}/manifest.json';
     try {
       const data = await fetchTemplateJson(template, jobId);
@@ -135,56 +139,127 @@ function initSseBridge() {
     }
   };
 
-  let source = null;
-  let currentJobId = root.dataset.jobId || 'demo';
-
-  const connect = (jobId) => {
-    if (source) {
-      source.close();
-    }
-    const template = root.dataset.streamTemplate || '/jobs/{job_id}/stream';
-    currentJobId = jobId || 'demo';
-    const url = buildTemplateUrl(template, currentJobId);
-    root.dataset.jobId = currentJobId;
-    const jobField = document.getElementById('job-id');
-    if (jobField) {
-      jobField.value = currentJobId;
-    }
-    source = new EventSource(url);
-    setStatus('Connecting…', 'pending');
-    embeddingsPanel?.setJobId(currentJobId);
-    eventsPanel?.connect(currentJobId);
-    refreshManifest(currentJobId);
-    refreshLinks(currentJobId);
-    source.addEventListener('open', () => setStatus(`Connected (${currentJobId})`, 'success'));
-    source.addEventListener('error', () => setStatus('Disconnected — retrying…', 'warning'));
-    source.addEventListener('state', (event) => {
-      updateField('state', event.data);
-      const normalized = (event.data || '').trim().toUpperCase();
-      if (normalized === 'DONE' || normalized === 'FAILED') {
-        refreshManifest(currentJobId);
-        refreshLinks(currentJobId);
-      }
-    });
-    source.addEventListener('progress', (event) => updateField('progress', event.data));
-    source.addEventListener('runtime', (event) => updateField('runtime', event.data));
-    source.addEventListener('manifest', (event) => updateField('manifest', event.data));
-    source.addEventListener('rendered', (event) => updateField('rendered', event.data));
-    source.addEventListener('raw', (event) => updateField('raw', event.data));
-    source.addEventListener('links', (event) => updateField('links', event.data));
-    source.addEventListener('artifacts', (event) => updateField('artifacts', event.data));
-    source.addEventListener('warnings', (event) => renderWarnings(warningListEl, event.data));
+  const state = {
+    jobId: root.dataset.jobId || 'demo',
+    streamTemplate: root.dataset.streamTemplate || '/jobs/{job_id}/stream',
   };
 
-  const defaultJob = root.dataset.jobId || 'demo';
-  connect(defaultJob);
+  const setConnectUrl = (jobId) => {
+    const url = buildTemplateUrl(state.streamTemplate, jobId);
+    root.setAttribute('sse-connect', url);
+    window.htmx.process(root);
+  };
 
-  window.addEventListener('beforeunload', () => {
-    if (source) {
-      source.close();
+  const connect = (jobId) => {
+    const resolved = jobId || 'demo';
+    state.jobId = resolved;
+    root.dataset.jobId = resolved;
+    const jobField = document.getElementById('job-id');
+    if (jobField) {
+      jobField.value = resolved;
     }
-    eventsPanel?.stop?.();
+    setStatus('Connecting…', 'pending');
+    setConnectUrl(resolved);
+    embeddingsPanel?.setJobId(resolved);
+    eventsPanel?.connect(resolved);
+    refreshManifest(resolved);
+    refreshLinks(resolved);
+  };
+
+  const parseJson = (value) => {
+    if (!value || typeof value !== 'string') {
+      return null;
+    }
+    try {
+      return JSON.parse(value);
+    } catch {
+      return null;
+    }
+  };
+
+  const handleDomAssist = (payload) => {
+    const data = parseJson(payload) || {};
+    eventsPanel?.appendSyntheticEvent?.({
+      event: 'dom_assist',
+      data,
+    });
+  };
+
+  const eventHandlers = {
+    state: (data) => {
+      updateField('state', data);
+      const normalized = (data || '').trim().toUpperCase();
+      if (normalized === 'DONE' || normalized === 'FAILED') {
+        refreshManifest(state.jobId);
+        refreshLinks(state.jobId);
+      }
+    },
+    progress: (data) => updateField('progress', data),
+    runtime: (data) => updateField('runtime', data),
+    rendered: (data) => updateField('rendered', data),
+    raw: (data) => updateField('raw', data),
+    manifest: (data) => updateField('manifest', data),
+    links: (data) => updateField('links', data),
+    artifacts: (data) => updateField('artifacts', data),
+    warnings: (data) => renderWarnings(warningListEl, data),
+    blocklist: (data) => renderBlocklistHits(blocklistHitsEl, data),
+    sweep: (data) => {
+      const parsed = parseJson(data) || {};
+      renderSweepStats(sweepStatsEl, parsed);
+      updateSweepSummary(sweepSummaryEl, parsed);
+    },
+    validation: (data) => {
+      const parsed = parseJson(data) || [];
+      renderValidationFailures(validationListEl, parsed);
+      updateValidationSummary(validationSummaryEl, parsed);
+    },
+    ocr_telemetry: (data) => {
+      const parsed = parseJson(data);
+      if (parsed) {
+        renderOcrQuota(ocrQuotaEl, {
+          limit: parsed.quota_limit,
+          used: parsed.quota_used,
+          warning_triggered: parsed.quota_warning,
+        });
+        renderOcrAutotune(ocrAutotuneEl, parsed.autotune);
+      }
+    },
+    dom_assist: handleDomAssist,
+  };
+
+  document.body.addEventListener('htmx:sseOpen', (event) => {
+    if (event.target === root) {
+      setStatus(`Connected (${state.jobId})`, 'success');
+    }
   });
+
+  document.body.addEventListener('htmx:sseError', (event) => {
+    if (event.target === root) {
+      setStatus('Disconnected — retrying…', 'warning');
+    }
+  });
+
+  document.body.addEventListener('htmx:sseClose', (event) => {
+    if (event.target === root) {
+      setStatus('Connection closed', 'warning');
+    }
+  });
+
+  document.body.addEventListener('htmx:sseBeforeMessage', (event) => {
+    if (event.target !== root) {
+      return;
+    }
+    const message = event.detail;
+    const name = message?.type || message?.event || '';
+    const handler = eventHandlers[name];
+    if (!handler) {
+      return;
+    }
+    event.preventDefault();
+    handler(message.data);
+  });
+
+  connect(state.jobId);
 
   return { connect, refreshLinks };
 }
@@ -201,6 +276,7 @@ function renderManifest(
     validationSummaryEl,
     ocrQuotaEl,
     ocrBatchesEl,
+    ocrAutotuneEl,
   },
 ) {
   if (!element) {
@@ -234,6 +310,7 @@ function renderManifest(
   updateValidationSummary(validationSummaryEl, parsedPayload?.validation_failures);
   renderOcrQuota(ocrQuotaEl, parsedPayload?.ocr_quota);
   renderOcrBatches(ocrBatchesEl, parsedPayload?.ocr_batches);
+  renderOcrAutotune(ocrAutotuneEl, parsedPayload?.ocr_autotune);
   element.textContent = formatted;
 }
 
@@ -260,30 +337,342 @@ function renderLinks(container, raw) {
     return;
   }
 
-  const header = ['text', 'href', 'source', 'delta'];
+  const groups = groupLinksByDomain(rows);
+  const fragment = document.createDocumentFragment();
+  groups.forEach((group) => {
+    fragment.appendChild(createLinkGroup(group.label, group.entries));
+  });
+
+  container.innerHTML = '';
+  container.appendChild(fragment);
+  ensureLinkActionHandlers(container);
+}
+
+function ensureLinkActionHandlers(container) {
+  if (container.dataset.linkActionsBound === 'true') {
+    return;
+  }
+  container.addEventListener('click', (event) => handleLinkAction(event));
+  container.dataset.linkActionsBound = 'true';
+}
+
+async function handleLinkAction(event) {
+  const button = event.target.closest('[data-link-action]');
+  if (!button) {
+    return;
+  }
+  const action = button.dataset.linkAction;
+  const href = button.dataset.href;
+  if (!action || !href) {
+    return;
+  }
+  if (action === 'open') {
+    document.dispatchEvent(
+      new CustomEvent(LINK_ACTION_EVENT, {
+        detail: { href },
+      }),
+    );
+    return;
+  }
+  if (action === 'copy') {
+    const markdown = button.dataset.markdown || `[${button.dataset.linkText || href}](${href})`;
+    const success = await copyTextToClipboard(markdown);
+    if (success) {
+      setButtonFeedback(button, 'Copied');
+    }
+    return;
+  }
+  if (action === 'crawled') {
+    const row = button.closest('[data-link-row]');
+    const nextState = !row?.classList.contains('link-row--crawled');
+    setLinkCrawledFlag(href, nextState);
+    updateRowCrawledState(row, button, nextState);
+  }
+}
+
+function groupLinksByDomain(rows) {
+  const map = new Map();
+  rows.forEach((row) => {
+    const label = row.domain || deriveDomain(row.href);
+    const key = label.toLowerCase();
+    if (!map.has(key)) {
+      map.set(key, { label, entries: [] });
+    }
+    map.get(key).entries.push(row);
+  });
+  return Array.from(map.values()).sort((a, b) => a.label.localeCompare(b.label, undefined, { sensitivity: 'base' }));
+}
+
+function createLinkGroup(domain, entries) {
+  const section = document.createElement('section');
+  section.className = 'link-group';
+  const header = document.createElement('header');
+  header.className = 'link-group__header';
+  const title = document.createElement('h3');
+  title.textContent = domain;
+  const count = document.createElement('span');
+  count.className = 'link-group__count';
+  count.textContent = `${entries.length} link${entries.length === 1 ? '' : 's'}`;
+  header.append(title, count);
+  section.appendChild(header);
+
   const table = document.createElement('table');
+  table.className = 'link-group__table';
   const thead = document.createElement('thead');
   const headRow = document.createElement('tr');
-  header.forEach((label) => {
+  ['Link', 'Coverage', 'Attributes', 'Actions'].forEach((label) => {
     const th = document.createElement('th');
-    th.textContent = label.toUpperCase();
+    th.textContent = label;
     headRow.appendChild(th);
   });
   thead.appendChild(headRow);
   table.appendChild(thead);
   const tbody = document.createElement('tbody');
-  rows.forEach((row) => {
-    const tr = document.createElement('tr');
-    header.forEach((key) => {
-      const td = document.createElement('td');
-      td.textContent = row[key] ?? '—';
-      tr.appendChild(td);
-    });
-    tbody.appendChild(tr);
+
+  const sorted = [...entries].sort((a, b) => {
+    const left = (a.text || a.href || '').toLowerCase();
+    const right = (b.text || b.href || '').toLowerCase();
+    if (left === right) return 0;
+    return left > right ? 1 : -1;
   });
+
+  sorted.forEach((entry) => tbody.appendChild(createLinkRow(entry)));
   table.appendChild(tbody);
-  container.innerHTML = '';
-  container.appendChild(table);
+  section.appendChild(table);
+  return section;
+}
+
+function createLinkRow(entry) {
+  const row = document.createElement('tr');
+  row.dataset.linkRow = 'true';
+  row.dataset.href = entry.href || '';
+  const isCrawled = isLinkCrawled(entry.href);
+  row.classList.toggle('link-row--crawled', isCrawled);
+
+  const linkCell = document.createElement('td');
+  const title = document.createElement('div');
+  title.className = 'link-entry__text';
+  title.textContent = entry.text || '(no text)';
+  const href = document.createElement('a');
+  href.className = 'link-entry__href';
+  href.href = entry.href || '#';
+  href.target = '_blank';
+  href.rel = 'noreferrer noopener';
+  href.textContent = entry.href || '—';
+  linkCell.append(title, href);
+
+  const coverageCell = document.createElement('td');
+  buildCoverageBadges(entry, isCrawled).forEach((badge) => coverageCell.appendChild(badge));
+
+  const attributesCell = document.createElement('td');
+  buildAttributeBadges(entry).forEach((badge) => attributesCell.appendChild(badge));
+  if (!attributesCell.childElementCount) {
+    attributesCell.textContent = '—';
+  }
+
+  const actionsCell = document.createElement('td');
+  actionsCell.className = 'link-actions';
+  const actionButtons = [
+    createActionButton('Open in new job', 'open', entry),
+    createActionButton('Copy Markdown', 'copy', entry),
+    createActionButton('Mark crawled', 'crawled', entry),
+  ];
+  const crawlButton = actionButtons[2];
+  if (isCrawled) {
+    crawlButton.textContent = 'Unmark';
+  }
+  actionButtons.forEach((button) => actionsCell.appendChild(button));
+
+  [linkCell, coverageCell, attributesCell, actionsCell].forEach((cell) => row.appendChild(cell));
+  return row;
+}
+
+function buildCoverageBadges(entry, isCrawled) {
+  const badges = [];
+  const coverageLabel = getCoverageLabel(entry.source);
+  badges.push(createBadge(coverageLabel, getCoverageVariant(entry.source)));
+  const delta = (entry.delta || '').toLowerCase();
+  if (entry.delta && entry.delta !== '✓' && delta !== 'dom only' && delta !== 'ocr only') {
+    const variant = delta.includes('mismatch') ? 'error' : 'warning';
+    badges.push(createBadge(entry.delta, variant));
+  }
+  if (entry.kind === 'form') {
+    badges.push(createBadge('Form', 'info'));
+  } else if (entry.kind === 'markdown' && entry.source === 'OCR') {
+    badges.push(createBadge('OCR text', 'muted'));
+  }
+  const crawledBadge = createBadge('Crawled', 'muted');
+  crawledBadge.dataset.crawledBadge = 'true';
+  crawledBadge.hidden = !isCrawled;
+  badges.push(crawledBadge);
+  return badges;
+}
+
+function buildAttributeBadges(entry) {
+  const badges = [];
+  if (entry.target) {
+    badges.push(createBadge(`target ${entry.target}`, 'info'));
+  }
+  const relTokens = Array.isArray(entry.rel)
+    ? entry.rel
+    : entry.rel
+    ? String(entry.rel).split(/\s+/)
+    : [];
+  relTokens
+    .map((token) => token.trim())
+    .filter(Boolean)
+    .forEach((token) => badges.push(createBadge(`rel ${token}`, 'muted')));
+  return badges;
+}
+
+function createActionButton(label, action, entry) {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'link-action';
+  button.textContent = label;
+  button.dataset.linkAction = action;
+  button.dataset.href = entry.href || '';
+  button.dataset.markdown = entry.markdown || `[${entry.text || entry.href || 'link'}](${entry.href || '#'})`;
+  button.dataset.linkText = entry.text || '';
+  button.dataset.defaultLabel = label;
+  return button;
+}
+
+function createBadge(label, variant = 'muted') {
+  const span = document.createElement('span');
+  span.className = `link-badge link-badge--${variant}`;
+  span.textContent = label;
+  return span;
+}
+
+function getCoverageLabel(source = '') {
+  const normalized = source.toUpperCase();
+  if (normalized === 'DOM+OCR') return 'DOM+OCR';
+  if (normalized === 'DOM') return 'DOM only';
+  if (normalized === 'OCR') return 'OCR only';
+  return normalized || 'Unknown';
+}
+
+function getCoverageVariant(source = '') {
+  const normalized = source.toUpperCase();
+  if (normalized === 'DOM+OCR') return 'success';
+  if (normalized === 'DOM') return 'info';
+  if (normalized === 'OCR') return 'warning';
+  return 'muted';
+}
+
+function deriveDomain(href) {
+  if (!href) {
+    return '(unknown)';
+  }
+  const match = href.match(/^https?:\/\/([^/]+)/i);
+  if (match) {
+    return match[1].toLowerCase();
+  }
+  if (href.startsWith('#')) {
+    return '(fragment)';
+  }
+  const schemeMatch = href.match(/^([a-z0-9+.-]+):/i);
+  if (schemeMatch) {
+    return `${schemeMatch[1].toLowerCase()}:`;
+  }
+  return '(relative)';
+}
+
+function setLinkCrawledFlag(href, isCrawled) {
+  if (!href) {
+    return;
+  }
+  if (isCrawled) {
+    crawledLinks.add(href);
+  } else {
+    crawledLinks.delete(href);
+  }
+  persistCrawledLinks();
+}
+
+function isLinkCrawled(href) {
+  if (!href) {
+    return false;
+  }
+  return crawledLinks.has(href);
+}
+
+function updateRowCrawledState(row, button, isCrawled) {
+  if (!row || !button) {
+    return;
+  }
+  row.classList.toggle('link-row--crawled', isCrawled);
+  button.textContent = isCrawled ? 'Unmark' : button.dataset.defaultLabel || 'Mark crawled';
+  const badge = row.querySelector('[data-crawled-badge]');
+  if (badge) {
+    badge.hidden = !isCrawled;
+  }
+}
+
+function loadCrawledLinkIds() {
+  if (typeof localStorage === 'undefined') {
+    return [];
+  }
+  try {
+    const stored = localStorage.getItem(LOCAL_STORAGE_CRAWLED_KEY);
+    if (!stored) {
+      return [];
+    }
+    const parsed = JSON.parse(stored);
+    return Array.isArray(parsed) ? parsed.filter(Boolean) : [];
+  } catch {
+    return [];
+  }
+}
+
+function persistCrawledLinks() {
+  if (typeof localStorage === 'undefined') {
+    return;
+  }
+  try {
+    localStorage.setItem(LOCAL_STORAGE_CRAWLED_KEY, JSON.stringify(Array.from(crawledLinks)));
+  } catch (error) {
+    console.warn('Failed to persist crawled link state', error);
+  }
+}
+
+async function copyTextToClipboard(text) {
+  if (!text) {
+    return false;
+  }
+  try {
+    if (typeof navigator !== 'undefined' && navigator?.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch (error) {
+    console.warn('Clipboard API failed, falling back', error);
+  }
+  const textarea = document.createElement('textarea');
+  textarea.value = text;
+  textarea.style.position = 'fixed';
+  textarea.style.top = '-1000px';
+  document.body.appendChild(textarea);
+  textarea.focus();
+  textarea.select();
+  let success = false;
+  try {
+    success = document.execCommand('copy');
+  } catch (error) {
+    console.warn('Fallback copy failed', error);
+    success = false;
+  }
+  document.body.removeChild(textarea);
+  return success;
+}
+
+function setButtonFeedback(button, label) {
+  const original = button.dataset.defaultLabel || button.textContent;
+  button.textContent = label;
+  setTimeout(() => {
+    button.textContent = original;
+  }, 1500);
 }
 
 function renderArtifacts(container, raw) {
@@ -488,6 +877,75 @@ function renderOcrBatches(container, payload) {
   });
   table.appendChild(tbody);
   container.appendChild(table);
+}
+
+function renderOcrAutotune(container, payload) {
+  if (!container) {
+    return;
+  }
+  let data = payload;
+  if (typeof payload === 'string') {
+    try {
+      data = JSON.parse(payload);
+    } catch {
+      data = null;
+    }
+  }
+  container.innerHTML = '';
+  if (!data) {
+    const p = document.createElement('p');
+    p.className = 'placeholder';
+    p.textContent = 'No concurrency adjustments recorded yet.';
+    container.appendChild(p);
+    return;
+  }
+  const summary = document.createElement('div');
+  summary.className = 'ocr-autotune__summary';
+  const metrics = [
+    ['Initial', data.initial_limit ?? '—'],
+    ['Peak', data.peak_limit ?? '—'],
+    ['Final', data.final_limit ?? '—'],
+  ];
+  metrics.forEach(([label, value]) => {
+    const block = document.createElement('div');
+    const labelSpan = document.createElement('span');
+    labelSpan.textContent = label;
+    const valueEl = document.createElement('strong');
+    valueEl.textContent = String(value);
+    block.append(labelSpan, valueEl);
+    summary.appendChild(block);
+  });
+  container.appendChild(summary);
+
+  const events = Array.isArray(data.events) && data.events.length
+    ? data.events
+    : data.last_event
+    ? [data.last_event]
+    : [];
+  if (!events.length) {
+    const note = document.createElement('p');
+    note.className = 'placeholder';
+    note.textContent = 'No autotune events yet.';
+    container.appendChild(note);
+    return;
+  }
+  const list = document.createElement('ul');
+  list.className = 'ocr-autotune__events';
+  events.slice(-5).reverse().forEach((event) => {
+    if (!event) {
+      return;
+    }
+    const item = document.createElement('li');
+    const left = document.createElement('span');
+    left.className = 'ocr-autotune__event-reason';
+    left.textContent = `${event.previous_limit ?? '—'}→${event.new_limit ?? '—'} (${event.reason || 'change'})`;
+    const right = document.createElement('span');
+    const latency = event.latency_ms != null ? `${event.latency_ms} ms` : '—';
+    right.textContent = `${event.status_code ?? '—'} • ${latency}`;
+    item.append(left, right);
+    list.appendChild(item);
+  });
+  container.appendChild(list);
 }
 
 function renderSweepStats(container, manifest) {
@@ -966,7 +1424,15 @@ function initEventsPanel(root) {
     connect(activeJobId, { resetCursor: false });
   });
 
-  return { connect, stop };
+  const appendSyntheticEvent = ({ event, data }) => {
+    appendEventLine({
+      event,
+      data,
+      timestamp: new Date().toISOString(),
+    });
+  };
+
+  return { connect, stop, appendSyntheticEvent };
 }
 
 function initStreamControls(sse) {
@@ -1041,6 +1507,20 @@ function initStreamControls(sse) {
 
   runButton.addEventListener('click', submitJob);
 
+  document.addEventListener(LINK_ACTION_EVENT, (event) => {
+    const href = event?.detail?.href;
+    if (!href || !urlInput) {
+      return;
+    }
+    urlInput.value = href;
+    if (runButton.disabled) {
+      setRunStatus('A capture is already running. Please wait for it to finish.', 'warning');
+      return;
+    }
+    setRunStatus(`Submitting capture for ${href}…`);
+    submitJob();
+  });
+
   const refreshButton = document.querySelector('[data-links-refresh]');
   if (refreshButton) {
     const manualRefresh = async () => {
@@ -1074,7 +1554,7 @@ function initStreamControls(sse) {
 
 function init() {
   setupTabs();
-  const sse = initSseBridge();
+  const sse = initSseHandlers();
   initStreamControls(sse);
 }
 

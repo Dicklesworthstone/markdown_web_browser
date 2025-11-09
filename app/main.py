@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import logging
 from contextlib import asynccontextmanager
@@ -146,6 +147,95 @@ def _snapshot_to_response(snapshot: JobSnapshot) -> JobSnapshotResponse:
     )
 
 
+def _render_highlight_page(*, job_id: str, tile: str, y0: int, y1: int) -> str:
+    image_url = f"/jobs/{job_id}/artifact/{tile}"
+    safe_image_url = html.escape(image_url, quote=True)
+    safe_tile = html.escape(tile)
+    highlight_height = max(1, y1 - y0)
+    return f"""
+<!DOCTYPE html>
+<html lang=\"en\">
+  <head>
+    <meta charset=\"utf-8\" />
+    <title>Tile highlight — {safe_tile}</title>
+    <style>
+      body {{
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        margin: 1.5rem;
+        background: #0f1115;
+        color: #f2f4f8;
+      }}
+      .viewer {{
+        max-width: 960px;
+        margin: 0 auto;
+      }}
+      .tile-wrapper {{
+        position: relative;
+        display: inline-block;
+        border: 1px solid #333a45;
+        background: #1b1f27;
+      }}
+      #tile-image {{
+        display: block;
+        max-width: 100%;
+      }}
+      #highlight-box {{
+        position: absolute;
+        left: 0;
+        right: 0;
+        border: 2px solid rgba(255, 193, 7, 0.9);
+        background: rgba(255, 193, 7, 0.25);
+        pointer-events: none;
+      }}
+      .meta {{
+        margin-top: 1rem;
+        font-size: 0.9rem;
+      }}
+      .meta code {{
+        background: #272c36;
+        padding: 0.15rem 0.35rem;
+        border-radius: 0.25rem;
+      }}
+    </style>
+  </head>
+  <body>
+    <main class=\"viewer\">
+      <div class=\"tile-wrapper\">
+        <img id=\"tile-image\" src=\"{safe_image_url}\" alt=\"Tile image {safe_tile}\" />
+        <div id=\"highlight-box\" data-y0=\"{y0}\" data-height=\"{highlight_height}\"></div>
+      </div>
+      <section class=\"meta\">
+        <p><strong>Tile:</strong> <code>{safe_tile}</code></p>
+        <p><strong>Highlight:</strong> y={y0} → y={y1}</p>
+      </section>
+    </main>
+    <script>
+      (function() {{
+        const img = document.getElementById('tile-image');
+        const box = document.getElementById('highlight-box');
+        const y0 = Number(box.dataset.y0) || 0;
+        const height = Number(box.dataset.height) || 1;
+        const update = () => {{
+          if (!img.naturalHeight) {{
+            return;
+          }}
+          const scale = img.clientHeight / img.naturalHeight;
+          box.style.top = `${{y0 * scale}}px`;
+          box.style.height = `${{height * scale}}px`;
+        }};
+        if (img.complete) {{
+          update();
+        }} else {{
+          img.addEventListener('load', update, {{ once: true }});
+        }}
+        window.addEventListener('resize', update);
+      }})();
+    </script>
+  </body>
+</html>
+"""
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index() -> str:
     """Serve the current web UI shell."""
@@ -265,7 +355,7 @@ async def job_events(job_id: str, request: Request, since: str | None = None) ->
 
 
 @app.get("/jobs/{job_id}/links.json")
-async def job_links(job_id: str) -> list[dict[str, str]]:
+async def job_links(job_id: str) -> list[dict[str, object]]:
     """Return stored links for a job, falling back to demo data when requested."""
 
     if job_id == "demo":
@@ -298,6 +388,18 @@ async def job_markdown(job_id: str) -> PlainTextResponse:
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Markdown not available yet") from None
     return PlainTextResponse(markdown, media_type="text/markdown")
+
+
+@app.get("/jobs/{job_id}/artifact/highlight", response_class=HTMLResponse)
+async def job_artifact_highlight(job_id: str, tile: str, y0: int = 0, y1: int | None = None) -> HTMLResponse:
+    try:
+        store.resolve_artifact(job_id, tile)
+    except (KeyError, FileNotFoundError) as exc:
+        raise HTTPException(status_code=404, detail="Artifact not found") from exc
+    start = max(0, y0)
+    end = max(start + 1, y1 if y1 is not None else start + 1)
+    content = _render_highlight_page(job_id=job_id, tile=tile, y0=start, y1=end)
+    return HTMLResponse(content)
 
 
 @app.get("/jobs/{job_id}/artifact/{artifact_path:path}")
@@ -419,6 +521,9 @@ def _snapshot_events(snapshot: JobSnapshot) -> list[tuple[str, str]]:
             validation_failures = manifest.get("validation_failures")
             if validation_failures:
                 events.append(("validation", json.dumps(validation_failures)))
+            dom_assists = manifest.get("dom_assists")
+            if isinstance(dom_assists, list) and dom_assists:
+                events.append(("dom_assist", json.dumps({"count": len(dom_assists)})))
             environment = manifest.get("environment")
             if isinstance(environment, dict):
                 env_data = cast(dict[str, Any], environment)

@@ -56,8 +56,14 @@ uv run python scripts/run_smoke.py \
 - Chrome for Testing pin + Playwright version recorded in `manifest.json`.
 - Enough quota on the hosted olmOCR endpoint for the nightly workload.
 
+### API runtime toggle (uvicorn vs Granian)
+- `scripts/dev_run.sh` now wraps `scripts/run_server.py`, so setting `SERVER_IMPL=uvicorn` (default) or `SERVER_IMPL=granian` flips the ASGI runtime without changing any other tooling.
+- For local dev, keep the default: `scripts/dev_run.sh` → uvicorn + reload.
+- For production-style tests or deployments, disable reload and bump workers: `SERVER_IMPL=granian UVICORN_RELOAD=false HOST=0.0.0.0 PORT=8000 scripts/dev_run.sh --workers 4 --granian-runtime-threads 2`. The manifest’s `environment.server_runtime` and the SQLite `runs` table will reflect the choice so cache hits/logs clearly show which runtime handled each job.
+
 ### Verification Checklist
-1. `scripts/run_checks.sh` (ruff → ty → targeted pytest suite → Playwright smoke) passes before the smoke run. The script now accepts `PLAYWRIGHT_BIN=/path/to/runner` when you need to invoke the Node-based Playwright test harness; otherwise it attempts `uv run playwright test …` and prints a warning if the bundled CLI lacks a `test` command. When libvips isn’t installed, set `SKIP_LIBVIPS_CHECK=1` to bypass the preflight until the dependency can be installed. The bundled pytest step covers CLI events/webhooks, olmOCR CLI config, check_env, show_latest_smoke (including `check`/`--json`), and API webhook tests so regressions surface before captures run. Each run now writes `tmp/pytest_report.xml` (`PYTEST_JUNIT_PATH`) and `tmp/pytest_summary.json` (`PYTEST_SUMMARY_PATH`) so ops/CI can read the failing test list without re-running pytest.
+1. `scripts/run_checks.sh` (ruff → ty → targeted pytest suite → Playwright smoke) passes before the smoke run. The script accepts `PLAYWRIGHT_BIN=/path/to/runner` when you need to invoke the Node-based Playwright test harness; otherwise it prefers `npx playwright test --config=playwright.config.mjs` and falls back to `uv run playwright test`. When libvips isn’t installed, set `SKIP_LIBVIPS_CHECK=1` to bypass the preflight until the dependency can be installed. The bundled pytest step now covers the CLI suites, `scripts/show_latest_smoke.py` (env-root + pointer/weekly variants), `scripts/update_smoke_pointers.py` (weekly-source guard), the store/manifest persistence tests (`tests/test_store_manifest.py`, `tests/test_manifest_contract.py`), and the Prometheus CLI health checks (`tests/test_check_metrics.py`) so regressions surface before captures run. Each run writes `tmp/pytest_report.xml` (`PYTEST_JUNIT_PATH`) and `tmp/pytest_summary.json` (`PYTEST_SUMMARY_PATH`) so ops/CI can read the failing test list without re-running pytest.
+2. Playwright CLI runs inherit the same Chrome for Testing defaults as the capture stack. Leave `PLAYWRIGHT_CHANNEL` at `cft` (or omit it entirely) so local smoke runs match production; only set `PLAYWRIGHT_CHANNEL=chromium` when CfT binaries are unavailable on the host. You can specify a comma-separated preference (e.g., `PLAYWRIGHT_CHANNEL="cft,chromium"`) to document the fallback order. The transport behaves the same way: keep `PLAYWRIGHT_TRANSPORT=cdp` unless you opt into WebDriver BiDi (`PLAYWRIGHT_TRANSPORT="bidi,cdp"`).
 2. Each category report stays below its p95 latency budget (see `manifest_index.json`).
 3. Failures must be triaged immediately; rerun `scripts/olmocr_cli.py run` on the
    offending URL with `--out-dir benchmarks/reruns` for deeper debugging.
@@ -93,6 +99,11 @@ Publish the summary in Monday’s ops update and attach the most recent
   are still streaming.
 - **OCR throttling**: temporarily reduce `OCR_MAX_CONCURRENCY` in `.env` and rerun,
   then notify the hosted OCR contact listed in `docs/olmocr_cli.md`.
+
+## OCR concurrency autotune
+- The OCR client now adjusts concurrency dynamically inside each job. It starts at `OCR_MIN_CONCURRENCY`, scales up when back-to-back batches stay under ~3.5 s with no retries, and throttles immediately on 408/429/5xx responses, retries, or >7 s latency.
+- Manifest `ocr_autotune` blocks capture the initial/peak/final limits plus a short list of adjustments (also streamed via the Events tab / `mdwb watch` as `ocr_telemetry`). Use these breadcrumbs to explain sudden throughput drops or remote throttling.
+- To lock concurrency (e.g., during incident mitigation), set `OCR_MIN_CONCURRENCY` and `OCR_MAX_CONCURRENCY` to the same value before running `scripts/run_checks.sh` or smoke; the controller respects those caps and still logs that scaling was disabled.
 
 ## Warning & Blocklist Logs
 
@@ -193,6 +204,7 @@ warning spikes, job failures, or SSE stalls exceed their budgets.
   back to the SSE stream if the NDJSON endpoint is unavailable. Pass
   `--raw/--since/--interval` to align with automation requirements, and add `--on EVENT=COMMAND`
   (repeatable) to run shell hooks when particular events fire (e.g., `--on state:DONE='notify-send mdwb done'`).
+- DOM-assist events (emitted whenever hybrid recovery patches OCR output) now show a short summary in the watcher output (count, reasons, sample tile) so ops can spot noisy overlays without opening manifests.
 - The Events tab/CLI watchers now show blocklist, sweep, and validation events emitted
   directly by the SSE feed, so the new manifest breadcrumbs surface even when the
   Manifest tab isn’t open.

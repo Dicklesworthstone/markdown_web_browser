@@ -5,6 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Markdown Web Browser</title>
     <link rel="stylesheet" href="/static/tailwind.css" />
+    <script src="/static/htmx.min.js" defer></script>
+    <script src="/static/htmx-ext-sse.js" defer></script>
   </head>
   <body class="app-body">
     <div
@@ -15,6 +17,8 @@
       data-links-template="/jobs/{job_id}/links.json"
       data-manifest-template="/jobs/{job_id}/manifest.json"
       data-events-template="/jobs/{job_id}/events"
+      hx-ext="sse"
+      sse-connect="/jobs/demo/stream"
     >
       <header class="toolbar">
         <div class="toolbar__group">
@@ -143,6 +147,9 @@
               </div>
               <div class="ocr-batches" data-ocr-batches>
                 <p class="placeholder">Batch latency and request IDs will be listed here when available.</p>
+              </div>
+              <div class="ocr-autotune" data-ocr-autotune>
+                <p class="placeholder">Concurrency adjustments will appear as OCR batches run.</p>
               </div>
             </div>
           </article>

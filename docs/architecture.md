@@ -49,9 +49,10 @@ guarded hyphenation, table seam rules)
 - **Model policy** in `docs/models.yaml` controls long‑side px, parallelism, FP8 preference, and prompt template. Default: `olmOCR-2-7B-1025-FP8`. 
 
 ### Stitching
-- Overlap de‑dup using RapidFuzz on trailing/leading line windows; fall back to difflib only when needed. 
-- DOM‑guided heading normalization (fix H1→H4 drift).
-- Guard hyphenation fix outside code/math fences; table seam logic prefers duplicate header collapse over risky merges.
+- Overlap de-dup using RapidFuzz on trailing/leading line windows; fall back to difflib only when needed. 
+- DOM-guided heading normalization uses the captured DOM outline so H-levels match the source document (we still emit `<!-- normalized-heading: … -->` comments for provenance).
+- Guard hyphenation fix outside code/math fences; table seam logic only collapses duplicate headers when overlapping tiles share the same SSIM/overlap hash.
+- Provenance comments include tile metrics (`y`, `height`, `sha256`, `path`) plus a `/jobs/{id}/artifact/highlight?tile=…` URL so reviewers can jump straight to the source pixels.
 
 ### DOM Harvest
 - Capture anchors/forms/headings/meta plus **ARIA landmarks** (role=main/nav/etc.), language and direction. Agents use this to prioritize content over chrome. (Use MDN’s IntersectionObserver and landmarks semantics to decide what to fetch next in infinite/virtualized lists.) 
@@ -62,10 +63,11 @@ guarded hyphenation, table seam rules)
 ### Observability
 - Expose `/metrics` via **prometheus-fastapi-instrumentator**; export p50/p95 per stage, tiles/sec, 429/5xx rates. Add OTel FastAPI tracing for end‑to‑end spans. 
 - Prefer streaming diagnostics over polling: `/jobs/{id}/stream` drives the status bar + HTMX tabs, while `/jobs/{id}/events` provides a cursor-aware NDJSON feed (UI Events tab + `scripts/mdwb_cli.py watch`) with heartbeat entries so dashboards catch stalls immediately.
+- The frontend uses the HTMX SSE extension (`hx-ext="sse" sse-connect="…"`) so status cards, warning pills, and Markdown panels update declaratively without bespoke `EventSource` plumbing; reconnect/error handling comes from the extension.
 
 ## Deliverables per run
 - `artifact/tiles/tile_XXXX.png`
-- `out.md` with `<!-- source: tile_i, y=..., sha256=..., scale=... -->`
+- `out.md` with `<!-- source: tile_i, y=..., height=..., sha256=..., scale=..., path=..., highlight=/jobs/... -->`
 - `links.json` (anchors/forms/headings/meta/landmarks)
 - `manifest.json` (CfT label+build, DPR, viewport, policies, timings, hashes)
 - `section_embeddings` (sqlite-vec vectors) exposed via `/jobs/{id}/embeddings/search`

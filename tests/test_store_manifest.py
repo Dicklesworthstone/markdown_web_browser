@@ -90,6 +90,7 @@ def test_store_persists_sweep_and_validation_metadata(tmp_path: Path) -> None:
         "environment": {
             "cft_version": "chrome-130",
             "cft_label": "Stable-1",
+            "server_runtime": "granian",
             "playwright_channel": "cft",
             "playwright_version": "1.55.0",
             "browser_transport": "cdp",
@@ -122,6 +123,7 @@ def test_store_persists_sweep_and_validation_metadata(tmp_path: Path) -> None:
     store.write_manifest(job_id="run-123", manifest=manifest)
     record = store.fetch_run("run-123")
     assert record is not None
+    assert record.server_runtime == "granian"
     assert record.sweep_shrink_events == 2
     assert record.sweep_retry_attempts == 1
     assert record.sweep_overlap_pairs == 6
