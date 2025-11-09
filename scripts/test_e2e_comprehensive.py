@@ -654,7 +654,7 @@ class ValidationEngine:
         results = []
 
         artifacts_to_check = [
-            ("markdown", "out.md", "text/markdown"),
+            ("markdown", "result.md", "text/markdown"),
             ("links_json", "links.json", "application/json"),
             ("manifest", "manifest.json", "application/json"),
         ]
@@ -1346,7 +1346,7 @@ class ComprehensiveTestRunner:
         """Retrieve job artifacts."""
 
         artifacts = [
-            ("markdown", "out.md", True),
+            ("markdown", "result.md", True),
             ("links", "links.json", False),
             ("manifest", "manifest.json", False),
         ]

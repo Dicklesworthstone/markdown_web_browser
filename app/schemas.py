@@ -20,18 +20,19 @@ class JobCreateRequest(BaseModel):
     @field_validator("url")
     @classmethod
     def _validate_url(cls, value: str) -> str:
-        if not value.strip():
+        value = value.strip()
+        if not value:
             raise ValueError("URL cannot be empty")
 
         # Basic URL format validation
-        parsed = urlparse(value.strip())
+        parsed = urlparse(value)
         if not parsed.scheme or not parsed.netloc:
             raise ValueError("URL must have a valid scheme and domain")
 
         if parsed.scheme.lower() not in ("http", "https"):
             raise ValueError("URL scheme must be http or https")
 
-        return value.strip()
+        return value
     profile_id: str | None = Field(default=None, description="Browser profile identifier")
     viewport_width: int | None = Field(default=None, ge=1, le=32767, description="Override viewport width")
     viewport_height: int | None = Field(default=None, ge=1, le=32767, description="Override viewport height")
@@ -319,18 +320,19 @@ class WebhookRegistrationRequest(BaseModel):
     @field_validator("url")
     @classmethod
     def _validate_webhook_url(cls, value: str) -> str:
-        if not value.strip():
+        value = value.strip()
+        if not value:
             raise ValueError("Webhook URL cannot be empty")
 
         # Basic URL format validation
-        parsed = urlparse(value.strip())
+        parsed = urlparse(value)
         if not parsed.scheme or not parsed.netloc:
             raise ValueError("Webhook URL must have a valid scheme and domain")
 
         if parsed.scheme.lower() not in ("http", "https"):
             raise ValueError("Webhook URL scheme must be http or https")
 
-        return value.strip()
+        return value
     events: list[str] | None = Field(
         default=None,
         description="States that should trigger the webhook (defaults to DONE/FAILED)",
@@ -357,18 +359,19 @@ class WebhookDeleteRequest(BaseModel):
         if value is None:
             return value
 
-        if not value.strip():
+        value = value.strip()
+        if not value:
             raise ValueError("Webhook URL cannot be empty if provided")
 
         # Basic URL format validation
-        parsed = urlparse(value.strip())
+        parsed = urlparse(value)
         if not parsed.scheme or not parsed.netloc:
             raise ValueError("Webhook URL must have a valid scheme and domain")
 
         if parsed.scheme.lower() not in ("http", "https"):
             raise ValueError("Webhook URL scheme must be http or https")
 
-        return value.strip()
+        return value
 
     @model_validator(mode="after")
     def _require_selector(self) -> WebhookDeleteRequest:

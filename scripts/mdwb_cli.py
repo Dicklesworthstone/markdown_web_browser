@@ -700,7 +700,7 @@ def _run_hook(command: str, event_name: str, payload: Mapping[str, Any]) -> None
     try:
         subprocess.run(command, shell=True, check=False, env=env)
     except Exception as exc:  # pragma: no cover - defensive
-        console.print(f"[yellow]Hook command '{shlex.quote(command)}' failed: {exc}[/]")
+        console.print(f"[yellow]Hook command '{command}' failed: {exc}[/]")
 
 
 def _iter_sse(response: httpx.Response) -> Iterable[Tuple[str, str]]:

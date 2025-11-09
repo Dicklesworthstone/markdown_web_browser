@@ -351,8 +351,13 @@ def _find_overlap_fuzzy(
     Find overlap using fuzzy line-by-line comparison (fallback method).
 
     Searches for the longest sequence where end of prev_tail matches
-    start of curr_head with fuzzy line matching. More lenient than
-    exact or sequence matching.
+    start of curr_head with fuzzy line matching. More STRICT than
+    sequence matching because it requires EVERY line to meet the
+    threshold individually.
+
+    Difference from sequence matching:
+      - Sequence: AVERAGE similarity >= threshold (lenient)
+      - Fuzzy: EVERY line similarity >= threshold (strict)
 
     Args:
         prev_tail: Last N lines of previous tile

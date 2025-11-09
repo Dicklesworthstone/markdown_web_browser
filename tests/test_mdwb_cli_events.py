@@ -664,13 +664,15 @@ def test_run_hook_properly_escapes_environment_variables(monkeypatch):
     event_name = captured_env["MDWB_EVENT_NAME"]
     payload_str = captured_env["MDWB_EVENT_PAYLOAD"]
 
-    # Verify they are quoted (shlex.quote adds quotes)
+    # For malicious input, shlex.quote should add quotes for protection
     assert event_name.startswith("'") or event_name.startswith('"')
     assert payload_str.startswith("'") or payload_str.startswith('"')
 
-    # Verify the original dangerous characters are escaped
-    assert "'; rm -rf" not in event_name or "\\'" in event_name
-    assert "'; cat /etc" not in payload_str or "\\'" in payload_str
+    # Verify that dangerous sequences cannot execute as shell commands
+    # The malicious content should be contained within quotes
+    assert event_name == shlex.quote(malicious_event)
+    assert payload_str == shlex.quote('{"data": "\'; cat /etc/passwd; echo \'"}') or \
+           payload_str == shlex.quote(str(malicious_payload))
 
     # The command itself should still be the original (we only escape env vars)
     assert captured_command == "echo 'test'"
@@ -690,16 +692,23 @@ def test_run_hook_handles_json_serialization_errors(monkeypatch):
 
     monkeypatch.setattr(subprocess, "run", fake_subprocess_run)
 
-    # Create an object that can't be JSON serialized
+    # Create a malicious object that can't be JSON serialized
     class UnserializableObj:
         def __str__(self):
-            return "fallback_str"
+            return "malicious'; rm -rf /; echo 'pwned"
 
-    unserializable_payload = {"obj": UnserializableObj()}
+    # Create a payload that will cause JSON serialization to fail
+    malicious_payload = UnserializableObj()
 
-    mdwb_cli._run_hook("echo test", "event", unserializable_payload)
+    mdwb_cli._run_hook("echo test", "event", malicious_payload)
 
     # Should fall back to str() and still be properly escaped
     payload_env = captured_env["MDWB_EVENT_PAYLOAD"]
-    assert "fallback_str" in payload_env
-    assert payload_env.startswith("'") or payload_env.startswith('"')
+
+    # Verify the malicious content is safely escaped
+    expected_str = str(malicious_payload)
+    assert payload_env == shlex.quote(expected_str)
+
+    # Verify dangerous content is present in original but safely quoted
+    assert "'; rm -rf /" in expected_str  # Dangerous content is in the original
+    assert payload_env.startswith("'") or payload_env.startswith('"')  # But safely quoted

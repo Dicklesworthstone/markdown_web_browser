@@ -221,7 +221,10 @@ async def _perform_viewport_sweeps(
     await _mask_automation(page)
     mask_locators = [page.locator(selector) for selector in mask_selectors]
 
-    await page.goto(config.url, wait_until="networkidle")
+    # Use 'domcontentloaded' for fastest reliable page load
+    # This fires when HTML is parsed, before all resources load
+    # Works better with Cloudflare challenge pages that may have delayed resources
+    await page.goto(config.url, wait_until="domcontentloaded", timeout=30000)
     blocklist_hits = await apply_blocklist(page, url=config.url, config=blocklist_config)
     await _ensure_watermark_injected(page)
     warning_entries: list[CaptureWarningEntry] = await collect_capture_warnings(page, warning_settings)
@@ -313,7 +316,7 @@ async def _perform_viewport_sweeps(
         if next_offset <= y_offset:
             break
 
-        await page.evaluate("window.scrollTo(0, arguments[0])", next_offset)
+        await page.evaluate(f"window.scrollTo(0, {next_offset})")
         await page.wait_for_timeout(settle_ms)
         y_offset = next_offset
 
@@ -467,8 +470,24 @@ async def _launch_browser(playwright, channel: str) -> Browser:
             channel,
             normalized,
         )
-    LOGGER.debug("launching chromium", extra={"channel": normalized})
-    return await playwright.chromium.launch(channel=normalized, headless=True)
+
+    # Use Chrome's new headless mode (--headless=new) which is virtually undetectable
+    # Combined with automation masking to evade bot detection
+    launch_args = [
+        "--headless=new",  # New headless mode - much harder to detect
+        "--disable-blink-features=AutomationControlled",
+        "--disable-dev-shm-usage",
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--window-size=1920,1080",
+    ]
+
+    LOGGER.debug("launching chromium", extra={"channel": normalized, "args": launch_args})
+    return await playwright.chromium.launch(
+        channel=normalized,
+        headless=True,  # Keep this True, the --headless=new arg is what matters
+        args=launch_args
+    )
 
 
 async def _build_context(
@@ -477,11 +496,20 @@ async def _build_context(
     *,
     profiles_root: Path | None = None,
 ) -> tuple[BrowserContext, Path | None]:
+    # Use realistic user-agent to avoid bot detection
+    # This should match the Chrome version being used
+    user_agent = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/130.0.0.0 Safari/537.36"
+    )
+
     options: dict[str, Any] = {
         "viewport": {"width": config.viewport_width, "height": config.viewport_height},
         "device_scale_factor": config.device_scale_factor,
         "color_scheme": config.color_scheme,
         "locale": "en-US",
+        "user_agent": user_agent,
         "reduced_motion": "reduce" if config.reduced_motion else "no-preference",
     }
     storage_state_path: Path | None = None
@@ -495,10 +523,67 @@ async def _build_context(
 
 
 async def _mask_automation(page: Page) -> None:
+    """Comprehensive automation masking to evade bot detection."""
     await page.add_init_script(
         """
+        // Mask webdriver property
         Object.defineProperty(navigator, 'webdriver', {
             get: () => undefined,
+        });
+
+        // Mask automation-controlled flag
+        delete navigator.__proto__.webdriver;
+
+        // Override plugins to show realistic values (not empty array)
+        Object.defineProperty(navigator, 'plugins', {
+            get: () => [
+                { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+                { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: 'Portable Document Format' },
+                { name: 'Native Client', filename: 'internal-nacl-plugin', description: 'Native Client Executable' }
+            ]
+        });
+
+        // Override languages to look more realistic
+        Object.defineProperty(navigator, 'languages', {
+            get: () => ['en-US', 'en']
+        });
+
+        // Add realistic chrome runtime
+        if (!window.chrome) {
+            window.chrome = {
+                runtime: {},
+                loadTimes: function() {},
+                csi: function() {},
+                app: {}
+            };
+        }
+
+        // Mask permissions API that exposes automation
+        const originalQuery = window.navigator.permissions.query;
+        window.navigator.permissions.query = (parameters) => (
+            parameters.name === 'notifications' ?
+                Promise.resolve({ state: Notification.permission }) :
+                originalQuery(parameters)
+        );
+
+        // Override connection type which can leak headless status
+        Object.defineProperty(navigator, 'connection', {
+            get: () => ({
+                effectiveType: '4g',
+                rtt: 50,
+                downlink: 10,
+                saveData: false
+            })
+        });
+
+        // Add realistic hardware concurrency
+        Object.defineProperty(navigator, 'hardwareConcurrency', {
+            get: () => 8
+        });
+
+        // Mask device memory which can leak
+        Object.defineProperty(navigator, 'deviceMemory', {
+            get: () => 8
         });
         """
     )
