@@ -69,11 +69,12 @@ This screenshot from Finviz shows a financial visualization dashboard with vario
 ```
 
 **What makes this work:**
-- ✅ **Bypasses Cloudflare bot detection** - Chrome's new headless mode + stealth JavaScript
+- ✅ **Bypasses Cloudflare bot detection** - Chrome's `--headless=new` mode (undetectable) + 60+ lines of stealth JavaScript
+- ✅ **Comprehensive fingerprint masking** - navigator.webdriver, plugins, permissions API, hardware specs
 - ✅ **Captures 4 tiles** with overlapping regions for seamless stitching
 - ✅ **95%+ OCR accuracy** - Extracts all stock tickers, prices, and percentages
 - ✅ **Full provenance** - Every section links back to exact pixel coordinates
-- ✅ **Works on protected sites** - finviz.com, financial dashboards, SPAs
+- ✅ **Works on protected sites** - finviz.com (Cloudflare), financial dashboards, SPAs
 
 ## 🌐 Browser UI - Interactive Web Browsing
 
@@ -167,14 +168,13 @@ curl -fsSL https://raw.githubusercontent.com/anthropics/markdown_web_browser/mai
 
 1. **Checks your system** - Detects your OS (Ubuntu/Debian, macOS, RHEL, Arch)
 2. **Installs uv package manager** - The modern Python package manager from Astral
-3. **Installs system dependencies** - Automatically installs libvips (image processing) and Xvfb (bot detection evasion)
-4. **Configures Xvfb** - Starts virtual framebuffer for headless Chrome (bypasses Cloudflare)
-5. **Clones the repository** - Downloads the latest Markdown Web Browser code
-6. **Sets up Python 3.13 environment** - Creates isolated virtual environment with all dependencies
-7. **Installs Playwright browsers** - Downloads Chrome for Testing with stealth mode
-8. **Configures environment** - Sets up `.env` file with default settings
-9. **Runs verification tests** - Ensures everything is working correctly
-10. **Creates launcher script** - Provides a convenient `mdwb` command for CLI usage
+3. **Installs system dependencies** - Automatically installs libvips (image processing library)
+4. **Clones the repository** - Downloads the latest Markdown Web Browser code
+5. **Sets up Python 3.13 environment** - Creates isolated virtual environment with all dependencies
+6. **Installs Playwright browsers** - Downloads Chrome for Testing with bot detection evasion built-in
+7. **Configures environment** - Sets up `.env` file with default settings
+8. **Runs verification tests** - Ensures everything is working correctly
+9. **Creates launcher script** - Provides a convenient `mdwb` command for CLI usage
 
 For interactive installation or custom options:
 ```bash
@@ -295,8 +295,7 @@ mdwb fetch https://finviz.com --watch
 ## Manual Installation
 1. **Install prerequisites**
    - Python 3.13, uv ≥0.8, and the system deps Playwright requires.
-   - Install system dependencies: `sudo apt-get install libvips-dev xvfb` (Ubuntu/Debian) or `brew install vips` (macOS).
-   - **Start Xvfb for bot detection evasion**: `Xvfb :99 -screen 0 1920x1080x24 -ac -nolisten tcp -dpi 96 +extension RANDR &` then `export DISPLAY=:99`.
+   - Install system dependencies: `sudo apt-get install libvips-dev` (Ubuntu/Debian) or `brew install vips` (macOS).
    - Install the CfT build Playwright expects: `playwright install chromium --with-deps --channel=cft`.
    - Create/sync the env: `uv venv --python 3.13 && uv sync`.
    - Optional (GPU/olmOCR power users): run `scripts/setup_olmocr_cuda12.sh` to provision CUDA 12.6 + the local vLLM toolchain described in `docs/olmocr_cli_tool_documentation.md`.

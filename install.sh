@@ -33,7 +33,6 @@ INSTALL_DIR="$DEFAULT_INSTALL_DIR"
 SKIP_CONFIRM=false
 INSTALL_DEPS=true
 INSTALL_BROWSERS=true
-SETUP_XVFB=true
 OCR_API_KEY=""
 
 # Function to print colored output
@@ -55,7 +54,6 @@ Options:
     --dir=PATH            Installation directory (default: $DEFAULT_INSTALL_DIR)
     --no-deps             Skip system dependency installation
     --no-browsers         Skip Playwright browser installation
-    --no-xvfb             Skip Xvfb setup (may reduce bot detection evasion)
     --ocr-key=KEY         Set OCR API key directly
     --help, -h            Show this help message
 
@@ -72,10 +70,7 @@ Examples:
     # Skip browser installation (useful for headless servers)
     $0 --no-browsers
 
-    # Skip Xvfb setup (if you have your own display server)
-    $0 --no-xvfb
-
-    # Automated deployment (skip all confirmations including Xvfb)
+    # Automated deployment (skip all confirmations)
     $0 --yes
 
 EOF
@@ -107,10 +102,6 @@ while [[ $# -gt 0 ]]; do
             ;;
         --no-browsers)
             INSTALL_BROWSERS=false
-            shift
-            ;;
-        --no-xvfb)
-            SETUP_XVFB=false
             shift
             ;;
         --ocr-key)
@@ -202,7 +193,7 @@ install_system_deps() {
     case $os_type in
         debian)
             if [ "$SKIP_CONFIRM" = false ]; then
-                read -p "Install system dependencies (libvips-dev, git, xvfb)? [Y/n] " -n 1 -r
+                read -p "Install system dependencies (libvips-dev, git)? [Y/n] " -n 1 -r
                 echo
                 if [[ ! $REPLY =~ ^[Yy]$ ]] && [ ! -z "$REPLY" ]; then
                     print_color "$YELLOW" "Skipping system dependencies"
@@ -210,9 +201,9 @@ install_system_deps() {
                 fi
             fi
 
-            print_color "$BLUE" "Installing libvips, Xvfb and other dependencies..."
+            print_color "$BLUE" "Installing libvips and other dependencies..."
             sudo apt-get update
-            sudo apt-get install -y libvips-dev git xvfb
+            sudo apt-get install -y libvips-dev git
             ;;
 
         macos)
@@ -529,81 +520,6 @@ EOF
     print_color "$YELLOW" "  alias mdwb='$abs_launcher_path'"
 }
 
-# Function to setup and start Xvfb (for headless bot detection evasion)
-setup_xvfb() {
-    # Skip if explicitly disabled
-    if [ "$SETUP_XVFB" = false ]; then
-        print_color "$YELLOW" "⚠ Skipping Xvfb setup (--no-xvfb flag used)"
-        print_color "$YELLOW" "  Note: Sites with bot detection (e.g., finviz.com) may block requests"
-        return 0
-    fi
-
-    echo
-    print_color "$BLUE" "════════════════════════════════════════════════"
-    print_color "$BLUE" "   Xvfb Setup (Bot Detection Evasion)          "
-    print_color "$BLUE" "════════════════════════════════════════════════"
-
-    # Check if DISPLAY is already set
-    if [ ! -z "${DISPLAY:-}" ]; then
-        print_color "$GREEN" "✓ DISPLAY already set to $DISPLAY"
-        print_color "$BLUE" "  Skipping Xvfb setup - using existing display"
-        return 0
-    fi
-
-    # Check if Xvfb is installed
-    if ! command_exists Xvfb; then
-        print_color "$YELLOW" "⚠ Xvfb not installed"
-        print_color "$YELLOW" "  Chrome will run in headless mode (may trigger bot detection on some sites)"
-        print_color "$YELLOW" "  Install Xvfb manually if needed: sudo apt-get install xvfb"
-        return 0
-    fi
-
-    # Check if Xvfb is already running on :99
-    if pgrep -f "Xvfb :99" > /dev/null; then
-        print_color "$GREEN" "✓ Xvfb already running on display :99"
-        export DISPLAY=:99
-        return 0
-    fi
-
-    # Ask for confirmation unless --yes flag is used
-    if [ "$SKIP_CONFIRM" = false ]; then
-        echo
-        print_color "$YELLOW" "Xvfb allows Chrome to run in non-headless mode on servers without a display,"
-        print_color "$YELLOW" "which helps bypass bot detection on sites like finviz.com (Cloudflare)."
-        echo
-        print_color "$BLUE" "This will start Xvfb as a background process on display :99"
-        echo
-        read -p "Start Xvfb for bot detection evasion? [Y/n] " -n 1 -r
-        echo
-        if [[ ! $REPLY =~ ^[Yy]$ ]] && [ ! -z "$REPLY" ]; then
-            print_color "$YELLOW" "⚠ Skipping Xvfb setup"
-            print_color "$YELLOW" "  Note: Sites with bot detection may block requests"
-            print_color "$YELLOW" "  You can start Xvfb manually later: Xvfb :99 -screen 0 1920x1080x24 -ac &"
-            return 0
-        fi
-    fi
-
-    # Start Xvfb in background
-    print_color "$BLUE" "Starting Xvfb on display :99..."
-    Xvfb :99 -screen 0 1920x1080x24 -ac -nolisten tcp -dpi 96 +extension RANDR >/dev/null 2>&1 &
-    local xvfb_pid=$!
-
-    # Wait a moment for Xvfb to start
-    sleep 2
-
-    # Verify it started
-    if pgrep -f "Xvfb :99" > /dev/null; then
-        export DISPLAY=:99
-        print_color "$GREEN" "✓ Xvfb started successfully (PID: $xvfb_pid, DISPLAY=:99)"
-        print_color "$BLUE" "  ✓ Enables bot detection evasion for protected sites"
-        print_color "$BLUE" "  ✓ Chrome runs in non-headless mode (looks more human)"
-        print_color "$BLUE" "  ✓ Works with Cloudflare, PerimeterX, and other bot detection"
-    else
-        print_color "$YELLOW" "⚠ Xvfb failed to start - continuing anyway"
-        print_color "$YELLOW" "  Chrome will fall back to headless mode"
-    fi
-}
-
 # Main installation flow
 main() {
     print_color "$BLUE" "════════════════════════════════════════════════"
@@ -616,7 +532,6 @@ main() {
     print_color "$YELLOW" "  • Install directory: $INSTALL_DIR"
     print_color "$YELLOW" "  • Python version: $PYTHON_VERSION"
     print_color "$YELLOW" "  • Install system deps: $INSTALL_DEPS"
-    print_color "$YELLOW" "  • Setup Xvfb: $SETUP_XVFB"
     print_color "$YELLOW" "  • Install browsers: $INSTALL_BROWSERS"
 
     if [ ! -z "$OCR_API_KEY" ]; then
@@ -640,7 +555,6 @@ main() {
     # Run installation steps
     install_uv
     install_system_deps
-    setup_xvfb
     setup_repository
     setup_python_env
     install_playwright_browsers
