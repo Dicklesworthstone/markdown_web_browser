@@ -82,15 +82,22 @@ def test_jobs_show_prints_sweep_and_validation_summary(monkeypatch):
     assert "checksum mismatch" in result.output
 
 
-def test_jobs_show_prints_seam_counts_without_manifest(monkeypatch):
+def test_jobs_show_prints_seam_summary_without_manifest(monkeypatch):
     snapshot = {
         "id": "job789",
         "state": "DONE",
         "url": "https://example.com/seams",
         "progress": {"done": 1, "total": 1},
         "manifest": None,
-        "seam_marker_count": 4,
-        "seam_hash_count": 3,
+        "seam_markers": {
+            "count": 2,
+            "unique_tiles": 2,
+            "unique_hashes": 2,
+            "sample": [
+                {"tile_index": 0, "position": "top", "hash": "hasha"},
+                {"tile_index": 1, "position": "bottom", "hash": "hashb"},
+            ],
+        },
     }
     responses = {"/jobs/job789": StubResponse(snapshot)}
     _patch_client_ctx(monkeypatch, responses)
@@ -99,7 +106,28 @@ def test_jobs_show_prints_seam_counts_without_manifest(monkeypatch):
     result = runner.invoke(mdwb_cli.cli, ["show", "job789"])
 
     assert result.exit_code == 0
-    assert "Seam markers: 4 (unique hashes: 3)" in result.output
+    assert "Seam Markers" in result.output
+    assert "hasha" in result.output
+
+
+def test_jobs_show_prints_seam_counts_when_summary_missing(monkeypatch):
+    snapshot = {
+        "id": "job788",
+        "state": "DONE",
+        "url": "https://example.com/seams2",
+        "progress": {"done": 1, "total": 1},
+        "manifest": None,
+        "seam_marker_count": 5,
+        "seam_hash_count": 4,
+    }
+    responses = {"/jobs/job788": StubResponse(snapshot)}
+    _patch_client_ctx(monkeypatch, responses)
+    monkeypatch.setattr(mdwb_cli, "_resolve_settings", lambda base: _fake_settings())
+
+    result = runner.invoke(mdwb_cli.cli, ["show", "job788"])
+
+    assert result.exit_code == 0
+    assert "Seam markers: 5 (unique hashes: 4)" in result.output
 
 
 def test_demo_snapshot_prints_links(monkeypatch):

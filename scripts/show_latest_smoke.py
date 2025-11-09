@@ -24,6 +24,7 @@ class SmokePaths:
     pointer: Path
     metrics: Path
     weekly_summary: Path
+    slo_summary: Path
 
     @classmethod
     def from_root(cls, root: Path) -> "SmokePaths":
@@ -34,6 +35,7 @@ class SmokePaths:
             pointer=root / "latest.txt",
             metrics=root / "latest_metrics.json",
             weekly_summary=root / "weekly_summary.json",
+            slo_summary=root / "latest_slo_summary.json",
         )
 
 
@@ -196,6 +198,53 @@ def _print_weekly_summary(summary: dict[str, Any]) -> None:
                 )
 
 
+def _load_slo_summary(paths: SmokePaths) -> dict[str, Any]:
+    if not paths.slo_summary.exists():
+        typer.secho("latest_slo_summary.json missing", fg=typer.colors.RED)
+        raise typer.Exit(1)
+    return json.loads(paths.slo_summary.read_text(encoding="utf-8"))
+
+
+def _print_slo_summary(summary: dict[str, Any]) -> None:
+    typer.secho("\n=== SLO Summary ===", fg=typer.colors.CYAN)
+    generated_at = summary.get("generated_at") or "?"
+    typer.echo(f"Generated: {generated_at}")
+    categories = summary.get("categories") or {}
+    if not categories:
+        typer.secho("No SLO data recorded yet.", fg=typer.colors.YELLOW)
+        return
+    typer.echo("\n| Category | Count | Budget (ms) | Capture p50/p95 | OCR p50/p95 | Total p50/p95 | Status |")
+    typer.echo("| --- | --- | --- | --- | --- | --- | --- |")
+    for name, stats in categories.items():
+        typer.echo(
+            "| {category} | {count} | {budget} | {cap_p50}/{cap_p95} | {ocr_p50}/{ocr_p95} | {tot_p50}/{tot_p95} | {status} |".format(
+                category=name,
+                count=stats.get("count", 0),
+                budget=_format_ms(stats.get("budget_ms")),
+                cap_p50=_format_ms(stats.get("p50_capture_ms")),
+                cap_p95=_format_ms(stats.get("p95_capture_ms")),
+                ocr_p50=_format_ms(stats.get("p50_ocr_ms")),
+                ocr_p95=_format_ms(stats.get("p95_ocr_ms")),
+                tot_p50=_format_ms(stats.get("p50_total_ms")),
+                tot_p95=_format_ms(stats.get("p95_total_ms")),
+                status=stats.get("status", "unknown"),
+            )
+        )
+        breaches = stats.get("budget_breaches")
+        if isinstance(breaches, int) and breaches > 0:
+            typer.echo(f"  Budget breaches: {breaches}")
+    aggregate = summary.get("aggregate")
+    if isinstance(aggregate, dict):
+        typer.echo(
+            "\nAggregate count={count}, p50_total={p50}, p95_total={p95}, budget_breaches={breaches}".format(
+                count=aggregate.get("count", 0),
+                p50=_format_ms(aggregate.get("p50_total_ms")),
+                p95=_format_ms(aggregate.get("p95_total_ms")),
+                breaches=aggregate.get("budget_breaches", 0),
+            )
+        )
+
+
 @app.command()
 def show(
     summary: bool = typer.Option(True, help="Include the Markdown summary (if present)."),
@@ -203,6 +252,7 @@ def show(
     limit: Optional[int] = typer.Option(10, help="Limit manifest rows (None = all)."),
     metrics: bool = typer.Option(False, "--metrics/--no-metrics", help="Include aggregated metrics JSON."),
     weekly: bool = typer.Option(False, "--weekly/--no-weekly", help="Include weekly_summary data."),
+    slo: bool = typer.Option(False, "--slo/--no-slo", help="Include latest_slo_summary.json data."),
     root: Optional[Path] = typer.Option(None, "--root", help="Override MDWB_SMOKE_ROOT for this invocation."),
     json_output: bool = typer.Option(
         False,
@@ -288,11 +338,18 @@ def show(
         else:
             payload["weekly_summary"] = weekly_data
 
+    if slo:
+        slo_data = _load_slo_summary(paths)
+        if not json_output:
+            _print_slo_summary(slo_data)
+        else:
+            payload["slo_summary"] = slo_data
+
     if json_output:
         typer.echo(json.dumps(payload, indent=2))
 
 
-def _collect_missing(paths: SmokePaths, require_weekly: bool) -> list[str]:
+def _collect_missing(paths: SmokePaths, *, require_weekly: bool, require_slo: bool) -> list[str]:
     required = [
         ("pointer", paths.pointer),
         ("summary", paths.summary),
@@ -301,6 +358,8 @@ def _collect_missing(paths: SmokePaths, require_weekly: bool) -> list[str]:
     ]
     if require_weekly:
         required.append(("weekly_summary", paths.weekly_summary))
+    if require_slo:
+        required.append(("slo_summary", paths.slo_summary))
     missing = [name for name, path in required if not path.exists()]
     return missing
 
@@ -308,16 +367,18 @@ def _collect_missing(paths: SmokePaths, require_weekly: bool) -> list[str]:
 @app.command()
 def check(
     weekly: bool = typer.Option(True, "--weekly/--no-weekly", help="Require weekly_summary.json to exist."),
+    slo: bool = typer.Option(False, "--slo/--no-slo", help="Require latest_slo_summary.json to exist."),
     root: Optional[Path] = typer.Option(None, "--root", help="Override MDWB_SMOKE_ROOT for this invocation."),
     json_output: bool = typer.Option(False, "--json/--no-json", help="Emit JSON payload instead of human text."),
 ) -> None:
     """Verify that the latest smoke pointer files exist (for CI/dashboards)."""
 
     paths = SmokePaths.from_root(root or _default_root())
-    missing = _collect_missing(paths, require_weekly=weekly)
+    missing = _collect_missing(paths, require_weekly=weekly, require_slo=slo)
     payload: dict[str, Any] = {
         "root": str(paths.root),
         "weekly_required": weekly,
+        "slo_required": slo,
         "missing": missing,
     }
     if missing:
@@ -336,10 +397,14 @@ def check(
     if json_output:
         typer.echo(json.dumps(payload, indent=2))
     else:
+        extra = []
+        if weekly:
+            extra.append("weekly")
+        if slo:
+            extra.append("slo")
+        suffix = f", {', '.join(extra)}" if extra else ""
         typer.secho(
-            f"Smoke pointers present for {run_date} (summary, manifest, metrics"
-            + (", weekly" if weekly else "")
-            + ").",
+            f"Smoke pointers present for {run_date} (summary, manifest, metrics{suffix}).",
             fg=typer.colors.GREEN,
         )
 

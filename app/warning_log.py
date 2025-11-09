@@ -11,6 +11,8 @@ from typing import Any, Mapping, Sequence
 from app.schemas import ManifestWarning
 from app.settings import get_settings
 
+__all__ = ["append_warning_log", "summarize_dom_assists", "summarize_seam_markers"]
+
 
 def _normalize_warning(entry: Any) -> dict[str, Any]:
     if isinstance(entry, ManifestWarning):
@@ -45,7 +47,10 @@ def append_warning_log(
     overlap_ratio = getattr(manifest, "overlap_match_ratio", None)
     if overlap_ratio is None and sweep_stats:
         overlap_ratio = sweep_stats.get("overlap_match_ratio")
-    seam_summary = _summarize_seam_markers(getattr(manifest, "seam_markers", None))
+    seam_summary = summarize_seam_markers(
+        getattr(manifest, "seam_markers", None),
+        events=getattr(manifest, "seam_marker_events", None),
+    )
     tiles_total = getattr(manifest, "tiles_total", None)
     dom_summary = getattr(manifest, "dom_assist_summary", None)
     if not dom_summary:
@@ -119,7 +124,12 @@ def _coerce_mapping(value: Any) -> dict[str, Any] | None:
     return None
 
 
-def _summarize_seam_markers(markers: Any, *, sample_limit: int = 3) -> dict[str, Any] | None:
+def summarize_seam_markers(
+    markers: Any,
+    *,
+    events: Any = None,
+    sample_limit: int = 3,
+) -> dict[str, Any] | None:
     if not isinstance(markers, Sequence):
         return None
     normalized: list[dict[str, Any]] = []
@@ -144,11 +154,41 @@ def _summarize_seam_markers(markers: Any, *, sample_limit: int = 3) -> dict[str,
     if not normalized:
         return None
     sample = normalized[:sample_limit]
-    return {
+    summary: dict[str, Any] = {
         "count": len(normalized),
         "unique_tiles": len(tile_ids) or None,
         "unique_hashes": len(hashes) or None,
         "sample": sample,
+    }
+    usage_summary = _summarize_seam_usage(events, sample_limit=sample_limit)
+    if usage_summary:
+        summary["usage"] = usage_summary
+    return summary
+
+
+def _summarize_seam_usage(events: Any, *, sample_limit: int = 3) -> dict[str, Any] | None:
+    if not isinstance(events, Sequence):
+        return None
+    normalized: list[dict[str, Any]] = []
+    for entry in events:
+        if not isinstance(entry, Mapping):
+            continue
+        item: dict[str, Any] = {}
+        prev_idx = entry.get("prev_tile_index")
+        curr_idx = entry.get("curr_tile_index")
+        seam_hash = entry.get("seam_hash") or entry.get("hash")
+        if isinstance(prev_idx, int):
+            item["prev_tile_index"] = prev_idx
+        if isinstance(curr_idx, int):
+            item["curr_tile_index"] = curr_idx
+        if isinstance(seam_hash, str):
+            item["seam_hash"] = seam_hash
+        normalized.append(item)
+    if not normalized:
+        return None
+    return {
+        "count": len(normalized),
+        "sample": normalized[:sample_limit],
     }
 
 

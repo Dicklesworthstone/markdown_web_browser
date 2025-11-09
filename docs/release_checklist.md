@@ -36,7 +36,8 @@ Record the following in the release PR / Agent Mail thread:
 | 5 | `uv run python scripts/mdwb_cli.py fetch <url> --watch --webhook-url ...` | exercise CLI submit/watch with webhooks |
 | 6 | `uv run python scripts/run_smoke.py --date $(date -u +%Y-%m-%d) --category docs_articles --category dashboards_apps` | run partial smoke (full nightly before GA); use `--dry-run` first if API is down |
 | 7 | `uv run python scripts/show_latest_smoke.py --manifest --metrics --weekly --limit 5 --json` | verify pointers + weekly budget |
-| 8 | `uv run python scripts/check_metrics.py --json --include-exporter` | final telemetry probe |
+| 8 | `uv run python scripts/compute_slo.py --root benchmarks/production --manifest benchmarks/production/latest_manifest_index.json --budget-file benchmarks/production_set.json --out benchmarks/production/latest_slo_summary.json` | capture per-category SLO summary JSON for dashboards/release notes |
+| 9 | `uv run python scripts/check_metrics.py --json --include-exporter` | final telemetry probe |
 
 Document pass/fail + links/attachments for each step.
 
@@ -51,6 +52,7 @@ Attach or link the following in the release hand-off:
    Each should include `mdwb diag <job_id>` output (JSON) and highlight any OCR autotune events.
 2. **Warning log excerpt** from the last successful smoke (`ops/warnings.jsonl` → last 10 entries).
 3. **`benchmarks/production/<date>/manifest_index.json` + `summary.md`** produced by `scripts/run_smoke.py`.
+4. **`benchmarks/production/latest_slo_summary.json`** from `scripts/compute_slo.py` (attach raw JSON so ops/Grafana can mirror it).
 4. **`tmp/pytest_summary.json`** from `scripts/run_checks.sh`.
 5. **Release notes skeleton** (include CfT/Playwright/model versions, env changes, toggles flipped).
 
@@ -89,4 +91,3 @@ Attach or link the following in the release hand-off:
 | `SERVER_IMPL` / `MDWB_SERVER_IMPL` | Chooses uvicorn vs Granian for API server. |
 | `OCR_MIN_CONCURRENCY` / `OCR_MAX_CONCURRENCY` | Bounds the autotune controller; set equal to lock concurrency. |
 | `SKIP_LIBVIPS_CHECK` | Skips the libvips preflight (only for CI environments without libvips). |
-

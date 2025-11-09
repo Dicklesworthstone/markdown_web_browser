@@ -22,7 +22,6 @@ if "pyvips" not in sys.modules:
 
 try:
     from app.capture import (  # noqa: E402
-        CaptureConfig,
         CaptureManifest,
         CaptureResult,
         ScrollPolicy,
@@ -82,24 +81,8 @@ except OSError:  # pyvips missing in CI
         tiles: list
         manifest: CaptureManifest
 
-    @dataclass
-    class CaptureConfig:  # type: ignore[override]
-        url: str
-        viewport_width: int = 1280
-        viewport_height: int = 2000
-        device_scale_factor: int = 2
-        color_scheme: str = "light"
-        reduced_motion: bool = True
-        profile_id: str | None = None
-        long_side_px: int | None = None
-        cache_key: str | None = None
-
-from app.jobs import (  # noqa: E402
-    JobManager,
-    JobState,
-    _build_cache_key,
-    global_settings as job_global_settings,
-)
+import app.jobs as jobs_module  # noqa: E402
+from app.jobs import JobManager, JobState  # noqa: E402
 from app.schemas import JobCreateRequest  # noqa: E402
 from app.store import StorageConfig, Store  # noqa: E402
 from app.tiler import TileSlice  # noqa: E402
@@ -234,6 +217,13 @@ async def test_job_manager_snapshot_includes_seam_counts(tmp_path: Path):
     final_snapshot = manager.get_snapshot(job_id)
     assert final_snapshot.get("seam_marker_count") == 2
     assert final_snapshot.get("seam_hash_count") == 2
+    seam_summary = final_snapshot.get("seam_markers")
+    if isinstance(seam_summary, dict):
+        assert seam_summary.get("count") == 2
+        assert seam_summary.get("unique_hashes") == 2
+    else:
+        assert isinstance(seam_summary, list)
+        assert len(seam_summary) == 2
 
 
 @pytest.mark.asyncio
@@ -503,34 +493,52 @@ async def test_delete_webhook_requires_both_identifiers(tmp_path: Path):
     assert manager._webhooks[job_id], "cached webhook list should remain intact"
 
 
-def test_cache_key_changes_when_cft_version_differs():
+@pytest.mark.asyncio
+async def test_cache_key_changes_when_cft_version_differs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """Changing the CfT build should invalidate the cache key."""
 
-    capture_config = CaptureConfig(url="https://example.com/cache-cft")
-    default_key = _build_cache_key(config=capture_config, settings=job_global_settings)
+    config = StorageConfig(cache_root=tmp_path / "cache", db_path=tmp_path / "runs.db")
+    manager = JobManager(store=Store(config), runner=_fake_runner)
+    url = "https://example.com/cache-cft"
+    first = await manager.create_job(JobCreateRequest(url=url, reuse_cache=False))
+    await manager._tasks[first["id"]]
+
+    base_settings = jobs_module.global_settings
     mutated_settings = replace(
-        job_global_settings,
-        browser=replace(job_global_settings.browser, cft_version="chrome-999.0.0"),
+        base_settings,
+        browser=replace(base_settings.browser, cft_version="chrome-999.0.0"),
     )
+    monkeypatch.setattr(jobs_module, "global_settings", mutated_settings)
+    try:
+        second = await manager.create_job(JobCreateRequest(url=url))
+        assert second["state"] != JobState.DONE.value
+        await manager._tasks[second["id"]]
+    finally:
+        monkeypatch.setattr(jobs_module, "global_settings", base_settings)
 
-    mutated_key = _build_cache_key(config=capture_config, settings=mutated_settings)
 
-    assert mutated_key != default_key
-
-
-def test_cache_key_changes_when_ocr_model_differs():
+@pytest.mark.asyncio
+async def test_cache_key_changes_when_ocr_model_differs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """Switching OCR models must produce a distinct cache key."""
 
-    capture_config = CaptureConfig(url="https://example.com/cache-ocr")
-    default_key = _build_cache_key(config=capture_config, settings=job_global_settings)
+    config = StorageConfig(cache_root=tmp_path / "cache", db_path=tmp_path / "runs.db")
+    manager = JobManager(store=Store(config), runner=_fake_runner)
+    url = "https://example.com/cache-ocr"
+    first = await manager.create_job(JobCreateRequest(url=url, reuse_cache=False))
+    await manager._tasks[first["id"]]
+
+    base_settings = jobs_module.global_settings
     mutated_settings = replace(
-        job_global_settings,
-        ocr=replace(job_global_settings.ocr, model="olmOCR-2-7B-NEW"),
+        base_settings,
+        ocr=replace(base_settings.ocr, model="olmOCR-2-7B-NEW"),
     )
-
-    mutated_key = _build_cache_key(config=capture_config, settings=mutated_settings)
-
-    assert mutated_key != default_key
+    monkeypatch.setattr(jobs_module, "global_settings", mutated_settings)
+    try:
+        second = await manager.create_job(JobCreateRequest(url=url))
+        assert second["state"] != JobState.DONE.value
+        await manager._tasks[second["id"]]
+    finally:
+        monkeypatch.setattr(jobs_module, "global_settings", base_settings)
 
 
 class _DeleteStubStore:

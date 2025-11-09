@@ -648,6 +648,7 @@ _2025-11-08 — BlueMountain (bd-b9e) opened to land DOM-guided heading leveling
 _2025-11-09 — RedDog (bd-b9e) delivered the seam markers + enriched provenance comments and overlap-aware table header trimming so reviewers can see exactly where tiles merged and why headers were dropped._
 _2025-11-09 — PinkCastle (bd-b9e follow-up) hardened the stitcher: table header trimming now ignores blank/comment prologues, DOM assists merge multi-line hyphen splits while preserving list/blockquote prefixes, overlay candidates are consumed FIFO to keep duplicates aligned, and the warnings CLI table now folds seam/sweep cells so ratios stay readable in Rich output._
 _2025-11-09 — BrownHill (bd-692/bd-md3) threaded seam marker/hash counts through RunRecord, `/jobs/{id}` snapshots, and the `mdwb diag/show` commands so seam telemetry stays available even when the manifest is missing or cached._
+_2025-11-09 — PinkHill (bd-692) persisted seam marker summaries to SQLite, exposed them via JobManager snapshots/SSE events, taught the CLI/UI to render the summaries (with samples) when manifests are missing, and added seam summary fallbacks to the warning log + smoke tooling._
 - DOM-guided heading leveling that stores the original line in an HTML comment right above normalized content.
 - Table merge heuristics keyed on repeated header rows + high SSIM; otherwise keep blocks separate.
 - Upgrade provenance comments to `<!-- source: tile_i, y=1234, sha256=..., scale=2.0 -->` and add `/jobs/{id}/artifact/... ?highlight=tile_i,y0,y1` viewer helpers.
@@ -662,6 +663,7 @@ _2025-11-09 — BrownHill (bd-692/bd-md3) threaded seam marker/hash counts throu
 - _2025-11-09 — RedMountain (markdown_web_browser-co1) taught the SSE snapshot builder to fall back to `manifest.dom_assist_summary` (and reuse the shared warning_log helper) so cached/replayed jobs keep emitting DOM-assist events even when the raw `dom_assists` list is absent, and the fallback summarizer now honors `tiles_total` so assist density/ratios stay accurate when we have to recompute._
 - _2025-11-09 — RedMountain (markdown_web_browser-co1) taught the SSE snapshot builder to fall back to `manifest.dom_assist_summary` (and reuse the shared warning_log helper) so cached/replayed jobs keep emitting DOM-assist events even when the raw `dom_assists` list is absent, and the fallback summarizer now honors `tiles_total` so assist density/ratios stay accurate when we have to recompute._
 - _2025-11-09 — PinkCastle (bd-co1 assist) pairing with RedMountain on the CLI resume/watch audit (ResumeManager stress tests + `_watch_events_with_fallback` reconnect fixes)._ 
+- _2025-11-09 — GreenLake (bd-co1 assist) updated `ResumeManager` to persist done flag metadata (JSON timestamp + entry), allow resume status to list completed URLs without rewriting `work_index_list`, and limit orphan detection to hashes missing either an index entry or embedded metadata; `tests/test_mdwb_cli_resume.py` now covers the new behavior._
 - Detect low-confidence OCR regions (symbol rate, low alpha ratio, hyphen density) and patch them with DOM text overlays scoped to the offending block (hero headings, captions, icon fonts).
 
 ### 19.6 Caching, Indexing, Retrieval Quality
@@ -743,6 +745,8 @@ _2025-11-08 — PinkCreek (bd-ug0) designing ops automation: smoke/latency job r
 _2025-11-08 — BlueMountain (bd-md3) opened to automate these SLO rollups + dashboards so error-budget tracking isn’t manual._
 _2025-11-09 — BrownHill (bd-md3) extended `scripts/run_smoke.py` + `scripts/show_latest_smoke.py` to record capture/total/OCR p95/p99 values, flag SLO breaches per category, and added `scripts/check_metrics.py --check-weekly` so CI/on-call can fail fast when the weekly summary exceeds its 2×p95 budgets._
 _2025-11-09 — PinkHill (bd-md3) documented the seam marker telemetry workflow so ops can plug the `weekly_summary.json` seam count/hash percentiles into Grafana/Prometheus alongside the capture/OCR SLO panels (README/docs/ops updated)._
+_2025-11-09 — GreenLake (bd-md3) added `scripts/compute_slo.py` + regression tests so nightly/CI jobs can emit capture/OCR SLO summaries (`latest_slo_summary.json`) and `mdwb_slo_*` Prometheus gauges for Grafana/alerting._
+_2025-11-09 — GreenLake (bd-md3 follow-up) taught `scripts/run_smoke.py` to invoke the SLO helper automatically; each smoke run now writes `slo_summary.json` + `slo.prom` (mirrored to `benchmarks/production/latest_*`) so node exporter/Grafana ingest the metrics without manual steps._
 
 ### 20.2 Monitoring & Alerting
 - **Metrics:** expose `/metrics` with Prometheus counters and histograms (tiles_processed_total, ocr_retry_total, capture_duration_seconds_bucket). Include labels for model, CfT version, and concurrency tier.

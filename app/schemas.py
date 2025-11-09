@@ -225,6 +225,10 @@ class ManifestMetadata(BaseModel):
         default_factory=list,
         description="Seam hash metadata keyed by tile index/position to trace stitched boundaries",
     )
+    seam_marker_events: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="Logged seam-fallback decisions with tile pair metadata",
+    )
 
 
 class EmbeddingSearchRequest(BaseModel):

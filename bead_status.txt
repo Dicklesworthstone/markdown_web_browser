@@ -24,8 +24,13 @@ bd-90m OCR concurrency autotune & HTTP/2 tuning — DONE (RedDog 2025-11-09): ad
 bd-rle Rich CLI E2E logging scaffolding — DONE (PurpleBear 2025-11-09): FlowLogger v2 + transcript exporter + the `mdwb fetch --resume --webhook` scenario now live in `tests/test_e2e_cli.py` (panels/tables/progress + artifact logs).
 bd-rlc Agent + warnings integration coverage — DONE (PurpleBear 2025-11-09): `tests/test_e2e_cli.py` now covers `agents summarize` + `agents generate-todos` with transcript exports plus the combined `mdwb warnings tail --json` → `mdwb diag --json` flow, asserting on `rich` Panels/Tables/Progress + artifact paths.
 bd-rlp Run-checks toggle + docs updates — DONE (PurpleBear 2025-11-09): `scripts/run_checks.sh` now supports `MDWB_RUN_E2E_RICH` (copying FlowLogger transcripts into `tmp/rich_e2e_cli/` via `RICH_E2E_ARTIFACT_DIR`), and README/docs/PLAN call out the new toggle alongside the lighter `MDWB_RUN_E2E`.
-bd-692 Viewport seam watermark hints — open to inject invisible viewport markers and stitcher logic per PLAN §15.
+bd-692 Viewport seam watermark hints — seam watermarks landed (RedDog); 2025-11-09 PinkHill wired the seam marker summaries into RunRecord/JobSnapshot/SSE, updated CLI/UI fallbacks, and refreshed docs/tests; remaining sub-beads (semantic post-process toggle, crawl mode) still open.
 bd-we4 Semantic post-processing toggle — open to design the optional LLM/post-processing stage with provenance + config hooks per PLAN §15.
 bd-n5c Depth-1 crawl mode — open to build the allowlisted single-hop crawl orchestration in PLAN §15.
 bd-md3 Capture/OCR SLO dashboards — open to automate the §20.1 SLO/error-budget calculations and dashboards. 2025-11-09 update: PinkHill documented the seam marker telemetry workflow (README/docs/ops) so weekly seam count/hash percentiles can feed Grafana/Prom alerts alongside capture/OCR SLOs; next step is wiring the exporters to publish those values directly.
 bd-0jc Overlap & hyphenation guard research — open to run the PLAN §17 experiments on overlap windows + hyphen guards and feed new defaults/tests.
+
+bd-co1 Resume/watch review — 2025-11-09 GreenLake audited ResumeManager: done_flags now record JSON payloads so resume status can display real URLs without rewriting work_index, orphan detection skips known entries, and tests/test_mdwb_cli_resume.py covers the new flag behavior.
+
+bd-md3 Capture/OCR SLO dashboards — 2025-11-09 GreenLake shipped scripts/compute_slo.py with Prometheus textfile output, added tests/test_compute_slo.py, and updated README/docs/ops so ops can run the SLO rollup + feed mdwb_slo_* metrics into Grafana.
+bd-md3 Capture/OCR SLO dashboards — 2025-11-09 GreenLake also hooked scripts/run_smoke.py into scripts/compute_slo.py so every smoke run emits slo_summary.json + slo.prom (copied to latest_slo_summary/latest_slo.prom) and docs/ops now describe the automated flow.

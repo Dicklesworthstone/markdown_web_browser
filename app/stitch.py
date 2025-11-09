@@ -32,9 +32,19 @@ class DomAssistEntry:
 
 
 @dataclass(slots=True)
+class SeamMarkerEvent:
+    prev_tile_index: int
+    curr_tile_index: int
+    seam_hash: str | None
+    prev_overlap_hash: str | None
+    curr_overlap_hash: str | None
+
+
+@dataclass(slots=True)
 class StitchResult:
     markdown: str
     dom_assists: list[DomAssistEntry]
+    seam_marker_events: list[SeamMarkerEvent]
 
 
 @dataclass(slots=True)
@@ -95,7 +105,7 @@ def stitch_markdown(
     """Join OCR-derived Markdown segments with provenance + DOM assists."""
 
     if not chunks:
-        return StitchResult(markdown="", dom_assists=[])
+        return StitchResult(markdown="", dom_assists=[], seam_marker_events=[])
 
     processed: list[str] = []
     last_heading_level = 0
@@ -104,6 +114,7 @@ def stitch_markdown(
     heading_guide = HeadingGuide(dom_headings) if dom_headings else None
     overlay_index = DomOverlayIndex(dom_overlays)
     dom_assists: list[DomAssistEntry] = []
+    seam_events: list[SeamMarkerEvent] = []
 
     for idx, chunk in enumerate(chunks):
         lines = _split_lines(chunk)
@@ -125,8 +136,20 @@ def stitch_markdown(
                 for assist in assists:
                     processed.append(_format_dom_assist_comment(assist))
 
-        if tile and previous_tile and _tiles_share_overlap(previous_tile, tile):
-            processed.append(_format_seam_marker(previous_tile, tile))
+        if tile and previous_tile:
+            overlap_match, used_seam_marker = _tiles_share_overlap(previous_tile, tile)
+            if overlap_match:
+                if used_seam_marker:
+                    seam_events.append(
+                        SeamMarkerEvent(
+                            prev_tile_index=previous_tile.index,
+                            curr_tile_index=tile.index,
+                            seam_hash=previous_tile.seam_bottom_hash or tile.seam_top_hash,
+                            prev_overlap_hash=previous_tile.bottom_overlap_sha256,
+                            curr_overlap_hash=tile.top_overlap_sha256,
+                        )
+                    )
+                processed.append(_format_seam_marker(previous_tile, tile))
         if tile:
             processed.append(_format_provenance(tile, job_id=job_id))
         for original in heading_changes:
@@ -139,7 +162,11 @@ def stitch_markdown(
             processed.append(body)
         previous_tile = tile if tile else previous_tile
 
-    return StitchResult(markdown="\n\n".join(processed), dom_assists=dom_assists)
+    return StitchResult(
+        markdown="\n\n".join(processed),
+        dom_assists=dom_assists,
+        seam_marker_events=seam_events,
+    )
 
 
 def _split_lines(chunk: str) -> list[str]:
@@ -200,7 +227,7 @@ def _trim_duplicate_table_header(
     prefix = lines[:header_start]
     suffix = lines[header_end:]
 
-    overlap_match = _tiles_share_overlap(prev_tile, tile)
+    overlap_match, _ = _tiles_share_overlap(prev_tile, tile)
     identical = header_signature == last_signature and overlap_match
     trimmed_info: TrimmedHeaderInfo | None = None
 
@@ -260,14 +287,16 @@ def _header_similarity(sig_a: str, sig_b: str) -> float:
     return difflib.SequenceMatcher(a=sig_a, b=sig_b).ratio()
 
 
-def _tiles_share_overlap(prev_tile: TileSlice | None, tile: TileSlice | None) -> bool:
+def _tiles_share_overlap(prev_tile: TileSlice | None, tile: TileSlice | None) -> tuple[bool, bool]:
     if not prev_tile or not tile:
-        return False
+        return False, False
     if prev_tile.bottom_overlap_sha256 and tile.top_overlap_sha256:
-        return prev_tile.bottom_overlap_sha256 == tile.top_overlap_sha256
+        if prev_tile.bottom_overlap_sha256 == tile.top_overlap_sha256:
+            return True, False
     if prev_tile.seam_bottom_hash and tile.seam_top_hash:
-        return prev_tile.seam_bottom_hash == tile.seam_top_hash
-    return False
+        if prev_tile.seam_bottom_hash == tile.seam_top_hash:
+            return True, True
+    return False, False
 
 
 def _format_seam_marker(prev_tile: TileSlice, tile: TileSlice) -> str:

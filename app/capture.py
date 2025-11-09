@@ -98,6 +98,7 @@ class CaptureManifest:
     dom_assist_summary: dict[str, object] | None = None
     ocr_autotune: dict[str, object] | None = None
     seam_markers: list[dict[str, object]] = field(default_factory=list)
+    seam_marker_events: list[dict[str, object]] = field(default_factory=list)
 
 
 @dataclass(slots=True)

@@ -100,7 +100,10 @@ def test_resume_status_counts_flags_missing_index(tmp_path):
     payload = json.loads(result.output)
     assert payload["done"] == 2  # 1 indexed entry + 1 placeholder hash
     assert payload["total"] == 2  # missing hashes now count toward the total
-    assert any(entry.startswith("hash:") for entry in payload["entries"])
+    assert any(
+        entry.startswith("hash:") or entry == url_b
+        for entry in payload["entries"]
+    )
     assert payload["orphan_flag_count"] == 1
     assert payload["orphan_flag_hashes"] == [mdwb_cli._resume_hash(url_b)]
 

@@ -140,12 +140,21 @@ def test_diag_reports_manifest_error(monkeypatch):
     assert "manifest-deleted" in output
 
 
-def test_diag_uses_snapshot_seam_counts(monkeypatch):
+def test_diag_uses_snapshot_seam_summary(monkeypatch):
     snapshot = {
         "id": "job999",
         "url": "https://example.com/seams",
         "state": "DONE",
         "progress": {"done": 1, "total": 1},
+        "seam_markers": {
+            "count": 3,
+            "unique_tiles": 2,
+            "unique_hashes": 2,
+            "sample": [
+                {"tile_index": 0, "position": "top", "hash": "abc111"},
+                {"tile_index": 1, "position": "bottom", "hash": "def222"},
+            ],
+        },
         "seam_marker_count": 3,
         "seam_hash_count": 2,
     }
@@ -163,4 +172,31 @@ def test_diag_uses_snapshot_seam_counts(monkeypatch):
 
     output = capture.get()
     assert result.exit_code == 0
-    assert "Seam markers: 3 (unique hashes: 2)" in output
+    assert "Seam Markers" in output
+    assert "abc111" in output
+
+
+def test_diag_prints_seam_counts_when_summary_missing(monkeypatch):
+    snapshot = {
+        "id": "job998",
+        "url": "https://example.com/fallback",
+        "state": "DONE",
+        "progress": {"done": 1, "total": 1},
+        "seam_marker_count": 4,
+        "seam_hash_count": 3,
+    }
+    stub = StubClient(
+        {
+            "/jobs/job998": StubResponse(200, payload=snapshot),
+            "/jobs/job998/manifest.json": StubResponse(404, payload={"detail": "missing"}),
+        }
+    )
+    _patch_client_ctx(monkeypatch, stub)
+    monkeypatch.setattr(mdwb_cli, "_resolve_settings", lambda base: _fake_settings())
+
+    with mdwb_cli.console.capture() as capture:
+        result = runner.invoke(mdwb_cli.cli, ["diag", "job998"])
+
+    output = capture.get()
+    assert result.exit_code == 0
+    assert "Seam markers: 4 (unique hashes: 3)" in output

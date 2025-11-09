@@ -21,6 +21,7 @@ def _write_pointer_files(
     root: Path,
     *,
     include_weekly: bool = True,
+    include_slo: bool = False,
     over_budget: bool = False,
     use_seam_marker_list: bool = False,
 ) -> None:
@@ -87,6 +88,26 @@ def _write_pointer_files(
             ],
         }
         (root / "weekly_summary.json").write_text(json.dumps(weekly_payload), encoding="utf-8")
+    if include_slo:
+        slo_payload = {
+            "generated_at": "2025-11-08T01:00:00Z",
+            "categories": {
+                "docs": {
+                    "count": 5,
+                    "budget_ms": 25000,
+                    "p50_capture_ms": 11000,
+                    "p95_capture_ms": 15000,
+                    "p50_ocr_ms": 6000,
+                    "p95_ocr_ms": 9000,
+                    "p50_total_ms": 18000,
+                    "p95_total_ms": 23000,
+                    "budget_breaches": 0,
+                    "status": "within_budget",
+                }
+            },
+            "aggregate": {"count": 5, "p50_total_ms": 18000, "p95_total_ms": 23000, "budget_breaches": 0},
+        }
+        (root / "latest_slo_summary.json").write_text(json.dumps(slo_payload), encoding="utf-8")
 
 
 def _invoke_show(tmp_path: Path, *args: str):
@@ -151,8 +172,23 @@ def test_show_latest_smoke_weekly_missing_file(tmp_path: Path):
     assert "weekly_summary.json missing" in result.output
 
 
+def test_show_latest_smoke_slo_summary(tmp_path: Path):
+    _write_pointer_files(tmp_path, include_weekly=False, include_slo=True)
+    result = _invoke_show(tmp_path, "--slo", "--no-summary", "--no-manifest", "--no-metrics", "--no-weekly")
+    assert result.exit_code == 0
+    assert "SLO Summary" in result.output
+    assert "| docs | 5 |" in result.output
+
+
+def test_show_latest_smoke_slo_missing_file(tmp_path: Path):
+    _write_pointer_files(tmp_path, include_weekly=False, include_slo=False)
+    result = _invoke_show(tmp_path, "--slo")
+    assert result.exit_code == 1
+    assert "latest_slo_summary.json missing" in result.output
+
+
 def test_show_latest_smoke_json_output(tmp_path: Path):
-    _write_pointer_files(tmp_path)
+    _write_pointer_files(tmp_path, include_slo=True)
     result = _invoke_show(
         tmp_path,
         "--manifest",
@@ -160,6 +196,7 @@ def test_show_latest_smoke_json_output(tmp_path: Path):
         "1",
         "--metrics",
         "--weekly",
+        "--slo",
         "--json",
     )
     assert result.exit_code == 0
@@ -174,11 +211,13 @@ def test_show_latest_smoke_json_output(tmp_path: Path):
     assert payload["manifest"][0]["seam_hash_count"] == 2
     assert "metrics" in payload
     assert "weekly_summary" in payload
+    assert "slo_summary" in payload
     weekly_seams = payload["weekly_summary"]["categories"][0]["seam_markers"]
     assert weekly_seams["count"]["p95"] == 2
     slo = payload["weekly_summary"]["categories"][0]["slo"]
     assert slo["capture_ok"] is True
     assert slo["ocr_ok"] is True
+    assert payload["slo_summary"]["categories"]["docs"]["status"] == "within_budget"
 
 
 def test_show_latest_smoke_manifest_missing(tmp_path: Path):
@@ -328,6 +367,41 @@ def test_show_latest_smoke_check_skip_weekly(tmp_path: Path):
     assert payload["status"] == "ok"
     assert payload["weekly_required"] is False
     assert payload["missing"] == []
+
+
+def test_show_latest_smoke_check_requires_slo(tmp_path: Path):
+    module = _load_cli()
+    _write_pointer_files(tmp_path, include_slo=False)
+    result = runner.invoke(
+        module.app,
+        [
+            "check",
+            "--root",
+            str(tmp_path),
+            "--slo",
+            "--json",
+        ],
+    )
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["status"] == "missing"
+    assert "slo_summary" in payload["missing"]
+
+
+def test_show_latest_smoke_check_requires_slo_present(tmp_path: Path):
+    module = _load_cli()
+    _write_pointer_files(tmp_path, include_slo=True)
+    result = runner.invoke(
+        module.app,
+        [
+            "check",
+            "--root",
+            str(tmp_path),
+            "--slo",
+        ],
+    )
+    assert result.exit_code == 0
+    assert "Smoke pointers present" in result.output
 
 
 def test_show_latest_smoke_check_pointer_missing(tmp_path: Path):

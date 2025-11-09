@@ -158,6 +158,7 @@ class ResumeManager:
         self.done_dir = done_dir or (root / "done_flags")
         self._index_cache: dict[str, set[str]] | None = None
         self._done_cache: set[str] | None = None
+        self._done_entries_cache: dict[str, str | None] | None = None
 
     def status(self) -> tuple[int, Optional[int]]:
         mapping = self._load_index()
@@ -177,16 +178,29 @@ class ResumeManager:
     def list_completed_entries(self, limit: Optional[int] = None) -> list[str]:
         mapping = self._load_index()
         done_hashes = self._done_hashes()
+        done_entries = self._done_entries()
         if mapping:
             completed: list[str] = []
             for group_hash, entries in mapping.items():
                 if group_hash not in done_hashes:
                     continue
                 completed.extend(sorted(entries))
-            placeholders = [f"hash:{value}" for value in sorted(h for h in done_hashes if h not in mapping)]
+            placeholders: list[str] = []
+            for hash_value in sorted(done_hashes):
+                if hash_value in mapping:
+                    continue
+                entry_value = done_entries.get(hash_value)
+                placeholders.append(entry_value or f"hash:{hash_value}")
             all_entries = completed + placeholders
         else:
-            all_entries = [f"hash:{value}" for value in sorted(done_hashes)]
+            def _sort_key(item: tuple[str, str | None]) -> tuple[int, str]:
+                hash_value, entry_value = item
+                if entry_value:
+                    return (0, entry_value)
+                return (1, hash_value)
+
+            ordered = sorted(done_entries.items(), key=_sort_key)
+            all_entries = [entry or f"hash:{hash_value}" for hash_value, entry in ordered]
         if limit is not None and limit > 0:
             return all_entries[:limit]
         return all_entries
@@ -224,28 +238,55 @@ class ResumeManager:
         self.done_dir.mkdir(parents=True, exist_ok=True)
         flag = self.done_dir / f"done_{group_hash}.flag"
         if not flag.exists():
-            flag.write_text(datetime.now(timezone.utc).isoformat(), encoding="utf-8")
+            payload = {"timestamp": datetime.now(timezone.utc).isoformat(), "entry": entry}
+            flag.write_text(json.dumps(payload), encoding="utf-8")
             self._done_cache = None
-        mapping = self._load_index()
-        if mapping is None:
-            mapping = {group_hash: {entry}}
-        else:
-            mapping.setdefault(group_hash, set()).add(entry)
-        self._write_index(mapping)
+            self._done_entries_cache = None
 
     def _done_hashes(self) -> set[str]:
         if self._done_cache is not None:
             return self._done_cache
         hashes: set[str] = set()
+        entries: dict[str, str | None] = {}
         if self.done_dir.exists():
             for child in self.done_dir.iterdir():
                 if not child.is_file():
                     continue
                 name = child.name
                 if name.startswith("done_") and name.endswith(".flag"):
-                    hashes.add(name[len("done_") : -len(".flag")])
+                    hash_value = name[len("done_") : -len(".flag")]
+                    hashes.add(hash_value)
+                    entries.setdefault(hash_value, self._read_flag_entry(child))
         self._done_cache = hashes
+        self._done_entries_cache = entries
         return hashes
+
+    def _done_entries(self) -> dict[str, str | None]:
+        if self._done_entries_cache is None:
+            self._done_hashes()
+        return self._done_entries_cache or {}
+
+    def _read_flag_entry(self, flag_path: Path) -> str | None:
+        try:
+            raw = flag_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        if not raw:
+            return None
+        if raw.startswith("{"):
+            try:
+                payload = json.loads(raw)
+                entry = payload.get("entry")
+                if isinstance(entry, str) and entry.strip():
+                    return entry.strip()
+            except json.JSONDecodeError:
+                return None
+            return None
+        lines = raw.splitlines()
+        if len(lines) >= 2:
+            candidate = lines[1].strip()
+            return candidate or None
+        return None
 
     def _load_index(self) -> dict[str, set[str]] | None:
         if self._index_cache is not None:
@@ -271,25 +312,6 @@ class ResumeManager:
             return None
         self._index_cache = mapping
         return mapping
-
-    def _write_index(self, mapping: dict[str, set[str]]) -> None:
-        rows: list[list[str]] = []
-        for group_hash in sorted(mapping.keys()):
-            entries = sorted(mapping[group_hash])
-            rows.append([group_hash, *entries])
-        buffer = io.StringIO()
-        writer = csv.writer(buffer)
-        for row in rows:
-            writer.writerow(row)
-        data = buffer.getvalue().encode("utf-8")
-        cctx = zstd.ZstdCompressor()
-        compressed = cctx.compress(data)
-        self.index_path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = self.index_path.with_suffix(".tmp")
-        temp_path.write_bytes(compressed)
-        temp_path.replace(self.index_path)
-        self._index_cache = mapping
-
 
 class _ProgressMeter:
     def __init__(self) -> None:
@@ -346,11 +368,12 @@ def resume_status(
     root = root.resolve()
     manager = ResumeManager(root)
     review_dir = root / "done_flags_review"
-    orphan_flags = sorted(
-        hash_value
-        for hash_value in manager._done_hashes()
-        if hash_value not in (manager._load_index() or {})
-    )
+    index_mapping = manager._load_index() or {}
+    done_entries = manager._done_entries()
+    if index_mapping:
+        orphan_flags = sorted(hash_value for hash_value in manager._done_hashes() if hash_value not in index_mapping)
+    else:
+        orphan_flags = sorted(hash_value for hash_value, entry in done_entries.items() if not entry)
     if orphan_flags:
         review_dir.mkdir(parents=True, exist_ok=True)
         for hash_value in orphan_flags:
@@ -447,8 +470,17 @@ def _print_ocr_metrics(manifest: dict[str, Any], *, json_output: bool) -> None:
     quota = manifest.get("ocr_quota") or {}
     autotune = manifest.get("ocr_autotune") or {}
     seam_markers = manifest.get("seam_markers") or []
+    seam_marker_events = manifest.get("seam_marker_events") or []
     if json_output:
-        console.print_json(data={"batches": batches, "quota": quota, "autotune": autotune, "seam_markers": seam_markers})
+        console.print_json(
+            data={
+                "batches": batches,
+                "quota": quota,
+                "autotune": autotune,
+                "seam_markers": seam_markers,
+                "seam_marker_events": seam_marker_events,
+            }
+        )
         return
 
     if quota:
@@ -1532,6 +1564,11 @@ def _format_seam_log_summary(data: Any) -> str:
         ]
         if preview:
             parts.append("hashes " + ", ".join(preview))
+    usage = data.get("usage")
+    if isinstance(usage, Mapping):
+        fallback_count = usage.get("count")
+        if isinstance(fallback_count, int) and fallback_count > 0:
+            parts.append(f"fallbacks={fallback_count}")
     return " | ".join(parts) if parts else "-"
 
 
@@ -1784,6 +1821,105 @@ def _dom_assist_counter(entries: Sequence[Mapping[str, Any]]) -> Counter[str]:
     return counter
 
 
+def _normalize_seam_rows(entries: Sequence[Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            continue
+        tile = entry.get("tile_index", entry.get("tile"))
+        rows.append(
+            {
+                "tile": tile,
+                "position": entry.get("position"),
+                "hash": entry.get("hash"),
+            }
+        )
+    return rows
+
+
+def _resolve_seam_data(
+    manifest: Mapping[str, Any] | None,
+    snapshot: Mapping[str, Any] | None,
+) -> Any:
+    manifest_data: Mapping[str, Any] | None = manifest if isinstance(manifest, Mapping) else None
+    if manifest_data:
+        markers = manifest_data.get("seam_markers")
+        if isinstance(markers, list):
+            payload: dict[str, Any] = {"markers": markers}
+            events = manifest_data.get("seam_marker_events")
+            if isinstance(events, list):
+                payload["events"] = events
+            return payload
+        if markers:
+            return markers
+    snapshot_data: Mapping[str, Any] | None = snapshot if isinstance(snapshot, Mapping) else None
+    if snapshot_data:
+        seam_field = snapshot_data.get("seam_markers")
+        if seam_field:
+            return seam_field
+        count = snapshot_data.get("seam_marker_count")
+        hash_count = snapshot_data.get("seam_hash_count")
+        if isinstance(count, int):
+            summary: dict[str, Any] = {"count": count}
+            if isinstance(hash_count, int):
+                summary["unique_hashes"] = hash_count
+            return summary
+    return None
+
+
+def _summarize_seam_data(entries: Any) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    if isinstance(entries, Mapping) and "markers" not in entries:
+        summary = dict(entries)
+        sample_entries = summary.get("sample")
+        rows = _normalize_seam_rows(sample_entries) if isinstance(sample_entries, Sequence) else []
+        return summary, rows
+
+    markers: list[Mapping[str, Any]] = []
+    events: list[Mapping[str, Any]] = []
+    if isinstance(entries, Mapping):
+        raw_markers = entries.get("markers")
+        if isinstance(raw_markers, Sequence):
+            markers = [entry for entry in raw_markers if isinstance(entry, Mapping)]
+        raw_events = entries.get("events")
+        if isinstance(raw_events, Sequence):
+            events = [entry for entry in raw_events if isinstance(entry, Mapping)]
+    elif isinstance(entries, Sequence):
+        markers = [entry for entry in entries if isinstance(entry, Mapping)]
+
+    if not markers:
+        return ({}, [])
+
+    tile_ids = {entry.get("tile_index") for entry in markers if isinstance(entry.get("tile_index"), int)}
+    hashes = {entry.get("hash") for entry in markers if entry.get("hash")}
+    summary: dict[str, Any] = {
+        "count": len(markers),
+        "unique_tiles": len(tile_ids) or None,
+        "unique_hashes": len(hashes) or None,
+    }
+    if events:
+        summary["usage"] = {
+            "count": len(events),
+            "sample": [
+                {
+                    "prev_tile_index": evt.get("prev_tile_index"),
+                    "curr_tile_index": evt.get("curr_tile_index"),
+                    "seam_hash": evt.get("seam_hash"),
+                }
+                for evt in events[:3]
+            ],
+        }
+
+    rows = [
+        {
+            "tile": entry.get("tile_index"),
+            "position": entry.get("position"),
+            "hash": entry.get("hash"),
+        }
+        for entry in markers
+    ]
+    return summary, rows
+
+
 def _print_seam_marker_counts(count: Any, hash_count: Any) -> None:
     if not isinstance(count, int):
         console.print("[dim]No seam markers recorded yet.[/]")
@@ -1812,6 +1948,23 @@ def _print_seam_markers(entries: Any) -> None:
     table.add_row("Distinct hashes", str(hash_count if hash_count is not None else "—"))
     console.print(table)
 
+    usage = summary.get("usage") if summary else None
+    if isinstance(usage, Mapping):
+        usage_count = usage.get("count")
+        if isinstance(usage_count, int) and usage_count > 0:
+            console.print(f"Seam fallback events: {usage_count}")
+            samples = usage.get("sample")
+            if isinstance(samples, Sequence) and samples:
+                usage_table = Table("Prev Tile", "Curr Tile", "Seam Hash", title="Fallback Samples")
+                sample_total = min(len(samples), 5)
+                for entry in samples[:sample_total]:
+                    usage_table.add_row(
+                        str(entry.get("prev_tile_index", "—")),
+                        str(entry.get("curr_tile_index", "—")),
+                        str(entry.get("seam_hash", "—")),
+                    )
+                console.print(usage_table)
+
     if rows:
         position_order = {"top": 0, "bottom": 1}
 
@@ -1838,7 +1991,7 @@ def _print_seam_markers(entries: Any) -> None:
             detail.caption = f"Showing {sample_count} of {len(sorted_rows)} markers"
         console.print(detail)
     else:
-        console.print("[dim]Seam markers recorded; sample unavailable (see manifest for details).[/]")
+        _print_seam_marker_counts(summary.get("count") if summary else None, summary.get("unique_hashes") if summary else None)
 
 
 def _follow_warning_log(path: Path, *, json_output: bool, interval: float) -> None:

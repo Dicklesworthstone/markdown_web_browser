@@ -115,6 +115,24 @@ def test_seam_marker_includes_hash_when_present() -> None:
     assert "seam_hash=abc123" in output
 
 
+def test_seam_marker_events_recorded_when_seam_hint_used() -> None:
+    tiles = [
+        _tile(0, 0, bottom_sha="mismatch-a"),
+        _tile(1, 400, top_sha="mismatch-b"),
+    ]
+    tiles[0].seam_bottom_hash = "seam99"
+    tiles[1].seam_top_hash = "seam99"
+
+    result = stitch_markdown(["chunk A", "chunk B"], tiles)
+
+    seam_events = getattr(result, "seam_marker_events")
+    assert seam_events, "expected seam marker usage to be recorded"
+    event = seam_events[0]
+    assert event.prev_tile_index == 0
+    assert event.curr_tile_index == 1
+    assert event.seam_hash == "seam99"
+
+
 def test_table_header_similarity_trim() -> None:
     tiles = [
         _tile(0, 0, bottom_sha="aaa"),

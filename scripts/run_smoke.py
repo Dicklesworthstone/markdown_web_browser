@@ -14,7 +14,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
 
-from scripts import olmocr_cli
+from scripts import olmocr_cli, compute_slo
 
 PRODUCTION_SET_PATH = Path("benchmarks/production_set.json")
 PRODUCTION_ROOT = Path("benchmarks/production")
@@ -259,6 +259,24 @@ def write_manifest_index(date_dir: Path, records: list[RunRecord]) -> Path:
     return index_path
 
 
+def write_slo_outputs(date_dir: Path, manifest_index: Path, budget_map: dict[str, int]) -> tuple[Path, Path]:
+    if not manifest_index.exists():
+        raise FileNotFoundError(f"Manifest index not found: {manifest_index}")
+    entries: list[dict[str, Any]] = json.loads(manifest_index.read_text(encoding="utf-8"))
+    summary = compute_slo.compute_slo_summary(entries, budget_map=budget_map)
+    payload = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "manifest_path": str(manifest_index),
+        "root": str(date_dir),
+        **summary,
+    }
+    summary_path = date_dir / "slo_summary.json"
+    summary_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    prom_path = date_dir / "slo.prom"
+    compute_slo.write_prom_metrics(summary=payload, output_path=prom_path)
+    return summary_path, prom_path
+
+
 def _aggregate_category_stats(records: list[RunRecord]) -> list[dict[str, Any]]:
     grouped: dict[str, list[RunRecord]] = defaultdict(list)
     for record in records:
@@ -339,6 +357,8 @@ def update_latest_markers(date_dir: Path) -> None:
         "manifest_index.json": PRODUCTION_ROOT / "latest_manifest_index.json",
         "summary.md": PRODUCTION_ROOT / "latest_summary.md",
         "metrics.json": PRODUCTION_ROOT / "latest_metrics.json",
+        "slo_summary.json": PRODUCTION_ROOT / "latest_slo_summary.json",
+        "slo.prom": PRODUCTION_ROOT / "latest_slo.prom",
     }
     for filename, dest in copies.items():
         src = date_dir / filename
@@ -485,6 +505,7 @@ def main() -> None:
         missing = selected - {cat.name for cat in categories}
         if missing:
             raise SystemExit(f"Unknown categories requested: {', '.join(sorted(missing))}")
+    budget_map = {cat.name: cat.budget_ms for cat in categories}
     settings = olmocr_cli.load_settings()
     date_dir = _ensure_date_dir(run_date)
 
@@ -503,7 +524,8 @@ def main() -> None:
             )
         all_records.extend(records)
 
-    write_manifest_index(date_dir, all_records)
+    manifest_index = write_manifest_index(date_dir, all_records)
+    write_slo_outputs(date_dir, manifest_index, budget_map)
     summary_path, stats = write_summary_markdown(date_dir, all_records)
     write_latest_metrics(date_dir, stats)
     update_latest_markers(date_dir)

@@ -22,6 +22,18 @@ from sqlmodel import Field, Session, SQLModel, create_engine, select
 
 from app.tiler import TileSlice
 
+try:  # pragma: no cover - imported for typing/runtime parity
+    from app.warning_log import summarize_seam_markers
+except ImportError:  # pragma: no cover - typing fallback
+
+    def summarize_seam_markers(
+        markers: Any,
+        *,
+        events: Any = None,
+        sample_limit: int = 3,
+    ) -> dict[str, Any] | None:
+        return None
+
 from .embeddings import EMBEDDING_DIM, EmbeddingMatch, search_embeddings
 from .settings import load_config
 
@@ -66,6 +78,10 @@ class RunRecord(SQLModel, table=True):
     cache_key: str | None = None
     seam_marker_count: int | None = None
     seam_hash_count: int | None = None
+    seam_markers_summary: dict[str, Any] | None = Field(
+        default=None,
+        sa_column=Column(SQLITE_JSON),
+    )
 
 
 class LinkRecord(SQLModel, table=True):
@@ -215,6 +231,7 @@ class Store:
             "server_runtime": "TEXT",
             "seam_marker_count": "INTEGER",
             "seam_hash_count": "INTEGER",
+            "seam_markers_summary": "JSON",
         }
         with self.engine.begin() as conn:
             existing = {
@@ -731,6 +748,7 @@ def _apply_manifest_metadata(record: RunRecord, manifest: Mapping[str, object] |
     validation_failures = manifest_dict.get("validation_failures")
     if isinstance(validation_failures, list):
         _set_int("validation_failure_count", len(validation_failures))
+    seam_summary: dict[str, Any] | None = None
     seam_markers = manifest_dict.get("seam_markers")
     if isinstance(seam_markers, list):
         _set_int("seam_marker_count", len(seam_markers))
@@ -741,9 +759,15 @@ def _apply_manifest_metadata(record: RunRecord, manifest: Mapping[str, object] |
         }
         if hashes:
             _set_int("seam_hash_count", len(hashes))
+        seam_summary = summarize_seam_markers(seam_markers)
     else:
         _set_int("seam_marker_count", manifest_dict.get("seam_marker_count"))
         _set_int("seam_hash_count", manifest_dict.get("seam_hash_count"))
+    if seam_summary is None:
+        raw_summary = manifest_dict.get("seam_markers_summary")
+        if isinstance(raw_summary, Mapping):
+            seam_summary = dict(raw_summary)
+    record.seam_markers_summary = seam_summary
 
 
 def _manifest_to_dict(manifest: Mapping[str, object] | Any) -> dict[str, Any]:

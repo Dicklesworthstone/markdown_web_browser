@@ -44,4 +44,10 @@ Starting bd-x6v cache reuse work now - GreenMountain
 2025-11-09 — RedMountain (markdown_web_browser-co1) fixed a long-standing bug where `mdwb watch --raw` skipped `--on` hooks; `_watch_job_events_pretty` now triggers hooks even when raw output is requested, with regression tests guarding the behavior.
 2025-11-09 — PinkCastle (bd-co1 assist) partnering with RedMountain on the CLI resume/watch audit (stress testing ResumeManager against large work_index/done_flags sets and reviewing `_watch_events_with_fallback` cursor handling).
 2025-11-09 — PinkHill (bd-md3) captured the seam-marker dashboard workflow in README/docs/ops so ops can ingest the weekly `seam_markers.count`/`hashes` percentiles alongside the capture/OCR SLO budget checks.
+2025-11-09 — PinkHill (bd-692) wired seam marker summaries into RunRecord + JobManager snapshots, added the SSE/CLI/UI fallbacks (manifest tab + `mdwb diag/show/events`) when manifests are missing, and refreshed tests for store/CLI/job_manager/warning log behavior.
 2025-11-09 — GreenLake (bd-4zy) enforced the `latest.txt` guard in `scripts/show_latest_smoke.py`, ensured the weekly JSON payload from `scripts/check_metrics.py` always includes `status/summary_path/failures`, added pytest coverage, and ran `SKIP_LIBVIPS_CHECK=1 bash scripts/run_checks.sh`.
+
+2025-11-09 — GreenLake hardened ResumeManager flag handling: done_flags now store JSON entries, resume status uses flag metadata when work_index is missing, and orphan counts only trigger when either the index exists or the legacy flags lack entry data. Tests: uv run pytest tests/test_mdwb_cli_resume.py.
+
+2025-11-09 — GreenLake (bd-md3) added scripts/compute_slo.py + tests/test_compute_slo.py to generate capture/OCR SLO summaries, Prometheus textfiles, and docs/ops/README guidance for running the new CLI.
+2025-11-09 — GreenLake wired scripts/run_smoke.py to call scripts/compute_slo.py after each smoke (writes slo_summary.json + slo.prom to latest markers) so dashboards/alerting always see fresh mdwb_slo_* metrics.

@@ -39,7 +39,7 @@ uv run python scripts/run_smoke.py \
   - `benchmarks/production/latest_manifest_index.json`
   - `benchmarks/production/latest_summary.md`
   so dashboards/automation can point at a stable path.
-- Run `uv run python scripts/show_latest_smoke.py --manifest --metrics --weekly --limit 5 --json` to inspect
+- Run `uv run python scripts/show_latest_smoke.py --manifest --metrics --weekly --slo --limit 5 --json` to inspect
   the latest summary/manifest pointers plus the rolling `weekly_summary.json`. Manifest rows include
   overlap ratios and validation failure counts when the data exists, so seam regressions are visible
   without opening individual manifests. The CLI highlights categories that exceed their p95 budgets
@@ -79,7 +79,7 @@ by folding the last seven days of `manifest_index.json` entries. The file contai
 - `window_days`: currently 7.
 - `categories`: list of `{name, runs, budget_ms, capture_ms.{p50,p95}, total_ms.{p50,p95}}`.
 
-Run `uv run python scripts/show_latest_smoke.py --weekly --manifest --metrics --no-summary`
+Run `uv run python scripts/show_latest_smoke.py --weekly --slo --manifest --metrics --no-summary`
 to review the latest weekly summary alongside the pointer files (set
 `MDWB_SMOKE_ROOT` or `--root` if the artifacts live outside `benchmarks/production/`). The CLI
 highlights categories whose p95 totals exceed their budgets so you can spot regressions
@@ -97,8 +97,12 @@ Publish the summary in Monday’s ops update and attach the most recent
 - `benchmarks/production/weekly_summary.json` now records seam health for each category under
   `categories[].seam_markers`: `count.p50/p95` tracks how many stitched seams the average run produced,
   while `hashes.p50/p95` tracks how many unique watermark hashes we saw (duplicate hashes across tiles
-  often indicate scroll glitches). `scripts/run_smoke.py` writes these values automatically, and
-  `scripts/show_latest_smoke.py --weekly --json` exposes them for dashboards/automation.
+  often indicate scroll glitches). Each manifest also includes `seam_marker_events`, and the CLI/manifest tab
+  surfaces the corresponding "Seam fallback events" table whenever those hints were needed. The same block now includes `usage.p50/p95` so you can see how often
+  seam fallback events fired (i.e., when the stitcher had to rely on the watermark hints because overlap
+  hashes disagreed). `scripts/run_smoke.py` writes these values automatically, and
+  `scripts/show_latest_smoke.py --weekly --slo --json` exposes them for dashboards/automation (the `--slo`
+  flag appends the capture/OCR SLO summary so dashboards can ingest both JSON blocks in one call).
 - Wire Grafana panels directly to those JSON fields (or to the rendered CLI output) so ops can
   spot regressions without opening manifests. A simple approach is to have CI upload the weekly
   summary as an artifact, then use the JSON API data source with the path
@@ -106,7 +110,8 @@ Publish the summary in Monday’s ops update and attach the most recent
   2× above their seven-day p95 baseline or when unique hashes collapse toward zero (duplicate seams).
 - Include the seam markers row in Monday’s ops update: copy the `p50/p95` pairs from the CLI output
   (or run `jq '.categories[] | {name, seam: .seam_markers}' benchmarks/production/weekly_summary.json`)
-  so reviewers understand whether the latest regressions stem from stitching vs. OCR latency.
+  so reviewers understand whether the latest regressions stem from stitching vs. OCR latency. Call out
+  any spike in `usage` since those runs relied on seam hints rather than raw overlap hashes.
 - When an alert fires, grab the affected job id from the manifest index, run
   `mdwb diag <job_id>` (or `mdwb jobs show`) to print the seam marker table, and attach it to the bead
   or Agent Mail thread so everyone has the hashes/tiles handy for repro.
@@ -170,10 +175,21 @@ uv run python scripts/check_metrics.py --timeout 3.0 --json
 
 # Include weekly SLO validation (fails fast when capture/OCR p99 exceed 2×p95 budgets)
 uv run python scripts/check_metrics.py --check-weekly --weekly-summary benchmarks/production/weekly_summary.json
+
+# Compute capture/OCR SLO summary for dashboards (PLAN §20.1)
+uv run python scripts/compute_slo.py \
+  --root benchmarks/production \
+  --manifest benchmarks/production/latest_manifest_index.json \
+  --budget-file benchmarks/production_set.json \
+  --out benchmarks/production/latest_slo_summary.json \
+  --prom-output tmp/mdwb_slo.prom
 curl -s http://localhost:8000/metrics | grep mdwb_capture_duration_seconds
 curl -s http://localhost:9000/metrics | head -n 5  # dedicated Prom port
 ```
-
+`scripts/run_smoke.py` runs the SLO helper automatically at the end of every smoke run, copying
+`slo_summary.json` → `benchmarks/production/latest_slo_summary.json` plus the matching `latest_slo.prom`
+textfile so node exporter/Grafana can ingest the `mdwb_slo_*` metrics without additional steps. Use the
+manual command above when you need to recompute SLOs from historical manifests or on a different root directory.
 The CLI command above reads `.env` for `API_BASE_URL`/`PROMETHEUS_PORT` (override with
 `--api-base`/`--exporter-port` and `--exporter-url` when talking to a remote exporter). Use
 `--json` for structured output (payload now includes `status`, `generated_at`, `ok_count`,
@@ -182,7 +198,12 @@ endpoint is exposed. `scripts/prom_scrape_check.py` simply wraps the same CLI fo
 automation; prefer calling `check_metrics.py` directly.
 When you pass `--check-weekly --json`, the payload always includes a `weekly` block with `status`,
 `summary_path`, and the recorded failures—even when the weekly summary cannot be read—so CI logs
-can quote the exact reason the health check failed.
+can quote the exact reason the health check failed. `scripts/compute_slo.py` produces the capture/OCR
+SLO rollup referenced in PLAN §20.1: it emits a JSON report (defaulting to
+`benchmarks/production/latest_slo_summary.json`) plus optional Prometheus textfile metrics
+(`mdwb_slo_*` gauges covering per-category p95 totals, breach ratios, and overall status) when
+`--prom-output` is supplied. Point the node exporter textfile collector at the generated `.prom`
+file so Grafana can alert whenever the rolling SLOs drift outside their budgets.
 - Optional automation toggles:
   - `MDWB_CHECK_METRICS=1` (and optionally `CHECK_METRICS_TIMEOUT=<seconds>`) appends the Prometheus probe after
     the lint/type/pytest/Playwright stages so CI mirrors manual smoke commands.
@@ -209,6 +230,9 @@ warning spikes, job failures, or SSE stalls exceed their budgets.
   the resulting `benchmarks/production/<DATE>` directory as a build artifact.
 - Use the weekly summary JSON to feed Grafana/Metabase until we switch to direct
   metrics ingestion.
+- Immediately after refreshing the `latest_*` pointers, run `scripts/compute_slo.py` (see command above)
+  to generate `latest_slo_summary.json`; that file feeds the PLAN §20.1 dashboards/alerts so release gates
+  have a single JSON artifact capturing per-category p50/p95 totals and budget breaches.
 - GitHub Actions example: `.github/workflows/nightly_smoke.yml` installs uv/Playwright,
   writes a minimal `.env` from repository secrets (`MDWB_API_BASE_URL`, `MDWB_API_KEY`,
   `OLMOCR_SERVER`, `OLMOCR_API_KEY`), runs `scripts/check_env.py` to fail fast on misconfigurations,
@@ -243,6 +267,8 @@ warning spikes, job failures, or SSE stalls exceed their budgets.
   `uv run python scripts/update_smoke_pointers.py <run-dir> [--root benchmarks/production]`
   (add `--weekly-source benchmarks/production/weekly_summary.json` if you need to override the weekly summary). This keeps
   `latest_summary.md`, `latest_manifest_index.json`, and `latest_metrics.json` aligned with the run that ops dashboards should display.
+  The script now recomputes `latest_slo_summary.json` automatically using the new manifest pointer plus the PLAN §22 budget file; pass
+  `--budget-file` to point at a different definition or `--no-compute-slo` when you intentionally want to leave the previous summary untouched.
 - `uv run python scripts/mdwb_cli.py events <job-id> --follow` tails the raw
   `/jobs/{id}/events` NDJSON feed for pipelines; combine with `--since` to resume
   from the last timestamp when running in cron or CI.

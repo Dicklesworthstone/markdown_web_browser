@@ -170,6 +170,16 @@ def test_store_persists_sweep_and_validation_metadata(tmp_path: Path) -> None:
     assert record.validation_failure_count == 2
     assert record.seam_marker_count == 3
     assert record.seam_hash_count == 2
+    assert getattr(record, "seam_markers_summary") == {
+        "count": 3,
+        "unique_tiles": 3,
+        "unique_hashes": 2,
+        "sample": [
+            {"tile_index": 0, "position": "top", "hash": "aaa111"},
+            {"tile_index": 1, "position": "bottom", "hash": "bbb222"},
+            {"tile_index": 2, "position": "top", "hash": "bbb222"},
+        ],
+    }
 
 
 def _sample_manifest_metadata() -> ManifestMetadata:
@@ -242,6 +252,15 @@ def test_store_accepts_pydantic_manifest(tmp_path: Path) -> None:
     assert record.validation_failure_count == 1
     assert record.seam_marker_count == 2
     assert record.seam_hash_count == 2
+    assert getattr(record, "seam_markers_summary") == {
+        "count": 2,
+        "unique_tiles": 2,
+        "unique_hashes": 2,
+        "sample": [
+            {"tile_index": 0, "position": "top", "hash": "ccc111"},
+            {"tile_index": 1, "position": "bottom", "hash": "ddd222"},
+        ],
+    }
 
     saved = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert saved["environment"]["viewport"]["device_scale_factor"] == 2

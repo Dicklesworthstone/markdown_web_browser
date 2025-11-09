@@ -79,6 +79,7 @@ class JobSnapshot(TypedDict, total=False):
     cache_hit: bool
     seam_marker_count: int | None
     seam_hash_count: int | None
+    seam_markers: list[dict[str, object]]
 
 
 def build_initial_snapshot(
@@ -282,6 +283,8 @@ class JobManager:
                 "total": capture_result.manifest.tiles_total,
             }
             snapshot["manifest"] = asdict(capture_result.manifest)
+            if capture_result.manifest.seam_markers:
+                snapshot["seam_markers"] = capture_result.manifest.seam_markers
             snapshot["artifacts"] = tile_artifacts
             snapshot["cache_hit"] = bool(capture_result.manifest.cache_hit)
             self._broadcast(job_id)
@@ -646,6 +649,7 @@ async def _run_ocr_pipeline(
     )
     markdown = stitch_result.markdown
     dom_assists = stitch_result.dom_assists
+    seam_events = stitch_result.seam_marker_events
     if dom_assists:
         capture_result.manifest.dom_assists = [
             {
@@ -664,6 +668,17 @@ async def _run_ocr_pipeline(
         if summary:
             manifest_any = cast(Any, capture_result.manifest)
             manifest_any.dom_assist_summary = summary
+    if seam_events:
+        capture_result.manifest.seam_marker_events = [
+            {
+                "prev_tile_index": event.prev_tile_index,
+                "curr_tile_index": event.curr_tile_index,
+                "seam_hash": event.seam_hash,
+                "prev_overlap_hash": event.prev_overlap_hash,
+                "curr_overlap_hash": event.curr_overlap_hash,
+            }
+            for event in seam_events
+        ]
     stitch_ms = int((time.perf_counter() - stitch_start) * 1000)
     ocr_links = extract_links_from_markdown(markdown)
     return markdown, ocr_ms, stitch_ms, ocr_links
