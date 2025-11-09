@@ -1184,14 +1184,41 @@ class ComprehensiveTestRunner:
                             for validation in validations:
                                 test_case.add_validation(validation)
                         else:
+                            # Job did not complete successfully - extract error details
+                            error_message = f"Job failed with state: {final_state}"
+                            error_details = {}
+
+                            # Try to get error information from job_data
+                            job_data = test_case.artifacts.get("job_data", {})
+                            if job_data:
+                                if "error" in job_data:
+                                    error_message += f"\nError: {job_data['error']}"
+                                    error_details["backend_error"] = job_data["error"]
+                                if "error_details" in job_data:
+                                    error_details["details"] = job_data["error_details"]
+                                if "traceback" in job_data:
+                                    error_details["traceback"] = job_data["traceback"]
+                                if "warnings" in job_data:
+                                    error_details["warnings"] = job_data["warnings"]
+
+                            # Try to retrieve manifest even on failure for diagnostic info
+                            try:
+                                await self._retrieve_artifacts(client, job_id, test_case)
+                                manifest = test_case.artifacts.get("manifest", {})
+                                if manifest and "error" in manifest:
+                                    error_details["manifest_error"] = manifest["error"]
+                            except Exception:
+                                pass  # Ignore artifact retrieval errors
+
                             test_case.add_validation(ValidationResult(
                                 passed=False,
                                 category="job",
                                 check_name="job_completion",
                                 expected="DONE",
                                 actual=final_state,
-                                message=f"Job failed with state: {final_state}",
-                                severity="critical"
+                                message=error_message,
+                                severity="critical",
+                                details=error_details
                             ))
                     else:
                         test_case.add_validation(ValidationResult(

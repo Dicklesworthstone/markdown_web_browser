@@ -402,9 +402,9 @@ function renderSeamMarkers(container, markers) {
         .map(
           (entry) => `
         <tr>
-          <td>${entry.tile ?? '—'}</td>
-          <td>${entry.position}</td>
-          <td><code>${entry.hash}</code></td>
+          <td>${escapeHtml(String(entry.tile ?? '—'))}</td>
+          <td>${escapeHtml(entry.position)}</td>
+          <td><code>${escapeHtml(entry.hash)}</code></td>
         </tr>
       `,
         )
