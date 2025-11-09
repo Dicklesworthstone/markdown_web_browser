@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import Any, cast
 from pathlib import Path
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import pytest
 
@@ -21,7 +21,13 @@ if "pyvips" not in sys.modules:
     sys.modules["pyvips"] = pyvips_stub
 
 try:
-    from app.capture import CaptureManifest, CaptureResult, ScrollPolicy, SweepStats  # noqa: E402
+    from app.capture import (  # noqa: E402
+        CaptureConfig,
+        CaptureManifest,
+        CaptureResult,
+        ScrollPolicy,
+        SweepStats,
+    )
 except OSError:  # pyvips missing in CI
     @dataclass
     class ScrollPolicy:  # type: ignore[override]
@@ -76,7 +82,24 @@ except OSError:  # pyvips missing in CI
         tiles: list
         manifest: CaptureManifest
 
-from app.jobs import JobManager, JobState  # noqa: E402
+    @dataclass
+    class CaptureConfig:  # type: ignore[override]
+        url: str
+        viewport_width: int = 1280
+        viewport_height: int = 2000
+        device_scale_factor: int = 2
+        color_scheme: str = "light"
+        reduced_motion: bool = True
+        profile_id: str | None = None
+        long_side_px: int | None = None
+        cache_key: str | None = None
+
+from app.jobs import (  # noqa: E402
+    JobManager,
+    JobState,
+    _build_cache_key,
+    global_settings as job_global_settings,
+)
 from app.schemas import JobCreateRequest  # noqa: E402
 from app.store import StorageConfig, Store  # noqa: E402
 from app.tiler import TileSlice  # noqa: E402

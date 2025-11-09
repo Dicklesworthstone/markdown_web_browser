@@ -435,9 +435,9 @@ def _print_job(job: dict) -> None:
     if validation_row != "-":
         table.add_row("validation", validation_row)
     console.print(table)
-    seam_markers = manifest.get("seam_markers") if isinstance(manifest, dict) else None
-    if seam_markers:
-        _print_seam_markers(seam_markers)
+    seam_payload = _resolve_seam_data(manifest if isinstance(manifest, dict) else None, job)
+    if seam_payload:
+        _print_seam_markers(seam_payload)
     else:
         _print_seam_marker_counts(job.get("seam_marker_count"), job.get("seam_hash_count"))
 
@@ -819,6 +819,9 @@ def _watch_job_events_pretty(
         if isinstance(event_name, str) and event_name == "dom_assist":
             _print_dom_assist_event(entry)
             continue
+        if isinstance(event_name, str) and event_name == "seams":
+            _print_seam_event(entry)
+            continue
         snapshot = entry.get("snapshot")
         if isinstance(snapshot, dict):
             _render_snapshot(snapshot, meter=progress_meter)
@@ -910,6 +913,10 @@ def _render_snapshot(snapshot: dict[str, Any], *, meter: _ProgressMeter | None =
         validation_summary = _format_validation_summary(manifest.get("validation_failures"))
         if validation_summary != "-":
             _log_event("log", f"validation: {validation_summary}")
+    seam_data = _resolve_seam_data(manifest if isinstance(manifest, dict) else None, snapshot)
+    seam_summary = _format_seam_log_summary(seam_data)
+    if seam_summary != "-":
+        _log_event("log", f"seams: {seam_summary}")
     error = snapshot.get("error")
     if error:
         _log_event("log", json.dumps({"error": error}))
@@ -1279,6 +1286,11 @@ def _log_event(event: str, payload: str) -> None:
             console.print(f"[red]validation[/]: {'; '.join(map(str, data))}")
             return
         console.print("[green]validation[/]: none")
+        return
+    if event == "seams":
+        data = _parse_json_payload(payload)
+        summary = _format_seam_log_summary(data)
+        console.print(f"[blue]seams[/]: {summary}")
         return
     console.print(f"[bold]{event}[/]: {payload}")
 
@@ -1712,9 +1724,9 @@ def _print_diag_report(
     else:
         console.print("[dim]No DOM assists recorded.[/]")
 
-    seam_markers = (manifest or {}).get("seam_markers")
-    if seam_markers:
-        _print_seam_markers(seam_markers)
+    seam_payload = _resolve_seam_data(manifest if isinstance(manifest, dict) else None, snapshot)
+    if seam_payload:
+        _print_seam_markers(seam_payload)
     else:
         _print_seam_marker_counts(
             snapshot.get("seam_marker_count"),
@@ -1753,6 +1765,14 @@ def _print_dom_assist_event(entry: Mapping[str, Any]) -> None:
         console.print(reason_table)
 
 
+def _print_seam_event(entry: Mapping[str, Any]) -> None:
+    payload = entry.get("data") or entry.get("payload")
+    if payload is None:
+        console.print_json(data=entry)
+        return
+    _print_seam_markers(payload)
+
+
 def _dom_assist_counter(entries: Sequence[Mapping[str, Any]]) -> Counter[str]:
     counter: Counter[str] = Counter()
     for entry in entries:
@@ -1775,30 +1795,50 @@ def _print_seam_marker_counts(count: Any, hash_count: Any) -> None:
 
 
 def _print_seam_markers(entries: Any) -> None:
-    markers = [entry for entry in entries or [] if isinstance(entry, Mapping)]
-    if not markers:
+    summary, rows = _summarize_seam_data(entries)
+    if not summary and not rows:
         console.print("[dim]No seam markers recorded yet.[/]")
         return
 
-    total = len(markers)
-    tile_count = len({entry.get("tile_index") for entry in markers if entry.get("tile_index") is not None})
-    hash_count = len({entry.get("hash") for entry in markers if entry.get("hash")})
-    summary = Table("Metric", "Value", title="Seam Markers")
-    summary.add_row("Markers", str(total))
-    summary.add_row("Tiles", str(tile_count or "—"))
-    summary.add_row("Distinct hashes", str(hash_count or "—"))
-    console.print(summary)
+    total = summary.get("count") if summary else len(rows)
+    if total is None and rows:
+        total = len(rows)
+    tile_count = summary.get("unique_tiles") if summary else len({row["tile"] for row in rows if row.get("tile")})
+    hash_count = summary.get("unique_hashes") if summary else len({row["hash"] for row in rows if row.get("hash")})
 
-    detail = Table("Tile", "Position", "Hash")
-    sample_count = min(total, 10)
-    for entry in markers[:sample_count]:
-        tile_value = entry.get("tile_index", "—")
-        position = entry.get("position", "—")
-        seam_hash = entry.get("hash", "—")
-        detail.add_row(str(tile_value), str(position), str(seam_hash))
-    if total > sample_count:
-        detail.caption = f"Showing {sample_count} of {total} markers"
-    console.print(detail)
+    table = Table("Metric", "Value", title="Seam Markers")
+    table.add_row("Markers", str(total if total is not None else "—"))
+    table.add_row("Tiles", str(tile_count if tile_count is not None else "—"))
+    table.add_row("Distinct hashes", str(hash_count if hash_count is not None else "—"))
+    console.print(table)
+
+    if rows:
+        position_order = {"top": 0, "bottom": 1}
+
+        def _tile_key(row: Mapping[str, Any]) -> tuple[int, Any]:
+            tile = row.get("tile")
+            if isinstance(tile, (int, float)):
+                return (0, float(tile))
+            return (1, str(tile or ""))
+
+        def _position_key(value: Any) -> int:
+            if isinstance(value, str):
+                return position_order.get(value.lower(), 2)
+            return 2
+
+        sorted_rows = sorted(rows, key=lambda row: (_tile_key(row), _position_key(row.get("position"))))
+        detail = Table("Tile", "Position", "Hash")
+        sample_count = min(len(sorted_rows), 10)
+        for entry in sorted_rows[:sample_count]:
+            tile_value = entry.get("tile", "—")
+            position = entry.get("position", "—")
+            seam_hash = entry.get("hash", "—")
+            detail.add_row(str(tile_value if tile_value is not None else "—"), str(position or "—"), str(seam_hash or "—"))
+        if len(sorted_rows) > sample_count:
+            detail.caption = f"Showing {sample_count} of {len(sorted_rows)} markers"
+        console.print(detail)
+    else:
+        console.print("[dim]Seam markers recorded; sample unavailable (see manifest for details).[/]")
 
 
 def _follow_warning_log(path: Path, *, json_output: bool, interval: float) -> None:

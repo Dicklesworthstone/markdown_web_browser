@@ -403,6 +403,55 @@ def test_stream_job_triggers_hooks_and_terminal(monkeypatch):
     assert hook_calls[-1][1] == {"state": ["echo done"]}
 
 
+def test_stream_job_stops_after_terminal_state():
+    lines = [
+        "event: state",
+        "data: DONE",
+        "",
+        "event: progress",
+        'data: {"done": 2, "total": 2}',
+        "",
+    ]
+
+    class FakeResponse:
+        def __init__(self, payload: list[str]) -> None:
+            self.payload = payload
+
+        def __enter__(self) -> "FakeResponse":
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:  # noqa: ANN001
+            return None
+
+        def iter_lines(self):  # noqa: ANN001
+            yield from self.payload
+
+        def raise_for_status(self) -> None:
+            return None
+
+    class FakeClient:
+        def stream(self, method: str, url: str, **kwargs):  # noqa: ANN001
+            return FakeResponse(lines)
+
+    fake_client = cast(httpx.Client, FakeClient())
+    terminal_states: list[str] = []
+
+    with mdwb_cli.console.capture() as capture:
+        mdwb_cli._stream_job(
+            "job-terminal",
+            API_SETTINGS,
+            raw=False,
+            hooks=None,
+            on_terminal=lambda state, snapshot: terminal_states.append(state),
+            client=fake_client,
+        )
+
+    output = capture.get()
+    assert "DONE" in output
+    assert '{"done": 2' not in output
+    assert terminal_states == ["DONE"]
+
+
 def test_format_progress_text_with_meter(monkeypatch):
     calls = iter([0.0, 5.0])
 

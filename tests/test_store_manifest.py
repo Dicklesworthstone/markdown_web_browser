@@ -36,6 +36,40 @@ def _allocate_run(store: Store, *, job_id: str = "run-123") -> tuple[str, Path]:
     return job_id, paths.root
 
 
+def test_allocate_run_uses_cache_key_path(tmp_path: Path) -> None:
+    store = _storage(tmp_path)
+    started = datetime(2025, 11, 9, 12, 0, tzinfo=timezone.utc)
+    cache_key = "ABCDEF1234567890"
+    paths = store.allocate_run(
+        job_id="run-cache",
+        url="https://example.com/cache-path",
+        started_at=started,
+        cache_key=cache_key,
+    )
+
+    relative = paths.root.relative_to(tmp_path / "cache")
+    parts = relative.parts
+    assert parts[2] == "cache"
+    assert parts[3] == cache_key[:2].lower()
+    assert parts[4] == cache_key.lower()
+    assert parts[-1] == started.astimezone(timezone.utc).strftime("%Y-%m-%d_%H%M%S")
+
+
+def test_allocate_run_without_cache_key_preserves_timestamp_layout(tmp_path: Path) -> None:
+    store = _storage(tmp_path)
+    started = datetime(2025, 11, 9, 12, 30, tzinfo=timezone.utc)
+    paths = store.allocate_run(
+        job_id="run-nocache",
+        url="https://example.com/no-cache",
+        started_at=started,
+    )
+
+    relative = paths.root.relative_to(tmp_path / "cache")
+    parts = relative.parts
+    assert "cache" not in parts[:3]
+    assert parts[-1] == started.astimezone(timezone.utc).strftime("%Y-%m-%d_%H%M%S")
+
+
 def test_store_records_profile_id(tmp_path: Path) -> None:
     store = _storage(tmp_path)
     job_id = "run-profile"

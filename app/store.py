@@ -120,12 +120,24 @@ class RunPaths:
     links_path: Path
     dom_snapshot_path: Path
     artifacts_manifest_path: Path
+    cache_key: str | None = None
 
     @classmethod
-    def from_url(cls, *, url: str, started_at: datetime, config: StorageConfig) -> RunPaths:
+    def from_url(
+        cls,
+        *,
+        url: str,
+        started_at: datetime,
+        config: StorageConfig,
+        cache_key: str | None = None,
+    ) -> RunPaths:
         host, slug = _split_url(url)
         timestamp = started_at.astimezone(timezone.utc).strftime(_TIMESTAMP_FORMAT)
-        run_root = config.cache_root / host / slug / timestamp
+        if cache_key:
+            bucket, normalized_key = _cache_segments(cache_key)
+            run_root = config.cache_root / host / slug / "cache" / bucket / normalized_key / timestamp
+        else:
+            run_root = config.cache_root / host / slug / timestamp
         artifacts = run_root / "artifact"
         tiles = artifacts / "tiles"
         return cls(
@@ -137,6 +149,7 @@ class RunPaths:
             links_path=run_root / "links.json",
             dom_snapshot_path=artifacts / "dom.html",
             artifacts_manifest_path=artifacts / "artifacts.json",
+            cache_key=cache_key,
         )
 
     def ensure_directories(self) -> None:
@@ -158,6 +171,7 @@ class RunPaths:
             links_path=root / "links.json",
             dom_snapshot_path=root / "artifact" / "dom.html",
             artifacts_manifest_path=root / "artifact" / "artifacts.json",
+            cache_key=record.cache_key,
         )
 
 
@@ -225,7 +239,7 @@ class Store:
         profile_id: str | None = None,
         cache_key: str | None = None,
     ) -> RunPaths:
-        paths = RunPaths.from_url(url=url, started_at=started_at, config=self.config)
+        paths = RunPaths.from_url(url=url, started_at=started_at, config=self.config, cache_key=cache_key)
         paths.ensure_directories()
         record = RunRecord(
             id=job_id,
@@ -621,6 +635,16 @@ def _split_url(url: str) -> tuple[str, str]:
     # Add a short hash of the full URL so distinct query strings do not collide.
     digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:8]
     return host.replace(":", "-"), f"{slug}-{digest}"
+
+
+def _cache_segments(cache_key: str) -> tuple[str, str]:
+    """Return (bucket, normalized_key) segments for cache directories."""
+
+    normalized = re.sub(r"[^a-z0-9]", "-", cache_key.lower()).strip("-")
+    if not normalized:
+        normalized = "cache"
+    bucket = normalized[:2].ljust(2, "0")
+    return bucket, normalized
 
 
 def _create_engine(db_path: Path):

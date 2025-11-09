@@ -80,9 +80,12 @@ Both scripts live under `scripts/agents/`, are Typer CLIs, and share helpers (`s
 
 ## Persistence & Bundles (Plan §§2, 10, 19.4, 19.6)
 
-- **Content-addressed layout** — now enforced via `RunPaths` in `app/store.py`. Each
-  run lives under `{CACHE_ROOT}/{host}/{path_slug}/{yyyy-mm-dd_HHMMSS}/` with
-  deterministic `manifest.json`, `out.md`, `links.json`, and `artifact/` children.
+- **Content-addressed layout** — `RunPaths` buckets captures by cache key so each
+  run lives under `{CACHE_ROOT}/{host}/{path_slug}/cache/{key_prefix}/{cache_key}/{yyyy-mm-dd_HHMMSS}/`
+  with deterministic `manifest.json`, `out.md`, `links.json`, and `artifact/` children.
+  The prefix (`cache_key[:2]`) keeps directory fan-out manageable, and the cache key
+  itself lets tooling jump straight from `_build_cache_key()` → filesystem path without
+  scraping SQLite first.
 - **SQLite metadata (`RUNS_DB_PATH`)** — `RunRecord`/`LinkRecord` tables capture CfT
   label/build, screenshot style hash, OCR policy, concurrency window, timing metrics,
   plus capture breadcrumbs (shrink/retry counts, overlap ratios, validation failure counts)
