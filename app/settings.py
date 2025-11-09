@@ -115,6 +115,10 @@ class Settings:
     webhook_secret: str
     server_runtime: str
 
+    # Authentication settings
+    REQUIRE_API_KEY: bool = False
+    API_KEY_HEADER: str = "X-API-Key"
+
     def manifest_environment(self, *, playwright_version: str | None = None) -> ManifestEnvironment:
         """Return the manifest metadata block used across captures."""
 
@@ -314,6 +318,10 @@ def get_settings(env_path: str = ".env") -> Settings:
     webhook_secret = cfg("WEBHOOK_SECRET", default="mdwb-dev-webhook")
     server_runtime = cfg("MDWB_SERVER_IMPL", default="uvicorn").lower()
 
+    # Authentication settings
+    require_api_key = _bool(cfg, "REQUIRE_API_KEY", default=False)
+    api_key_header = cfg("API_KEY_HEADER", default="X-API-Key")
+
     return Settings(
         env_path=env_path,
         browser=browser,
@@ -324,6 +332,8 @@ def get_settings(env_path: str = ".env") -> Settings:
         logging=logging_settings,
         webhook_secret=webhook_secret,
         server_runtime=server_runtime,
+        REQUIRE_API_KEY=require_api_key,
+        API_KEY_HEADER=api_key_header,
     )
 
 

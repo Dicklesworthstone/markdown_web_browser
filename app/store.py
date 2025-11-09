@@ -37,6 +37,9 @@ except ImportError:  # pragma: no cover - typing fallback
 from .embeddings import EMBEDDING_DIM, EmbeddingMatch, search_embeddings
 from .settings import load_config
 
+# Import models so they're registered with SQLModel.metadata
+from app.auth import APIKey  # noqa: F401 - imported for table registration
+
 DEFAULT_JOB_STATE = "BROWSER_STARTING"
 
 _TIMESTAMP_FORMAT = "%Y-%m-%d_%H%M%S"

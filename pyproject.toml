@@ -30,6 +30,8 @@ dependencies = [
   "beautifulsoup4>=4.14",
   "numpy>=2.0",
   "psutil>=7.0",
+  "arq>=0.26",
+  "redis>=5.0",
 ]
 
 [project.optional-dependencies]

@@ -2,9 +2,9 @@
 # Markdown Web Browser - All-in-One Installer Script
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/yourusername/markdown_web_browser/main/install.sh | bash
-#   curl -fsSL https://raw.githubusercontent.com/yourusername/markdown_web_browser/main/install.sh | bash -s -- --yes
-#   wget -qO- https://raw.githubusercontent.com/yourusername/markdown_web_browser/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/anthropics/markdown_web_browser/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/anthropics/markdown_web_browser/main/install.sh | bash -s -- --yes
+#   wget -qO- https://raw.githubusercontent.com/anthropics/markdown_web_browser/main/install.sh | bash
 #
 # Options:
 #   --yes, -y              Skip all confirmations (non-interactive mode)
@@ -282,6 +282,36 @@ setup_python_env() {
     print_color "$GREEN" "✓ Python environment ready"
 }
 
+# Function to detect Chrome for Testing version
+detect_cft_version() {
+    print_color "$BLUE" "Detecting Chrome for Testing version..."
+
+    # Try to get version info from playwright
+    local version_output=$(uv run playwright install chromium --dry-run --channel=cft 2>&1 || true)
+
+    # Extract version from output (format varies, try multiple patterns)
+    local cft_version=""
+
+    # Try to extract version like "130.0.6723.69"
+    if echo "$version_output" | grep -qE "chrome-[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+"; then
+        cft_version=$(echo "$version_output" | grep -oE "chrome-[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" | head -1)
+    elif echo "$version_output" | grep -qE "[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+"; then
+        # Sometimes it's just the version without "chrome-" prefix
+        local raw_version=$(echo "$version_output" | grep -oE "[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" | head -1)
+        cft_version="chrome-${raw_version}"
+    fi
+
+    if [ -z "$cft_version" ]; then
+        # Fallback: use a reasonable default if detection fails
+        print_color "$YELLOW" "Could not auto-detect CfT version, using default"
+        cft_version="chrome-130.0.6723.69"
+    else
+        print_color "$GREEN" "✓ Detected Chrome for Testing: $cft_version"
+    fi
+
+    echo "$cft_version"
+}
+
 # Function to install Playwright browsers
 install_playwright_browsers() {
     if [ "$INSTALL_BROWSERS" = false ]; then
@@ -289,12 +319,23 @@ install_playwright_browsers() {
         return 0
     fi
 
-    print_color "$BLUE" "Installing Playwright browsers..."
+    print_color "$BLUE" "Installing Chrome for Testing via Playwright..."
+    print_color "$YELLOW" "  Note: This installs the deterministic Chrome for Testing build,"
+    print_color "$YELLOW" "        NOT regular Chromium, to ensure reproducible screenshots."
 
-    uv run playwright install chromium
-    uv run playwright install-deps chromium
+    # CRITICAL FIX: Install Chrome for Testing with --channel=cft
+    uv run playwright install chromium --with-deps --channel=cft
 
-    print_color "$GREEN" "✓ Playwright browsers installed"
+    # Verify CfT installation
+    if ! uv run playwright install chromium --dry-run --channel=cft 2>&1 | grep -q "is already installed"; then
+        print_color "$RED" "✗ Chrome for Testing installation may have failed"
+        print_color "$YELLOW" "  The system may not work correctly without CfT"
+        return 1
+    fi
+
+    print_color "$GREEN" "✓ Chrome for Testing installed successfully"
+
+    return 0
 }
 
 # Function to setup configuration
@@ -313,31 +354,70 @@ setup_config() {
         print_color "$GREEN" "✓ .env file already exists"
     fi
 
+    # Detect and update CfT version in .env
+    if [ "$INSTALL_BROWSERS" = true ] && [ -f ".env" ]; then
+        local detected_version=$(detect_cft_version)
+
+        if [ ! -z "$detected_version" ]; then
+            # Update CFT_VERSION in .env
+            if grep -q "^CFT_VERSION=" .env; then
+                if [[ "$OSTYPE" == "darwin"* ]]; then
+                    # macOS requires '' after -i
+                    sed -i '' "s|^CFT_VERSION=.*|CFT_VERSION=$detected_version|" .env
+                else
+                    sed -i "s|^CFT_VERSION=.*|CFT_VERSION=$detected_version|" .env
+                fi
+                print_color "$GREEN" "✓ Updated CFT_VERSION in .env to $detected_version"
+            else
+                echo "CFT_VERSION=$detected_version" >> .env
+                print_color "$GREEN" "✓ Added CFT_VERSION to .env: $detected_version"
+            fi
+
+            # Note: CFT_LABEL should be manually set based on Chrome release channel
+            # Default to "Stable" if not already set
+            if ! grep -q "^CFT_LABEL=" .env; then
+                echo "CFT_LABEL=Stable" >> .env
+                print_color "$YELLOW" "  Set CFT_LABEL=Stable (update if using specific label like Stable-1)"
+            fi
+        fi
+    fi
+
     # Set OCR API key if provided
     if [ ! -z "$OCR_API_KEY" ]; then
         if grep -q "^OLMOCR_API_KEY=" .env; then
-            sed -i.bak "s/^OLMOCR_API_KEY=.*/OLMOCR_API_KEY=$OCR_API_KEY/" .env
-            rm .env.bak
+            if [[ "$OSTYPE" == "darwin"* ]]; then
+                sed -i '' "s|^OLMOCR_API_KEY=.*|OLMOCR_API_KEY=$OCR_API_KEY|" .env
+            else
+                sed -i "s|^OLMOCR_API_KEY=.*|OLMOCR_API_KEY=$OCR_API_KEY|" .env
+            fi
             print_color "$GREEN" "✓ OCR API key configured"
         else
             echo "OLMOCR_API_KEY=$OCR_API_KEY" >> .env
             print_color "$GREEN" "✓ OCR API key added to .env"
         fi
     else
-        print_color "$YELLOW" "Note: OCR API key not configured. You can add it later to .env"
+        print_color "$YELLOW" "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        print_color "$YELLOW" "⚠  IMPORTANT: OCR API key not configured"
+        print_color "$YELLOW" "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        print_color "$YELLOW" "  The system REQUIRES an olmOCR API key to function."
+        print_color "$YELLOW" "  Add it to $INSTALL_DIR/.env before running:"
+        print_color "$YELLOW" "    OLMOCR_API_KEY=sk-your-api-key-here"
+        print_color "$YELLOW" "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     fi
 }
 
 # Function to run tests
 run_tests() {
-    print_color "$BLUE" "Running basic tests..."
+    print_color "$BLUE" "Running verification tests..."
+
+    local all_passed=true
 
     # Test pyvips import
     if uv run python -c "import pyvips; print('✓ pyvips works')" 2>/dev/null; then
         print_color "$GREEN" "✓ pyvips import successful"
     else
         print_color "$RED" "✗ pyvips import failed - libvips may not be installed correctly"
-        return 1
+        all_passed=false
     fi
 
     # Test Playwright
@@ -346,7 +426,16 @@ run_tests() {
             print_color "$GREEN" "✓ Playwright import successful"
         else
             print_color "$RED" "✗ Playwright import failed"
-            return 1
+            all_passed=false
+        fi
+
+        # Verify Chrome for Testing is actually installed
+        if uv run playwright install chromium --dry-run --channel=cft 2>&1 | grep -q "is already installed"; then
+            print_color "$GREEN" "✓ Chrome for Testing is installed and ready"
+        else
+            print_color "$RED" "✗ Chrome for Testing not detected"
+            print_color "$YELLOW" "  System may not work correctly - screenshots won't be deterministic"
+            all_passed=false
         fi
     fi
 
@@ -355,10 +444,23 @@ run_tests() {
         print_color "$GREEN" "✓ CLI tool works"
     else
         print_color "$RED" "✗ CLI tool failed"
-        return 1
+        all_passed=false
     fi
 
-    return 0
+    # Test environment configuration
+    if [ -f ".env" ]; then
+        if grep -q "^OLMOCR_API_KEY=sk-" .env 2>/dev/null; then
+            print_color "$GREEN" "✓ OCR API key configured in .env"
+        else
+            print_color "$YELLOW" "⚠ OCR API key not set - system will not work until configured"
+        fi
+    fi
+
+    if [ "$all_passed" = true ]; then
+        return 0
+    else
+        return 1
+    fi
 }
 
 # Function to create launcher script
@@ -424,13 +526,15 @@ main() {
     setup_config
 
     # Run tests
+    echo
     if run_tests; then
         print_color "$GREEN" "✓ All tests passed"
     else
-        print_color "$YELLOW" "⚠ Some tests failed, but installation completed"
+        print_color "$YELLOW" "⚠ Some tests failed - review messages above"
     fi
 
     # Create launcher
+    echo
     create_launcher
 
     # Print success message
@@ -441,18 +545,38 @@ main() {
     echo
     print_color "$BLUE" "Quick Start:"
     print_color "$BLUE" "  cd $INSTALL_DIR"
+
+    if [ -z "$OCR_API_KEY" ]; then
+        print_color "$YELLOW" "  # FIRST: Add your OCR API key to .env"
+        print_color "$YELLOW" "  nano .env  # (set OLMOCR_API_KEY=sk-...)"
+        print_color "$YELLOW" ""
+        print_color "$BLUE" "  # THEN: Run your first capture"
+    fi
+
     print_color "$BLUE" "  uv run python -m scripts.mdwb_cli fetch https://example.com"
     echo
     print_color "$BLUE" "Or use the launcher:"
     print_color "$BLUE" "  $INSTALL_DIR/mdwb fetch https://example.com"
     echo
 
-    if [ -z "$OCR_API_KEY" ]; then
-        print_color "$YELLOW" "Don't forget to add your OCR API key to $INSTALL_DIR/.env"
-        print_color "$YELLOW" "  OLMOCR_API_KEY=your-api-key-here"
+    if [ "$INSTALL_BROWSERS" = true ]; then
+        print_color "$BLUE" "Chrome for Testing Information:"
+        print_color "$BLUE" "  • Ensures deterministic, reproducible screenshots"
+        print_color "$BLUE" "  • Version recorded in every manifest.json"
+        print_color "$BLUE" "  • Check your .env for CFT_VERSION and CFT_LABEL settings"
+        echo
     fi
 
-    echo
+    if [ -z "$OCR_API_KEY" ]; then
+        print_color "$RED" "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        print_color "$RED" "  ACTION REQUIRED: Set your OCR API key in .env"
+        print_color "$RED" "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        print_color "$YELLOW" "  Edit: $INSTALL_DIR/.env"
+        print_color "$YELLOW" "  Set: OLMOCR_API_KEY=sk-your-actual-api-key"
+        print_color "$RED" "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo
+    fi
+
     print_color "$GREEN" "Happy browsing! 🎉"
 }
 
