@@ -83,46 +83,74 @@ async def capture_screenshots():
 
         print("\n📸 Capturing AFTER screenshots: Browser UI with markdown...")
 
-        # 2. Load the browser UI with finviz URL
-        await page.goto("http://localhost:8000/browser?url=https://finviz.com", wait_until="load", timeout=30000)
-        print("   Browser UI loaded, waiting for content processing...")
+        # 2. Load the browser UI
+        await page.goto("http://localhost:8000/browser", wait_until="load", timeout=30000)
+        print("   Browser UI loaded")
         
-        # Wait for the welcome message to disappear and content to load
-        # We'll wait for status bar to show it's done
-        await page.wait_for_timeout(5000)
+        # 3. Enter the URL in the input field and press Enter
+        print("   Entering finviz.com URL and pressing Enter...")
+        await page.fill("#url-input", "https://finviz.com")
+        await page.press("#url-input", "Enter")
         
-        # Wait for rendered content to appear (not the welcome message)
+        # 4. Wait for the welcome message to be REPLACED with actual content
+        print("   Waiting for finviz content to load (this may take 30-60 seconds)...")
         try:
             await page.wait_for_function(
                 """() => {
                     const content = document.querySelector('#rendered-content');
                     if (!content) return false;
                     const text = content.textContent || '';
-                    // Check if it has real content, not just the welcome message
-                    return text.includes('Finviz') || text.includes('DOW') || text.length > 500;
+                    // Wait until the welcome message is gone and replaced with real content
+                    const hasWelcome = text.includes('Welcome to Markdown Web Browser');
+                    const hasFinviz = text.includes('Finviz') || text.includes('DOW') || text.includes('NASDAQ') || text.includes('S&P 500');
+                    return !hasWelcome && hasFinviz;
                 }""",
-                timeout=120000  # 2 minutes for finviz to be captured and processed
+                timeout=180000  # 3 minutes for finviz to be captured and processed
             )
-            print("   ✓ Content loaded successfully")
+            print("   ✓ Content loaded successfully - finviz data detected!")
         except Exception as e:
-            print(f"   ⚠️  Warning: Timeout waiting for content, proceeding anyway: {e}")
+            print(f"   ⚠️  Warning: Timeout waiting for content: {e}")
+            
+            # Debug: Check what's actually in the content
+            content_text = await page.evaluate("""() => {
+                const content = document.querySelector('#rendered-content');
+                return content ? content.textContent.substring(0, 300) : 'NO CONTENT';
+            }""")
+            print(f"   Content preview: {content_text[:150]}...")
         
+        # Extra wait to ensure rendering is complete
         await page.wait_for_timeout(2000)
 
-        # 3. Capture RENDERED view first (it's the default)
+        # 5. Capture RENDERED view (should be active by default)
         await page.screenshot(path=str(output_dir / "finviz_after_rendered.png"), full_page=True)
         print("✅ Saved: docs/images/finviz_after_rendered.png")
 
-        # 4. Click "Raw" button to show raw markdown
+        # 6. Click "Raw" button to show raw markdown
         print("   Switching to raw markdown view...")
         try:
-            await page.click("#raw-btn")
-            await page.wait_for_timeout(1000)
+            await page.click("#raw-btn", force=True)
+            await page.wait_for_timeout(1500)
             
-            # Wait for raw content to be visible
-            await page.wait_for_selector("#raw-content.active", timeout=5000)
+            # Wait for raw content to be visible and have content
+            await page.wait_for_function(
+                """() => {
+                    const rawView = document.querySelector('#raw-view');
+                    const rawContent = document.querySelector('#raw-content');
+                    if (!rawView || !rawContent) return false;
+                    
+                    // Check if raw view is active (has 'active' class)
+                    const isActive = rawView.classList.contains('active');
+                    
+                    // Check if raw content has actual markdown text
+                    const hasContent = rawContent.textContent.length > 100;
+                    
+                    return isActive && hasContent;
+                }""",
+                timeout=5000
+            )
+            print("   ✓ Switched to raw view successfully")
         except Exception as e:
-            print(f"   ⚠️  Note: Could not switch to raw view: {e}")
+            print(f"   ⚠️  Warning: Could not switch to raw view properly: {e}")
 
         await page.screenshot(path=str(output_dir / "finviz_after_raw.png"), full_page=True)
         print("✅ Saved: docs/images/finviz_after_raw.png")
