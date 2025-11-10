@@ -398,8 +398,25 @@ def _build_payload(tiles: Sequence[_EncodedTile], *, use_fp8: bool) -> dict:
     if not model.startswith("allenai/") and "olmOCR" in model:
         model = f"allenai/{model.split('-FP8')[0]}"  # Remove -FP8 suffix and add prefix
 
-    # Build content array with all tile images
-    content = []
+    # Build content array starting with OCR instruction
+    content = [{
+        "type": "text",
+        "text": (
+            "You are performing OCR (Optical Character Recognition). "
+            "Extract EVERY SINGLE piece of visible text from this image with absolute completeness. "
+            "Your task is TRANSCRIPTION, not summarization. "
+            "Include every word, number, symbol, punctuation mark, label, heading, button text, link text, "
+            "caption, tooltip, badge, tag, and any other visible text element. "
+            "This includes text that appears within or as part of figures, visualizations, charts, graphs, "
+            "diagrams, infographics, maps, or any other graphical elements. "
+            "Do not skip anything. Do not paraphrase. Do not summarize. Do not indicate omissions. "
+            "If you see text, transcribe it character-for-character. "
+            "Preserve the visual structure and layout using markdown formatting. "
+            "Be exhaustive and complete - missing even a single visible text element is unacceptable."
+        )
+    }]
+
+    # Add all tile images
     for tile in tiles:
         content.append({
             "type": "image_url",
