@@ -54,3 +54,4 @@
 # - github.org
 # - github.repo
 # - sync.branch - Git branch for beads commits (use BEADS_SYNC_BRANCH env var or bd config set)
+sync-branch: beads-sync
