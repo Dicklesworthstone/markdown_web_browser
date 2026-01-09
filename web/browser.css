@@ -514,13 +514,53 @@ body {
     color: #ccc;
 }
 
-/* Ensure Prism token colors display properly by boosting specificity */
-#raw-view code[class*="language-"] .token {
-    /* Reset any inherited color so Prism's token-specific colors work */
-    color: inherit;
+/* Prism token color overrides for Tomorrow theme - needed for specificity */
+
+/* Markdown-specific token colors */
+#raw-view .token.title,
+#raw-view .token.title .token.punctuation {
+    color: #6196cc !important; /* Blue for headings */
 }
 
-/* Prism token color overrides for Tomorrow theme - needed for specificity */
+#raw-view .token.bold {
+    color: #f08d49 !important; /* Orange for bold */
+    font-weight: bold;
+}
+
+#raw-view .token.italic {
+    color: #7ec699 !important; /* Green for italic */
+    font-style: italic;
+}
+
+#raw-view .token.strike {
+    color: #e2777a !important; /* Pink for strikethrough */
+    text-decoration: line-through;
+}
+
+#raw-view .token.list.punctuation {
+    color: #f08d49 !important; /* Orange for list markers */
+}
+
+#raw-view .token.url,
+#raw-view .token.url-reference,
+#raw-view .token.link {
+    color: #67cdcc !important; /* Cyan for URLs */
+}
+
+#raw-view .token.code,
+#raw-view .token.code-snippet {
+    color: #c94922 !important; /* Red for inline code */
+}
+
+#raw-view .token.hr.punctuation {
+    color: #999999 !important; /* Gray for horizontal rules */
+}
+
+#raw-view .token.blockquote.punctuation {
+    color: #999999 !important; /* Gray for blockquote markers */
+}
+
+/* General programming language token colors */
 #raw-view .token.comment,
 #raw-view .token.prolog,
 #raw-view .token.doctype,

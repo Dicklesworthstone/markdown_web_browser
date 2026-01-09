@@ -229,10 +229,12 @@ class _AdaptiveLimiter:
         try:
             yield
         finally:
-            if self._pending_reduction > 0:
-                self._pending_reduction -= 1
-            else:
-                self._semaphore.release()
+            # Protect _pending_reduction access to prevent race conditions
+            async with self._limit_lock:
+                if self._pending_reduction > 0:
+                    self._pending_reduction -= 1
+                else:
+                    self._semaphore.release()
 
     async def record(self, telemetry: OCRBatchTelemetry) -> OcrAutotuneEvent | None:
         event = self._controller.observe(telemetry)
@@ -395,83 +397,24 @@ def _build_payload(tiles: Sequence[_EncodedTile], *, use_fp8: bool) -> dict:
 
     # Add allenai/ prefix if not present (for DeepInfra)
     model = tiles[0].model
+    if not model:
+        raise ValueError("Model must be specified for OCR requests")
     if not model.startswith("allenai/") and "olmOCR" in model:
         model = f"allenai/{model.split('-FP8')[0]}"  # Remove -FP8 suffix and add prefix
 
-    # Build content array starting with OCR instruction
+    # olmOCR's official prompt from build_no_anchoring_v4_yaml_prompt()
+    # https://github.com/allenai/olmocr/blob/main/olmocr/prompts/prompts.py
+    # Note: Model doesn't format output with markdown syntax (headings, bold, etc) despite instructions
     content = [{
         "type": "text",
         "text": (
-            "You are performing OCR (Optical Character Recognition) with GitHub-Flavored Markdown (GFM) formatting. "
-            "Extract EVERY SINGLE piece of visible text from this image with absolute completeness AND proper formatting. "
-            "\n\n"
-            "CRITICAL REQUIREMENTS:\n"
-            "1. COMPLETENESS - EXTRACT EVERY SINGLE VISIBLE TEXT ELEMENT:\n"
-            "   Your task is TRANSCRIPTION, not summarization. You must include:\n"
-            "   - Every word, number, symbol, and punctuation mark\n"
-            "   - ALL UI elements: buttons, links, labels, tabs, menus, navigation items\n"
-            "   - ALL metadata: captions, tooltips, badges, tags, timestamps, author names, counts\n"
-            "   - ALL headings, subheadings, titles, and section headers\n"
-            "   - ALL body text, paragraphs, and descriptions\n"
-            "   - ALL text within or as part of figures, visualizations, charts, graphs, diagrams, infographics, maps\n"
-            "   - ALL text overlays, annotations, callouts, and labels on images\n"
-            "   - ALL table content including headers, data cells, and footers\n"
-            "   - ALL list items, whether bulleted, numbered, or definition lists\n"
-            "   - ALL code snippets, commands, file names, and technical content\n"
-            "   - ALL footer text, copyright notices, fine print, and disclaimers\n"
-            "   \n"
-            "   RULES: Do not skip anything. Do not paraphrase. Do not summarize. Do not use ellipsis (...) or "
-            "   indicate omissions. Do not say 'various items' or 'multiple entries'. If you see text ANYWHERE "
-            "   on the page - in the main content, in sidebars, in headers, in footers, in popups, in graphical "
-            "   elements, in background images - transcribe it character-for-character.\n"
-            "\n"
-            "2. FORMATTING PRESERVATION: You MUST preserve the original text formatting using proper GitHub-Flavored Markdown:\n"
-            "   - **Bold text**: Use **text** or __text__ for any text that appears bold/heavy/thick in the original\n"
-            "   - *Italic text*: Use *text* or _text_ for any text that appears italic/slanted in the original\n"
-            "   - ***Bold AND italic***: Use ***text*** for text that is both bold and italic\n"
-            "   - Headings: Use # ## ### #### ##### ###### based on visual hierarchy and font size\n"
-            "   - Bullet lists: Use -, *, or + for unordered lists, preserving indentation for nested items\n"
-            "   - Numbered lists: Use 1. 2. 3. etc. for ordered lists, preserving indentation for nested items\n"
-            "   - Links: Use [link text](url) format when you can identify clickable links\n"
-            "   - Inline code: Use `code` for monospace/code-like text\n"
-            "   - Code blocks: Use ```language\\ncode\\n``` for multi-line code sections\n"
-            "   - Blockquotes: Use > for quoted or indented text blocks\n"
-            "   - ~~Strikethrough~~: Use ~~text~~ for crossed-out text\n"
-            "   - Horizontal rules: Use --- or *** for visual separators/dividers\n"
-            "   - Task lists: Use - [ ] for unchecked and - [x] for checked checkboxes\n"
-            "\n"
-            "3. TABLES: For tabular data, use proper Markdown table syntax:\n"
-            "   - Use | to separate columns\n"
-            "   - Use |---|---| for the header separator row\n"
-            "   - Align columns properly using |:---|:---:| (left/center/right alignment)\n"
-            "   - For nested tables or complex layouts, use nested markdown tables or describe the structure\n"
-            "   - Preserve ALL table content including headers, data cells, and footers\n"
-            "   - Example:\n"
-            "     | Column 1 | Column 2 |\n"
-            "     |----------|----------|\n"
-            "     | Data 1   | Data 2   |\n"
-            "\n"
-            "4. VISUAL STRUCTURE: Preserve spacing, paragraph breaks, line breaks, and visual hierarchy. "
-            "Use blank lines to separate paragraphs and sections. Maintain the original reading order and layout.\n"
-            "\n"
-            "5. TEXT IN GRAPHICAL ELEMENTS - CRITICAL:\n"
-            "   This is especially important: Many pages embed text INSIDE images, charts, diagrams, and other "
-            "   graphical elements. You MUST extract ALL text that appears within or as part of:\n"
-            "   - Figures and images with text overlays, labels, or captions\n"
-            "   - Charts and graphs (axis labels, data labels, legends, titles)\n"
-            "   - Diagrams and flowcharts (node labels, connector text, annotations)\n"
-            "   - Infographics (all embedded text and data)\n"
-            "   - Maps (location names, labels, legends)\n"
-            "   - Screenshots (all visible UI text within the screenshot)\n"
-            "   - Icons with text labels or badges\n"
-            "   - Any other graphical elements containing text\n"
-            "   \n"
-            "   Do not just describe the image - EXTRACT THE TEXT from within it. If an image contains readable "
-            "   text, that text must appear in your markdown output. Use ![alt text](url) for purely decorative "
-            "   images without text.\n"
-            "\n"
-            "REMEMBER: Missing text is unacceptable. Incorrect formatting is unacceptable. You must capture BOTH "
-            "the complete text content AND its visual formatting using proper GitHub-Flavored Markdown syntax."
+            "Attached is one page of a document that you must process. "
+            "Just return the plain text representation of this document as if you were reading it naturally. "
+            "Convert equations to LaTeX and tables to HTML.\n"
+            "If there are any figures or charts, label them with the following markdown syntax "
+            "![Alt text describing the contents of the figure](page_startx_starty_width_height.png)\n"
+            "Return your output as markdown, with a front matter section on top specifying values for the "
+            "primary_language, is_rotation_valid, rotation_correction, is_table, and is_diagram parameters."
         )
     }]
 
@@ -490,7 +433,8 @@ def _build_payload(tiles: Sequence[_EncodedTile], *, use_fp8: bool) -> dict:
             "role": "user",
             "content": content
         }],
-        "max_tokens": 4096
+        "max_tokens": 8000,  # Match olmOCR toolkit configuration
+        "temperature": 0.1  # Low temperature for deterministic OCR output (per olmOCR docs)
     }
 
 

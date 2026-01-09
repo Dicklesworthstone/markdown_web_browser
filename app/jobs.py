@@ -948,7 +948,7 @@ def _build_cache_key(*, config: CaptureConfig, settings: Settings) -> str:
         "mask_selectors": list(settings.browser.screenshot_mask_selectors),
         "ocr_model": settings.ocr.model,
         "ocr_use_fp8": settings.ocr.use_fp8,
-        "ocr_prompt_version": "v3_deepseek_gfm",  # Bump this when OCR prompt/model changes
+        "ocr_prompt_version": "v8_plain_text_accepted",  # Bump this when OCR prompt/model changes
         "profile_id": config.profile_id or "",
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()

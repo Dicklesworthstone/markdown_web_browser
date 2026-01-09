@@ -435,11 +435,17 @@ function renderMarkdown(markdown) {
 
 function renderRawMarkdown(markdown) {
     // Apply syntax highlighting using Prism.highlight()
-    if (typeof Prism !== 'undefined' && Prism.languages.markdown) {
-        const highlighted = Prism.highlight(markdown, Prism.languages.markdown, 'markdown');
-        elements.rawContent.innerHTML = highlighted;
-    } else {
-        // Fallback if Prism isn't loaded
+    try {
+        if (typeof Prism !== 'undefined' && Prism.languages.markdown) {
+            const highlighted = Prism.highlight(markdown, Prism.languages.markdown, 'markdown');
+            elements.rawContent.innerHTML = highlighted;
+        } else {
+            // Fallback if Prism isn't loaded
+            elements.rawContent.textContent = markdown;
+        }
+    } catch (error) {
+        console.error('Error highlighting markdown:', error);
+        // Fallback to plain text if highlighting fails
         elements.rawContent.textContent = markdown;
     }
 }
