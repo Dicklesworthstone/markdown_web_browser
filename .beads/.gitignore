@@ -33,3 +33,6 @@ beads.right.meta.json
 
 # Compressed daemon logs (timestamped)
 daemon-*.log.gz
+
+# bv (beads viewer) lock file
+.bv.lock
