@@ -224,3 +224,6 @@ test_report_*
 test-outputs/
 
 ops/warnings.jsonl
+
+# bv (beads viewer) local config and caches
+.bv/
