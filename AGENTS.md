@@ -435,3 +435,234 @@ fix: $IMPORTS
 * **Structure-sensitive changes** or **bulk refactors** → `ast-grep` rules (often YAML) with `inside/has/not`, `constraints`, `transform`, and sometimes `rewriters`.
 * **Fast reconnaissance** or **non‑code assets** → `ripgrep`; pipe file lists into `ast-grep` when precision or rewriting begins.
 
+---
+
+## bv — Graph-Aware Triage Engine
+
+bv is a graph-aware triage engine for Beads projects (`.beads/beads.jsonl`). It computes PageRank, betweenness, critical path, cycles, HITS, eigenvector, and k-core metrics deterministically.
+
+**CRITICAL: Use ONLY `--robot-*` flags. Bare `bv` launches an interactive TUI that blocks your session.**
+
+### The Workflow: Start With Triage
+
+**`bv --robot-triage` is your single entry point.** It returns:
+- `quick_ref`: at-a-glance counts + top 3 picks
+- `recommendations`: ranked actionable items with scores, reasons, unblock info
+- `quick_wins`: low-effort high-impact items
+- `blockers_to_clear`: items that unblock the most downstream work
+- `project_health`: status/type/priority distributions, graph metrics
+- `commands`: copy-paste shell commands for next steps
+
+```bash
+bv --robot-triage        # THE MEGA-COMMAND: start here
+bv --robot-next          # Minimal: just the single top pick + claim command
+```
+
+### Command Reference
+
+**Planning:**
+| Command | Returns |
+|---------|---------|
+| `--robot-plan` | Parallel execution tracks with `unblocks` lists |
+| `--robot-priority` | Priority misalignment detection with confidence |
+
+**Graph Analysis:**
+| Command | Returns |
+|---------|---------|
+| `--robot-insights` | Full metrics: PageRank, betweenness, HITS, eigenvector, critical path, cycles, k-core |
+| `--robot-label-health` | Per-label health: `health_level`, `velocity_score`, `staleness`, `blocked_count` |
+
+### jq Quick Reference
+
+```bash
+bv --robot-triage | jq '.quick_ref'                        # At-a-glance summary
+bv --robot-triage | jq '.recommendations[0]'               # Top recommendation
+bv --robot-plan | jq '.plan.summary.highest_impact'        # Best unblock target
+bv --robot-insights | jq '.Cycles'                         # Circular deps (must fix!)
+```
+
+---
+
+## UBS — Ultimate Bug Scanner
+
+**Golden Rule:** `ubs <changed-files>` before every commit. Exit 0 = safe. Exit >0 = fix & re-run.
+
+### Commands
+
+```bash
+ubs file.py file2.py                        # Specific files (< 1s) — USE THIS
+ubs $(git diff --name-only --cached)        # Staged files — before commit
+ubs --only=python src/                      # Language filter (3-5x faster)
+ubs .                                       # Whole project
+```
+
+### Output Format
+
+```
+⚠️  Category (N errors)
+    file.py:42:5 – Issue description
+    💡 Suggested fix
+Exit code: 1
+```
+
+Parse: `file:line:col` → location | 💡 → how to fix | Exit 0/1 → pass/fail
+
+### Fix Workflow
+
+1. Read finding → category + fix suggestion
+2. Navigate `file:line:col` → view context
+3. Verify real issue (not false positive)
+4. Fix root cause (not symptom)
+5. Re-run `ubs <file>` → exit 0
+6. Commit
+
+### Bug Severity
+
+- **Critical (always fix):** Command injection, unquoted variables, eval with user input
+- **Important (production):** Missing error handling, unset variables, unsafe pipes
+- **Contextual (judgment):** TODO/FIXME, echo debugging
+
+---
+
+## Morph Warp Grep — AI-Powered Code Search
+
+**Use `mcp__morph-mcp__warp_grep` for exploratory "how does X work?" questions.** An AI agent expands your query, greps the codebase, reads relevant files, and returns precise line ranges with full context.
+
+**Use `ripgrep` for targeted searches.** When you know exactly what you're looking for.
+
+### When to Use What
+
+| Scenario | Tool | Why |
+|----------|------|-----|
+| "How is OCR tiling implemented?" | `warp_grep` | Exploratory; don't know where to start |
+| "Where is the viewport sweep handler?" | `warp_grep` | Need to understand architecture |
+| "Find all uses of `pyvips`" | `ripgrep` | Targeted literal search |
+| "Replace all `os.getenv` with decouple" | `ast-grep` | Structural refactor |
+
+### warp_grep Usage
+
+```
+mcp__morph-mcp__warp_grep(
+  repoPath: "/data/projects/markdown_web_browser",
+  query: "How does the capture system handle viewport sweeps?"
+)
+```
+
+### Anti-Patterns
+
+- **Don't** use `warp_grep` to find a specific function name → use `ripgrep`
+- **Don't** use `ripgrep` to understand "how does X work" → wastes time with manual reads
+
+---
+
+## cass — Cross-Agent Session Search
+
+`cass` indexes prior agent conversations (Claude Code, Codex, Cursor, Gemini, ChatGPT, etc.) so we can reuse solved problems.
+
+**Rules:** Never run bare `cass` (TUI). Always use `--robot` or `--json`.
+
+### Examples
+
+```bash
+cass health
+cass search "OCR tiling" --robot --limit 5
+cass view /path/to/session.jsonl -n 42 --json
+cass expand /path/to/session.jsonl -n 42 -C 3 --json
+cass capabilities --json
+cass robot-docs guide
+```
+
+### Tips
+
+- Use `--fields minimal` for lean output
+- Filter by agent with `--agent`
+- Use `--days N` to limit to recent history
+
+stdout is data-only, stderr is diagnostics; exit code 0 means success.
+
+Treat cass as a way to avoid re-solving problems other agents already handled.
+
+---
+
+<!-- bv-agent-instructions-v1 -->
+
+## Beads Workflow Integration
+
+This project uses [beads_viewer](https://github.com/Dicklesworthstone/beads_viewer) for issue tracking. Issues are stored in `.beads/` and tracked in git.
+
+### Essential Commands
+
+```bash
+# CLI commands for agents
+bd ready              # Show issues ready to work (no blockers)
+bd list --status=open # All open issues
+bd show <id>          # Full issue details with dependencies
+bd create --title="..." --type=task --priority=2
+bd update <id> --status=in_progress
+bd close <id> --reason="Completed"
+bd close <id1> <id2>  # Close multiple issues at once
+bd sync               # Commit and push changes
+```
+
+### Workflow Pattern
+
+1. **Start**: Run `bd ready` to find actionable work
+2. **Claim**: Use `bd update <id> --status=in_progress`
+3. **Work**: Implement the task
+4. **Complete**: Use `bd close <id>`
+5. **Sync**: Always run `bd sync` at session end
+
+### Key Concepts
+
+- **Dependencies**: Issues can block other issues. `bd ready` shows only unblocked work.
+- **Priority**: P0=critical, P1=high, P2=medium, P3=low, P4=backlog (use numbers, not words)
+- **Types**: task, bug, feature, epic, question, docs
+
+<!-- end-bv-agent-instructions -->
+
+---
+
+## Landing the Plane (Session Completion)
+
+**When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until `git push` succeeds.
+
+**MANDATORY WORKFLOW:**
+
+1. **File issues for remaining work** - Create issues for anything that needs follow-up
+2. **Run quality gates** (if code changed) - Tests, linters, builds
+3. **Update issue status** - Close finished work, update in-progress items
+4. **PUSH TO REMOTE** - This is MANDATORY:
+   ```bash
+   git pull --rebase
+   bd sync
+   git push
+   git status  # MUST show "up to date with origin"
+   ```
+5. **Clean up** - Clear stashes, prune remote branches
+6. **Verify** - All changes committed AND pushed
+7. **Hand off** - Provide context for next session
+
+**CRITICAL RULES:**
+- Work is NOT complete until `git push` succeeds
+- NEVER stop before pushing - that leaves work stranded locally
+- NEVER say "ready to push when you are" - YOU must push
+- If push fails, resolve and retry until it succeeds
+
+---
+
+## Note for Codex/GPT-5.2
+
+You constantly bother me and stop working with concerned questions that look similar to this:
+
+```
+Unexpected changes (need guidance)
+
+- Working tree still shows edits I did not make in pyproject.toml, app/capture.py, app/ocr.py, tests/smoke_capture.spec.ts. Please advise whether to keep/commit/revert these before any further work. I did not touch them.
+
+Next steps (pick one)
+
+1. Decide how to handle the unrelated modified files above so we can resume cleanly.
+```
+
+NEVER EVER DO THAT AGAIN. The answer is literally ALWAYS the same: those are changes created by the potentially dozen of other agents working on the project at the same time. This is not only a common occurence, it happens multiple times PER MINUTE. The way to deal with it is simple: you NEVER, under ANY CIRCUMSTANCE, stash, revert, overwrite, or otherwise disturb in ANY way the work of other agents. Just treat those changes identically to changes that you yourself made. Just fool yourself into thinking YOU made the changes and simply don't recall it for some reason.
+
