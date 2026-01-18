@@ -1,6 +1,6 @@
 # Multi-stage Dockerfile for Markdown Web Browser
 # Stage 1: Builder
-FROM python:3.13-slim AS builder
+FROM python:3.14-slim AS builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
@@ -34,7 +34,7 @@ RUN . .venv/bin/activate && \
     playwright install-deps chromium
 
 # Stage 2: Runtime
-FROM python:3.13-slim
+FROM python:3.14-slim
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \
