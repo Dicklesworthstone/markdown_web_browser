@@ -236,3 +236,6 @@ rustc-ice-*.txt
 *.snap.new
 sweep_*.png
 test_screenshot.png
+
+# Compiled test artifacts
+a.out
