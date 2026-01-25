@@ -261,6 +261,8 @@ mdwb demo stream
 - No import or dependency errors
 - Server responds on localhost:8000
 
+**Tip:** Any `mdwb` CLI command that supports `--json` also accepts `--format toon` for TOON output (falls back to JSON if `tru` is unavailable).
+
 **Step 2: Capture a Real Page**
 ```bash
 # Start with a simple page

@@ -170,6 +170,19 @@ def test_demo_snapshot_json_output(monkeypatch):
     assert '"links": []' in result.output
 
 
+def test_demo_snapshot_toon_fallback(monkeypatch):
+    payload = {"id": "demo-toon", "links": []}
+    responses = {"/jobs/demo": StubResponse(payload)}
+    _patch_client_ctx(monkeypatch, responses)
+    monkeypatch.setattr(mdwb_cli, "_resolve_settings", lambda base: _fake_settings())
+    monkeypatch.setattr(mdwb_cli, "_toon_available", lambda: False)
+
+    result = runner.invoke(mdwb_cli.cli, ["demo", "snapshot", "--format", "toon"])
+
+    assert result.exit_code == 0
+    assert '"id": "demo-toon"' in result.output
+
+
 def test_demo_links_prints_table(monkeypatch):
     links = [
         {"text": "Homepage", "href": "https://example.com", "source": "dom", "delta": "match"},

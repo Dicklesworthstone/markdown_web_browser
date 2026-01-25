@@ -9,6 +9,7 @@ import io
 import json
 import math
 import os
+import shutil
 import shlex
 import subprocess
 import time
@@ -24,6 +25,7 @@ from typing import (
     Iterable,
     Iterator,
     Mapping,
+    Literal,
     Optional,
     Sequence,
     TextIO,
@@ -65,6 +67,50 @@ jobs_webhooks_cli = typer.Typer(help="Manage job webhooks.")
 jobs_cli.add_typer(jobs_webhooks_cli, name="webhooks")
 warnings_cli = typer.Typer(help="Warning/blocklist log helpers.")
 cli.add_typer(warnings_cli, name="warnings")
+
+OutputFormat = Literal["json", "toon"]
+
+
+def _resolve_output_format(
+    json_output: bool, format_option: Optional[str]
+) -> Optional[OutputFormat]:
+    if format_option is None:
+        return "json" if json_output else None
+    normalized = format_option.strip().lower()
+    if normalized in {"json", "toon"}:
+        return normalized  # type: ignore[return-value]
+    raise typer.BadParameter("format must be 'json' or 'toon'")
+
+
+def _toon_available() -> bool:
+    return shutil.which("tru") is not None
+
+
+def _encode_toon(payload: str) -> str:
+    result = subprocess.run(
+        ["tru", "--encode"], input=payload, text=True, capture_output=True, check=True
+    )
+    return result.stdout
+
+
+def _emit_machine_payload(data: Any, *, output_format: OutputFormat) -> None:
+    if output_format == "json":
+        console.print_json(data=data)
+        return
+    json_payload = json.dumps(data, indent=2)
+    if not _toon_available():
+        typer.echo("warning: tru not available, falling back to JSON", err=True)
+        console.print_json(data=data)
+        return
+    try:
+        toon_payload = _encode_toon(json_payload)
+    except subprocess.CalledProcessError:
+        typer.echo("warning: tru --encode failed, falling back to JSON", err=True)
+        console.print_json(data=data)
+        return
+    if not toon_payload.endswith("\n"):
+        toon_payload += "\n"
+    sys.stdout.write(toon_payload)
 
 
 @dataclass
@@ -386,6 +432,9 @@ def resume_status(
     json_output: bool = typer.Option(
         False, "--json/--no-json", help="Emit JSON instead of tables."
     ),
+    output_format: Optional[str] = typer.Option(
+        None, "--format", help="Emit json or toon output."
+    ),
 ) -> None:
     """Inspect the completion state tracked by --resume."""
 
@@ -411,7 +460,8 @@ def resume_status(
     done, total = manager.status()
     entry_limit = None if limit == 0 else limit
     completed_entries = manager.list_completed_entries(entry_limit)
-    pending_entries = manager.list_pending_entries(entry_limit) if pending or json_output else []
+    resolved_format = _resolve_output_format(json_output, output_format)
+    pending_entries = manager.list_pending_entries(entry_limit) if pending or resolved_format else []
     data = {
         "root": str(manager.root),
         "done_dir": str(manager.done_dir),
@@ -425,8 +475,8 @@ def resume_status(
         "orphan_flag_hashes": orphan_flags,
         "orphan_flag_review_dir": str(review_dir),
     }
-    if json_output:
-        console.print_json(data=data)
+    if resolved_format:
+        _emit_machine_payload(data, output_format=resolved_format)
         return
 
     table = Table("Field", "Value", title="Resume Status")
@@ -491,21 +541,22 @@ def _print_job(job: dict) -> None:
         _print_seam_marker_counts(job.get("seam_marker_count"), job.get("seam_hash_count"))
 
 
-def _print_ocr_metrics(manifest: dict[str, Any], *, json_output: bool) -> None:
+def _print_ocr_metrics(manifest: dict[str, Any], *, output_format: Optional[OutputFormat]) -> None:
     batches = manifest.get("ocr_batches") or []
     quota = manifest.get("ocr_quota") or {}
     autotune = manifest.get("ocr_autotune") or {}
     seam_markers = manifest.get("seam_markers") or []
     seam_marker_events = manifest.get("seam_marker_events") or []
-    if json_output:
-        console.print_json(
-            data={
+    if output_format:
+        _emit_machine_payload(
+            {
                 "batches": batches,
                 "quota": quota,
                 "autotune": autotune,
                 "seam_markers": seam_markers,
                 "seam_marker_events": seam_marker_events,
-            }
+            },
+            output_format=output_format,
         )
         return
 
@@ -1173,7 +1224,7 @@ def show(
                 "[yellow]Manifest not available yet; try again after the job completes.[/]"
             )
         else:
-            _print_ocr_metrics(manifest, json_output=False)
+            _print_ocr_metrics(manifest, output_format=None)
 
 
 def _fetch_job_snapshot(
@@ -1206,6 +1257,9 @@ def diag(
     json_output: bool = typer.Option(
         False, "--json/--no-json", help="Emit JSON payload instead of tables."
     ),
+    output_format: Optional[str] = typer.Option(
+        None, "--format", help="Emit json or toon output."
+    ),
 ) -> None:
     """Print manifest/environment details for a job."""
 
@@ -1236,8 +1290,9 @@ def diag(
         "manifest_source": manifest_source,
         "manifest_error": manifest_error,
     }
-    if json_output:
-        console.print_json(data=payload)
+    resolved_format = _resolve_output_format(json_output, output_format)
+    if resolved_format:
+        _emit_machine_payload(payload, output_format=resolved_format)
         return
     _print_diag_report(snapshot, manifest, manifest_source, manifest_error)
 
@@ -1331,6 +1386,9 @@ def watch(
 def demo_snapshot(
     api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
     json_output: bool = typer.Option(False, "--json", help="Print raw JSON instead of tables."),
+    output_format: Optional[str] = typer.Option(
+        None, "--format", help="Emit json or toon output."
+    ),
 ) -> None:
     """Fetch the demo job snapshot from /jobs/demo."""
 
@@ -1339,8 +1397,9 @@ def demo_snapshot(
         response = client.get("/jobs/demo")
         response.raise_for_status()
         data = response.json()
-    if json_output:
-        console.print_json(data=data)
+    resolved_format = _resolve_output_format(json_output, output_format)
+    if resolved_format:
+        _emit_machine_payload(data, output_format=resolved_format)
     else:
         _print_job(data)
         if links := data.get("links"):
@@ -1351,6 +1410,9 @@ def demo_snapshot(
 def demo_links(
     api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
     json_output: bool = typer.Option(False, "--json", help="Print raw JSON."),
+    output_format: Optional[str] = typer.Option(
+        None, "--format", help="Emit json or toon output."
+    ),
 ) -> None:
     """Fetch the demo links JSON."""
 
@@ -1359,8 +1421,9 @@ def demo_links(
         response = client.get("/jobs/demo/links.json")
         response.raise_for_status()
         data = response.json()
-    if json_output:
-        console.print_json(data=data)
+    resolved_format = _resolve_output_format(json_output, output_format)
+    if resolved_format:
+        _emit_machine_payload(data, output_format=resolved_format)
     else:
         _print_links(data)
 
@@ -1544,13 +1607,33 @@ def _load_warning_records(path: Path, limit: int) -> list[dict[str, Any]]:
     return list(records)
 
 
-def _print_warning_records(records: list[dict[str, Any]], *, json_output: bool) -> None:
+def _print_warning_records(
+    records: list[dict[str, Any]], *, output_format: Optional[OutputFormat]
+) -> None:
     if not records:
         console.print("[dim]No warning entries found.[/]")
         return
-    if json_output:
+    if output_format == "json":
         for record in records:
             console.print(json.dumps(_augment_warning_record(record)))
+        return
+    if output_format == "toon":
+        if not _toon_available():
+            typer.echo("warning: tru not available, falling back to JSON", err=True)
+            for record in records:
+                console.print(json.dumps(_augment_warning_record(record)))
+            return
+        for record in records:
+            payload = json.dumps(_augment_warning_record(record), indent=2)
+            try:
+                toon_payload = _encode_toon(payload)
+            except subprocess.CalledProcessError:
+                typer.echo("warning: tru --encode failed, falling back to JSON", err=True)
+                console.print(json.dumps(_augment_warning_record(record)))
+                continue
+            if not toon_payload.endswith("\n"):
+                toon_payload += "\n"
+            sys.stdout.write(toon_payload)
         return
     table = Table(title="Warning Log")
     table.add_column("timestamp")
@@ -2099,7 +2182,7 @@ def _print_seam_markers(entries: Any) -> None:
         )
 
 
-def _follow_warning_log(path: Path, *, json_output: bool, interval: float) -> None:
+def _follow_warning_log(path: Path, *, output_format: Optional[OutputFormat], interval: float) -> None:
     handle: TextIO | None = None
     last_inode: int | None = None
     try:
@@ -2130,7 +2213,7 @@ def _follow_warning_log(path: Path, *, json_output: bool, interval: float) -> No
                 record = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            _print_warning_records([record], json_output=json_output)
+            _print_warning_records([record], output_format=output_format)
     finally:
         if handle:
             handle.close()
@@ -2194,22 +2277,26 @@ def warnings_tail(
     json_output: bool = typer.Option(
         False, "--json", help="Emit raw JSON lines instead of a table."
     ),
+    output_format: Optional[str] = typer.Option(
+        None, "--format", help="Emit json or toon output."
+    ),
     log_path: Optional[Path] = typer.Option(None, "--log-path", help="Override WARNING_LOG_PATH."),
 ) -> None:
     """Tail the structured warning/blocklist log."""
 
     settings = _resolve_settings(None)
     target_path = log_path or settings.warning_log_path
+    resolved_format = _resolve_output_format(json_output, output_format)
     if target_path.exists():
         records = _load_warning_records(target_path, count)
-        _print_warning_records(records, json_output=json_output)
+        _print_warning_records(records, output_format=resolved_format)
     else:
         console.print(f"[yellow]Warning log not found at {target_path}[/]")
 
     if follow:
         console.print(f"[dim]Following {target_path} (Ctrl+C to stop)...[/]")
         try:
-            _follow_warning_log(target_path, json_output=json_output, interval=interval)
+            _follow_warning_log(target_path, output_format=resolved_format, interval=interval)
         except KeyboardInterrupt:  # pragma: no cover - manual interaction
             console.print("[dim]Stopped tailing warning log.[/]")
 
@@ -2250,6 +2337,9 @@ def dom_links(
     json_output: bool = typer.Option(
         False, "--json", help="Print raw JSON list instead of a table."
     ),
+    output_format: Optional[str] = typer.Option(
+        None, "--format", help="Emit json or toon output."
+    ),
 ) -> None:
     """Extract links from a DOM snapshot using the ogf helper."""
 
@@ -2267,8 +2357,9 @@ def dom_links(
 
     records = extract_links_from_dom(path)
     data = serialize_links(records)
-    if json_output:
-        console.print_json(data=data)
+    resolved_format = _resolve_output_format(json_output, output_format)
+    if resolved_format:
+        _emit_machine_payload(data, output_format=resolved_format)
         return
     _print_links(data)
 
@@ -2280,6 +2371,9 @@ def jobs_webhooks_list(
     json_output: bool = typer.Option(
         False, "--json", help="Emit structured JSON instead of a table."
     ),
+    output_format: Optional[str] = typer.Option(
+        None, "--format", help="Emit json or toon output."
+    ),
 ) -> None:
     """List registered webhooks for a job."""
 
@@ -2288,11 +2382,16 @@ def jobs_webhooks_list(
         response = client.get(f"/jobs/{job_id}/webhooks")
         if response.status_code == 404:
             detail = _extract_detail(response) or f"Job {job_id} not found."
-            _print_webhook_list_error(detail, job_id, json_output)
+            resolved_format = _resolve_output_format(json_output, output_format)
+            _print_webhook_list_error(detail, job_id, resolved_format)
         response.raise_for_status()
         data = response.json()
-    if json_output:
-        console.print_json(data={"status": "ok", "job_id": job_id, "webhooks": data})
+    resolved_format = _resolve_output_format(json_output, output_format)
+    if resolved_format:
+        _emit_machine_payload(
+            {"status": "ok", "job_id": job_id, "webhooks": data},
+            output_format=resolved_format,
+        )
         return
     _print_webhooks(data)
 
@@ -2311,6 +2410,9 @@ def jobs_webhooks_add(
     json_output: bool = typer.Option(
         False, "--json/--no-json", help="Emit JSON payload instead of text."
     ),
+    output_format: Optional[str] = typer.Option(
+        None, "--format", help="Emit json or toon output."
+    ),
 ) -> None:
     """Register a webhook for a job."""
 
@@ -2324,11 +2426,13 @@ def jobs_webhooks_add(
             detail = _extract_detail(response) or (
                 "Job not found." if response.status_code == 404 else "Webhook rejected."
             )
-            _print_webhook_add_error(detail, job_id, json_output)
+            resolved_format = _resolve_output_format(json_output, output_format)
+            _print_webhook_add_error(detail, job_id, resolved_format)
         response.raise_for_status()
         body = response.json()
-    if json_output:
-        console.print_json(data={"status": "ok", **body})
+    resolved_format = _resolve_output_format(json_output, output_format)
+    if resolved_format:
+        _emit_machine_payload({"status": "ok", **body}, output_format=resolved_format)
         return
     console.print(
         f"[green]Registered webhook for {job_id} ({url}).[/] Trigger states: {', '.join(event) if event else 'DONE, FAILED'}."
@@ -2344,6 +2448,9 @@ def jobs_webhooks_delete(
     json_output: bool = typer.Option(
         False, "--json/--no-json", help="Emit JSON payload instead of text."
     ),
+    output_format: Optional[str] = typer.Option(
+        None, "--format", help="Emit json or toon output."
+    ),
 ) -> None:
     """Remove a webhook subscription from a job."""
 
@@ -2357,16 +2464,22 @@ def jobs_webhooks_delete(
         response, payload = _delete_job_webhooks(client, job_id, webhook_id=webhook_id, url=url)
         if response.status_code == 404:
             detail = _extract_detail(response) or "Webhook or job not found."
-            _print_delete_error(detail, job_id, json_output)
+            resolved_format = _resolve_output_format(json_output, output_format)
+            _print_delete_error(detail, job_id, resolved_format)
             return
         if response.status_code == 400:
             detail = _extract_detail(response) or "Webhook deletion rejected."
-            _print_delete_error(detail, job_id, json_output)
+            resolved_format = _resolve_output_format(json_output, output_format)
+            _print_delete_error(detail, job_id, resolved_format)
             return
         response.raise_for_status()
         body = response.json()
-    if json_output:
-        console.print_json(data={"status": "ok", **body, "request": payload})
+    resolved_format = _resolve_output_format(json_output, output_format)
+    if resolved_format:
+        _emit_machine_payload(
+            {"status": "ok", **body, "request": payload},
+            output_format=resolved_format,
+        )
         return
     console.print(f"[green]Deleted {body.get('deleted', 0)} webhook(s) from {job_id}.[/]")
 
@@ -2464,6 +2577,9 @@ def jobs_ocr_metrics(
     job_id: str = typer.Argument(..., help="Job identifier"),
     api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
     json_output: bool = typer.Option(False, "--json", help="Emit OCR telemetry as JSON"),
+    output_format: Optional[str] = typer.Option(
+        None, "--format", help="Emit json or toon output."
+    ),
 ) -> None:
     """Show OCR batch latency + quota telemetry for a job."""
 
@@ -2472,7 +2588,8 @@ def jobs_ocr_metrics(
     manifest = snapshot.get("manifest")
     if not manifest:
         raise typer.BadParameter("Manifest not available yet; rerun once the job completes.")
-    _print_ocr_metrics(manifest, json_output=json_output)
+    resolved_format = _resolve_output_format(json_output, output_format)
+    _print_ocr_metrics(manifest, output_format=resolved_format)
 
 
 @jobs_replay_cli.command("manifest")
@@ -2492,6 +2609,9 @@ def jobs_replay_manifest(
     json_output: bool = typer.Option(
         False, "--json/--no-json", help="Emit JSON instead of text output."
     ),
+    output_format: Optional[str] = typer.Option(
+        None, "--format", help="Emit json or toon output."
+    ),
 ) -> None:
     """Replay a capture manifest via POST /replay."""
 
@@ -2507,15 +2627,20 @@ def jobs_replay_manifest(
         response = client.post("/replay", json={"manifest": manifest_payload})
         if response.status_code >= 400:
             detail = _extract_detail(response) or response.text or f"HTTP {response.status_code}"
-            if json_output:
-                console.print_json(data={"status": "error", "detail": detail})
+            resolved_format = _resolve_output_format(json_output, output_format)
+            if resolved_format:
+                _emit_machine_payload(
+                    {"status": "error", "detail": detail},
+                    output_format=resolved_format,
+                )
             else:
                 console.print(f"[red]Replay failed:[/] {detail}")
             raise typer.Exit(1)
 
         job = response.json()
-    if json_output:
-        console.print_json(data={"status": "ok", "job": job})
+    resolved_format = _resolve_output_format(json_output, output_format)
+    if resolved_format:
+        _emit_machine_payload({"status": "ok", "job": job}, output_format=resolved_format)
         return
     console.print("[green]Replay submitted.[/]")
     _print_job(job)
@@ -2543,6 +2668,9 @@ def jobs_embeddings_search(
     json_output: bool = typer.Option(
         False, "--json/--no-json", help="Emit JSON instead of a table."
     ),
+    output_format: Optional[str] = typer.Option(
+        None, "--format", help="Emit json or toon output."
+    ),
 ) -> None:
     """Search section embeddings for a job."""
 
@@ -2561,31 +2689,47 @@ def jobs_embeddings_search(
             console.print(f"[red]Embeddings search failed:[/] {detail}")
             raise typer.Exit(1)
         data = response.json()
-    if json_output:
-        console.print_json(data=data)
+    resolved_format = _resolve_output_format(json_output, output_format)
+    if resolved_format:
+        _emit_machine_payload(data, output_format=resolved_format)
         return
     _print_embedding_matches(data.get("total_sections", 0), data.get("matches", []))
 
 
-def _print_delete_error(detail: str, job_id: str, json_output: bool) -> None:
-    if json_output:
-        console.print_json(data={"status": "error", "job_id": job_id, "detail": detail})
+def _print_delete_error(
+    detail: str, job_id: str, output_format: Optional[OutputFormat]
+) -> None:
+    if output_format:
+        _emit_machine_payload(
+            {"status": "error", "job_id": job_id, "detail": detail},
+            output_format=output_format,
+        )
     else:
         console.print(f"[red]{detail}[/]")
     raise typer.Exit(1)
 
 
-def _print_webhook_add_error(detail: str, job_id: str, json_output: bool) -> None:
-    if json_output:
-        console.print_json(data={"status": "error", "job_id": job_id, "detail": detail})
+def _print_webhook_add_error(
+    detail: str, job_id: str, output_format: Optional[OutputFormat]
+) -> None:
+    if output_format:
+        _emit_machine_payload(
+            {"status": "error", "job_id": job_id, "detail": detail},
+            output_format=output_format,
+        )
     else:
         console.print(f"[red]{detail}[/]")
     raise typer.Exit(1)
 
 
-def _print_webhook_list_error(detail: str, job_id: str, json_output: bool) -> None:
-    if json_output:
-        console.print_json(data={"status": "error", "job_id": job_id, "detail": detail})
+def _print_webhook_list_error(
+    detail: str, job_id: str, output_format: Optional[OutputFormat]
+) -> None:
+    if output_format:
+        _emit_machine_payload(
+            {"status": "error", "job_id": job_id, "detail": detail},
+            output_format=output_format,
+        )
     else:
         console.print(f"[red]{detail}[/]")
     raise typer.Exit(1)
