@@ -74,12 +74,36 @@ OutputFormat = Literal["json", "toon"]
 def _resolve_output_format(
     json_output: bool, format_option: Optional[str]
 ) -> Optional[OutputFormat]:
-    if format_option is None:
-        return "json" if json_output else None
-    normalized = format_option.strip().lower()
-    if normalized in {"json", "toon"}:
-        return normalized  # type: ignore[return-value]
-    raise typer.BadParameter("format must be 'json' or 'toon'")
+    """Resolve output format with precedence: CLI flag > MWB_OUTPUT_FORMAT > TOON_DEFAULT_FORMAT > default.
+
+    Args:
+        json_output: If True, treat as --json flag (returns "json")
+        format_option: Explicit --format value from CLI
+
+    Returns:
+        Output format ("json" or "toon") or None if no machine format requested
+    """
+    # CLI flag has highest precedence
+    if format_option is not None:
+        normalized = format_option.strip().lower()
+        if normalized in {"json", "toon"}:
+            return normalized  # type: ignore[return-value]
+        raise typer.BadParameter("format must be 'json' or 'toon'")
+
+    # --json flag
+    if json_output:
+        return "json"
+
+    # Check environment variables in order of precedence
+    env_format = os.environ.get("MWB_OUTPUT_FORMAT", "").strip().lower()
+    if env_format in {"json", "toon"}:
+        return env_format  # type: ignore[return-value]
+
+    env_format = os.environ.get("TOON_DEFAULT_FORMAT", "").strip().lower()
+    if env_format in {"json", "toon"}:
+        return env_format  # type: ignore[return-value]
+
+    return None
 
 
 def _toon_available() -> bool:
@@ -93,21 +117,59 @@ def _encode_toon(payload: str) -> str:
     return result.stdout
 
 
-def _emit_machine_payload(data: Any, *, output_format: OutputFormat) -> None:
+def _emit_machine_payload(
+    data: Any, *, output_format: OutputFormat, show_stats: bool = False
+) -> None:
+    """Emit data in the specified machine-readable format.
+
+    Args:
+        data: Data to serialize
+        output_format: "json" or "toon"
+        show_stats: If True, print token savings comparison to stderr
+    """
+    json_payload = json.dumps(data, indent=2)
+    json_bytes = len(json_payload.encode("utf-8"))
+
     if output_format == "json":
+        # Show potential TOON savings if stats requested
+        if show_stats and _toon_available():
+            try:
+                toon_payload = _encode_toon(json_payload)
+                toon_bytes = len(toon_payload.encode("utf-8"))
+                savings = 100 - (toon_bytes * 100 // json_bytes) if json_bytes > 0 else 0
+                typer.echo(
+                    f"[mdwb-toon] JSON: {json_bytes} bytes, TOON would be: {toon_bytes} bytes ({savings}% potential savings)",
+                    err=True,
+                )
+            except subprocess.CalledProcessError:
+                typer.echo(f"[mdwb-toon] JSON: {json_bytes} bytes (TOON unavailable for comparison)", err=True)
+        elif show_stats:
+            typer.echo(f"[mdwb-toon] JSON: {json_bytes} bytes (TOON unavailable for comparison)", err=True)
         console.print_json(data=data)
         return
-    json_payload = json.dumps(data, indent=2)
+
+    # TOON format
     if not _toon_available():
         typer.echo("warning: tru not available, falling back to JSON", err=True)
+        if show_stats:
+            typer.echo(f"[mdwb-toon] JSON: {json_bytes} bytes (TOON unavailable)", err=True)
         console.print_json(data=data)
         return
     try:
         toon_payload = _encode_toon(json_payload)
     except subprocess.CalledProcessError:
         typer.echo("warning: tru --encode failed, falling back to JSON", err=True)
+        if show_stats:
+            typer.echo(f"[mdwb-toon] JSON: {json_bytes} bytes (TOON encoding failed)", err=True)
         console.print_json(data=data)
         return
+
+    # Show stats for TOON mode
+    if show_stats:
+        toon_bytes = len(toon_payload.encode("utf-8"))
+        savings = 100 - (toon_bytes * 100 // json_bytes) if json_bytes > 0 else 0
+        typer.echo(f"[mdwb-toon] JSON: {json_bytes} bytes, TOON: {toon_bytes} bytes ({savings}% savings)", err=True)
+
     if not toon_payload.endswith("\n"):
         toon_payload += "\n"
     sys.stdout.write(toon_payload)
@@ -432,7 +494,8 @@ def resume_status(
     json_output: bool = typer.Option(
         False, "--json/--no-json", help="Emit JSON instead of tables."
     ),
-    output_format: Optional[str] = typer.Option(None, "--format", help="Emit json or toon output."),
+    output_format: Optional[str] = typer.Option(None, "--format", help="Emit json or toon output (env: MWB_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT)."),
+    stats: bool = typer.Option(False, "--stats", help="Show token savings comparison (JSON vs TOON bytes)."),
 ) -> None:
     """Inspect the completion state tracked by --resume."""
 
@@ -476,7 +539,7 @@ def resume_status(
         "orphan_flag_review_dir": str(review_dir),
     }
     if resolved_format:
-        _emit_machine_payload(data, output_format=resolved_format)
+        _emit_machine_payload(data, output_format=resolved_format, show_stats=stats)
         return
 
     table = Table("Field", "Value", title="Resume Status")
@@ -1384,7 +1447,8 @@ def watch(
 def demo_snapshot(
     api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
     json_output: bool = typer.Option(False, "--json", help="Print raw JSON instead of tables."),
-    output_format: Optional[str] = typer.Option(None, "--format", help="Emit json or toon output."),
+    output_format: Optional[str] = typer.Option(None, "--format", help="Emit json or toon output (env: MWB_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT)."),
+    stats: bool = typer.Option(False, "--stats", help="Show token savings comparison (JSON vs TOON bytes)."),
 ) -> None:
     """Fetch the demo job snapshot from /jobs/demo."""
 
@@ -1395,7 +1459,7 @@ def demo_snapshot(
         data = response.json()
     resolved_format = _resolve_output_format(json_output, output_format)
     if resolved_format:
-        _emit_machine_payload(data, output_format=resolved_format)
+        _emit_machine_payload(data, output_format=resolved_format, show_stats=stats)
     else:
         _print_job(data)
         if links := data.get("links"):
@@ -1406,7 +1470,8 @@ def demo_snapshot(
 def demo_links(
     api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
     json_output: bool = typer.Option(False, "--json", help="Print raw JSON."),
-    output_format: Optional[str] = typer.Option(None, "--format", help="Emit json or toon output."),
+    output_format: Optional[str] = typer.Option(None, "--format", help="Emit json or toon output (env: MWB_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT)."),
+    stats: bool = typer.Option(False, "--stats", help="Show token savings comparison (JSON vs TOON bytes)."),
 ) -> None:
     """Fetch the demo links JSON."""
 
@@ -1417,7 +1482,7 @@ def demo_links(
         data = response.json()
     resolved_format = _resolve_output_format(json_output, output_format)
     if resolved_format:
-        _emit_machine_payload(data, output_format=resolved_format)
+        _emit_machine_payload(data, output_format=resolved_format, show_stats=stats)
     else:
         _print_links(data)
 
@@ -2331,7 +2396,8 @@ def dom_links(
     json_output: bool = typer.Option(
         False, "--json", help="Print raw JSON list instead of a table."
     ),
-    output_format: Optional[str] = typer.Option(None, "--format", help="Emit json or toon output."),
+    output_format: Optional[str] = typer.Option(None, "--format", help="Emit json or toon output (env: MWB_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT)."),
+    stats: bool = typer.Option(False, "--stats", help="Show token savings comparison (JSON vs TOON bytes)."),
 ) -> None:
     """Extract links from a DOM snapshot using the ogf helper."""
 
@@ -2351,7 +2417,7 @@ def dom_links(
     data = serialize_links(records)
     resolved_format = _resolve_output_format(json_output, output_format)
     if resolved_format:
-        _emit_machine_payload(data, output_format=resolved_format)
+        _emit_machine_payload(data, output_format=resolved_format, show_stats=stats)
         return
     _print_links(data)
 
@@ -2363,7 +2429,8 @@ def jobs_webhooks_list(
     json_output: bool = typer.Option(
         False, "--json", help="Emit structured JSON instead of a table."
     ),
-    output_format: Optional[str] = typer.Option(None, "--format", help="Emit json or toon output."),
+    output_format: Optional[str] = typer.Option(None, "--format", help="Emit json or toon output (env: MWB_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT)."),
+    stats: bool = typer.Option(False, "--stats", help="Show token savings comparison (JSON vs TOON bytes)."),
 ) -> None:
     """List registered webhooks for a job."""
 
@@ -2381,6 +2448,7 @@ def jobs_webhooks_list(
         _emit_machine_payload(
             {"status": "ok", "job_id": job_id, "webhooks": data},
             output_format=resolved_format,
+            show_stats=stats,
         )
         return
     _print_webhooks(data)
@@ -2400,7 +2468,8 @@ def jobs_webhooks_add(
     json_output: bool = typer.Option(
         False, "--json/--no-json", help="Emit JSON payload instead of text."
     ),
-    output_format: Optional[str] = typer.Option(None, "--format", help="Emit json or toon output."),
+    output_format: Optional[str] = typer.Option(None, "--format", help="Emit json or toon output (env: MWB_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT)."),
+    stats: bool = typer.Option(False, "--stats", help="Show token savings comparison (JSON vs TOON bytes)."),
 ) -> None:
     """Register a webhook for a job."""
 
@@ -2420,7 +2489,7 @@ def jobs_webhooks_add(
         body = response.json()
     resolved_format = _resolve_output_format(json_output, output_format)
     if resolved_format:
-        _emit_machine_payload({"status": "ok", **body}, output_format=resolved_format)
+        _emit_machine_payload({"status": "ok", **body}, output_format=resolved_format, show_stats=stats)
         return
     console.print(
         f"[green]Registered webhook for {job_id} ({url}).[/] Trigger states: {', '.join(event) if event else 'DONE, FAILED'}."
@@ -2436,7 +2505,8 @@ def jobs_webhooks_delete(
     json_output: bool = typer.Option(
         False, "--json/--no-json", help="Emit JSON payload instead of text."
     ),
-    output_format: Optional[str] = typer.Option(None, "--format", help="Emit json or toon output."),
+    output_format: Optional[str] = typer.Option(None, "--format", help="Emit json or toon output (env: MWB_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT)."),
+    stats: bool = typer.Option(False, "--stats", help="Show token savings comparison (JSON vs TOON bytes)."),
 ) -> None:
     """Remove a webhook subscription from a job."""
 
@@ -2465,6 +2535,7 @@ def jobs_webhooks_delete(
         _emit_machine_payload(
             {"status": "ok", **body, "request": payload},
             output_format=resolved_format,
+            show_stats=stats,
         )
         return
     console.print(f"[green]Deleted {body.get('deleted', 0)} webhook(s) from {job_id}.[/]")
