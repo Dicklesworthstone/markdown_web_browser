@@ -175,7 +175,7 @@ http://localhost:8000/browser
 Get started in under 2 minutes with our automated installer:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/anthropics/markdown_web_browser/main/install.sh | bash -s -- --yes
+curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/markdown_web_browser/main/install.sh | bash -s -- --yes
 ```
 
 **What this installer does for you:**
@@ -193,14 +193,14 @@ curl -fsSL https://raw.githubusercontent.com/anthropics/markdown_web_browser/mai
 For interactive installation or custom options:
 ```bash
 # Interactive mode (prompts for each step)
-curl -fsSL https://raw.githubusercontent.com/anthropics/markdown_web_browser/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/markdown_web_browser/main/install.sh | bash
 
 # Custom directory with OCR API key
-curl -fsSL https://raw.githubusercontent.com/anthropics/markdown_web_browser/main/install.sh | bash -s -- \
+curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/markdown_web_browser/main/install.sh | bash -s -- \
   --dir=/opt/mdwb --ocr-key=sk-YOUR-API-KEY
 
 # See all options
-curl -fsSL https://raw.githubusercontent.com/anthropics/markdown_web_browser/main/install.sh | bash -s -- --help
+curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/markdown_web_browser/main/install.sh | bash -s -- --help
 ```
 
 ## Why it exists
