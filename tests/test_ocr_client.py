@@ -406,6 +406,70 @@ async def test_submit_tiles_local_glm_alias_fallback_on_model_not_found(
 
 
 @pytest.mark.asyncio
+async def test_submit_tiles_local_openai_extracts_content_list_as_text() -> None:
+    settings = get_settings()
+    local_settings = replace(
+        settings,
+        ocr=replace(
+            settings.ocr,
+            local_url="http://localhost:8001/v1",
+            model="glm-ocr",
+            min_concurrency=1,
+            max_concurrency=1,
+        ),
+    )
+    request = OCRRequest(tile_id="tile-local-content-list", tile_bytes=b"tile-local")
+
+    def _handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": [
+                                {"type": "text", "text": "Line 1"},
+                                {"type": "text", "text": "Line 2"},
+                            ]
+                        }
+                    }
+                ]
+            },
+        )
+
+    transport = httpx.MockTransport(_handler)
+    async with httpx.AsyncClient(transport=transport) as client:
+        result = await submit_tiles(requests=[request], settings=local_settings, client=client)
+
+    assert result.markdown_chunks == ["Line 1\nLine 2"]
+
+
+@pytest.mark.asyncio
+async def test_submit_tiles_openai_results_entry_accepts_text_key() -> None:
+    settings = get_settings()
+    local_settings = replace(
+        settings,
+        ocr=replace(
+            settings.ocr,
+            local_url="http://localhost:8001/v1",
+            model="glm-ocr",
+            min_concurrency=1,
+            max_concurrency=1,
+        ),
+    )
+    request = OCRRequest(tile_id="tile-local-results-text", tile_bytes=b"tile-local")
+
+    def _handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"results": [{"text": "Result text"}]})
+
+    transport = httpx.MockTransport(_handler)
+    async with httpx.AsyncClient(transport=transport) as client:
+        result = await submit_tiles(requests=[request], settings=local_settings, client=client)
+
+    assert result.markdown_chunks == ["Result text"]
+
+
+@pytest.mark.asyncio
 async def test_probe_ocr_backend_local_gpu_exposes_adaptive_tuning(monkeypatch: pytest.MonkeyPatch) -> None:
     settings = get_settings()
     local_settings = replace(

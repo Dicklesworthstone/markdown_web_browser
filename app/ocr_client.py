@@ -957,16 +957,14 @@ def _extract_markdown_batch(
         return [extract_glm_maas_markdown(response_json)]
 
     # OpenAI-compatible format: {"choices": [{"message": {"content": "..."}}]}
-    choices = response_json.get("choices")
-    if isinstance(choices, list) and len(choices) > 0:
-        choice = choices[0]
-        if isinstance(choice, dict):
-            message = choice.get("message")
-            if isinstance(message, dict):
-                content = message.get("content")
-                if content is not None:
-                    # OpenAI returns one response; with our batching logic this should be for exactly 1 tile
-                    return [str(content)]
+    try:
+        openai_chunk = extract_glm_openai_markdown(response_json)
+    except ValueError:
+        openai_chunk = None
+    if openai_chunk is not None:
+        if len(tile_ids) != 1:
+            raise ValueError("OpenAI-compatible responses require exactly one tile id")
+        return [openai_chunk]
 
     def _extract_from_entry(entry: dict) -> str | None:
         if not isinstance(entry, dict):
@@ -975,6 +973,8 @@ def _extract_markdown_batch(
             return str(entry["markdown"])
         if "content" in entry:
             return str(entry["content"])
+        if "text" in entry:
+            return str(entry["text"])
         return None
 
     buckets: list[str] = []
