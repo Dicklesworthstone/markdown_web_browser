@@ -23,6 +23,10 @@ print(settings.ocr.server_url)
 | `API_BASE_URL` | `http://localhost:8000` | FastAPI base URL consumed by the CLI + automation; the CLI now fails fast if unset. |
 | `MDWB_API_KEY` | *(unset)* | Optional bearer token for `/jobs` HTTP calls (CLI + automation). |
 | `OCR_LOCAL_URL` | *(unset)* | Optional self-hosted olmOCR endpoint; overrides `OLMOCR_SERVER` when set. |
+| `OCR_LOCAL_AUTOSTART` | `true` | Enables automatic probe/reuse + local server autostart for local OpenAI-compatible OCR backends. |
+| `OCR_LOCAL_STARTUP_TIMEOUT_S` | `180` | Max seconds to wait for local OCR service readiness before deterministic failure/restart handling. |
+| `OCR_LOCAL_HEALTHCHECK_TIMEOUT_S` | `5` | Timeout (seconds) for each local OCR health probe attempt. |
+| `OCR_LOCAL_MAX_RESTARTS` | `1` | Number of restart attempts after a failed local OCR startup before marking local runtime unavailable. |
 | `OCR_USE_FP8` | `true` | Whether FP8 inference is enabled; surfaced via `environment.ocr_use_fp8`. |
 | `OCR_MAX_BATCH_TILES` | `3` | Maximum number of tiles bundled into each OCR HTTP request (helps keep payloads deterministic). |
 | `OCR_MAX_BATCH_BYTES` | `25000000` | Byte ceiling for a single OCR request; batches exceeding this size are split automatically. |
@@ -81,6 +85,8 @@ manifest schema if they need to be echoed downstream.
     (`tuning_profile=local-gpu-adaptive` and effective min/max concurrency).
   - Local CPU runtime uses conservative defaults (`tuning_profile=local-cpu-conservative`)
     so OCR requests do not starve capture/stitch workloads on CPU-only hosts.
+  - Local lifecycle manager now performs probe/reuse first, then optional autostart with
+    bounded restart policy; lifecycle metadata is emitted under `ocr_local_service`.
   - CPU local retries/latency spikes now emit policy reevaluation signals in submit
     results (`reevaluate_policy`, `reevaluation_reason_code`) so failover orchestration
     can switch to alternate backends automatically.

@@ -69,6 +69,12 @@ def test_manifest_metadata_accepts_blocklist_and_warnings() -> None:
         ocr_quota=ManifestOCRQuota(
             limit=500000, used=200000, threshold_ratio=0.7, warning_triggered=False
         ),
+        ocr_local_service={
+            "enabled": True,
+            "endpoint": "http://localhost:8001/v1",
+            "healthy": True,
+            "action": "reused",
+        },
         hardware_capabilities={
             "cpu_logical_cores": 16,
             "gpu_count": 1,
@@ -98,6 +104,8 @@ def test_manifest_metadata_accepts_blocklist_and_warnings() -> None:
     assert manifest.ocr_batches[0].request_id == "req-abc"
     assert manifest.ocr_quota is not None
     assert manifest.ocr_quota.limit == 500000
+    assert manifest.ocr_local_service is not None
+    assert manifest.ocr_local_service["action"] == "reused"
     assert manifest.dom_assists[0]["reason"] == "low-alpha"
     assert manifest.backend_id == "olmocr-remote-openai"
     assert manifest.backend_mode == "openai-compatible"

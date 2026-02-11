@@ -61,6 +61,8 @@ guarded hyphenation, table seam rules)
     - Preserves configured local served-name strings (no forced remote-style model prefixing).
     - On local `400/404` model-not-found responses, retries with GLM alias candidates
       before entering normal transport backoff.
+    - Lifecycle manager probes/reuses existing local services, then optionally autostarts
+      with deterministic bounded restart behavior when local services are absent/unhealthy.
     - Exposes adaptive local-GPU concurrency metadata via `probe.capabilities`
       so orchestration can reason about effective runtime ceilings.
     - Exposes conservative local-CPU concurrency metadata and emits runtime

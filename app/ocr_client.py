@@ -13,6 +13,7 @@ from typing import Any, Protocol, Sequence
 import httpx
 
 from app.hardware import HardwareCapabilitySnapshot, get_host_capabilities
+from app.local_ocr import ensure_local_ocr_service
 from app.ocr_policy import (
     BACKEND_MODE_MAAS,
     BACKEND_MODE_OPENAI_COMPATIBLE,
@@ -60,6 +61,7 @@ class OCRBackendProbe:
     endpoint: str
     model: str
     capabilities: dict[str, object]
+    local_service: dict[str, object] | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -72,6 +74,7 @@ class OCRBackendHealth:
     latency_ms: int | None = None
     reason_code: str | None = None
     detail: str | None = None
+    local_service: dict[str, object] | None = None
 
 
 class OCRBackend(Protocol):
@@ -282,6 +285,7 @@ class SubmitTilesResult:
     quota: OCRQuotaStatus
     backend: OCRBackendRuntime = field(default_factory=_default_backend_runtime)
     host_capabilities: dict[str, object] | None = None
+    local_service: dict[str, object] | None = None
     autotune: "OcrAutotuneSnapshot | None" = None
     reevaluate_policy: bool = False
     reevaluation_reason_code: str | None = None
@@ -536,6 +540,14 @@ async def probe_ocr_backend(
     cfg = settings or get_settings()
     capabilities_snapshot = get_host_capabilities()
     backend = resolve_ocr_backend(cfg, capabilities=capabilities_snapshot)
+    local_service: dict[str, object] | None = None
+    if backend.backend_id.endswith("-local-openai"):
+        status = await ensure_local_ocr_service(
+            settings=cfg,
+            capabilities=capabilities_snapshot,
+            preferred_hardware_path=backend.hardware_path,
+        )
+        local_service = status.to_dict()
     endpoint = _normalize_endpoint(
         _select_server_url(cfg),
         backend_mode=backend.backend_mode,
@@ -562,11 +574,14 @@ async def probe_ocr_backend(
         capabilities["model_aliases"] = list(
             _model_alias_candidates(cfg.ocr.model, backend_id=backend.backend_id)
         )
+        if local_service is not None:
+            capabilities["local_service"] = local_service
     return OCRBackendProbe(
         backend=backend,
         endpoint=endpoint,
         model=cfg.ocr.model,
         capabilities=capabilities,
+        local_service=local_service,
     )
 
 
@@ -579,6 +594,22 @@ async def healthcheck_ocr_backend(
 
     probe = await probe_ocr_backend(settings=settings, client=client)
     cfg = settings or get_settings()
+    if (
+        probe.backend.backend_id.endswith("-local-openai")
+        and probe.local_service is not None
+        and not bool(probe.local_service.get("healthy"))
+    ):
+        local_status_value = probe.local_service.get("status_code")
+        local_status_code = local_status_value if isinstance(local_status_value, int) else None
+        reason = str(probe.local_service.get("reason") or "local-service-unhealthy")
+        return OCRBackendHealth(
+            backend=probe.backend,
+            healthy=False,
+            status_code=local_status_code,
+            reason_code="local-service-unhealthy",
+            detail=reason,
+            local_service=probe.local_service,
+        )
     request_timeout = _resolve_request_timeout(backend=probe.backend)
     owns_client = client is None
     http_client = client or httpx.AsyncClient(timeout=request_timeout, http2=True)
@@ -615,6 +646,7 @@ async def healthcheck_ocr_backend(
         latency_ms=latency_ms,
         reason_code=reason_code,
         detail=detail,
+        local_service=probe.local_service,
     )
 
 
@@ -629,6 +661,17 @@ async def submit_tiles(
     cfg = settings or get_settings()
     capabilities_snapshot = get_host_capabilities()
     backend = resolve_ocr_backend(cfg, capabilities=capabilities_snapshot)
+    local_service: dict[str, object] | None = None
+    if backend.backend_id.endswith("-local-openai"):
+        status = await ensure_local_ocr_service(
+            settings=cfg,
+            capabilities=capabilities_snapshot,
+            preferred_hardware_path=backend.hardware_path,
+        )
+        local_service = status.to_dict()
+        if not status.healthy:
+            reason = status.reason or status.action
+            raise RuntimeError(f"Local OCR service unavailable ({reason})")
     if backend.backend_mode not in {BACKEND_MODE_OPENAI_COMPATIBLE, BACKEND_MODE_MAAS}:
         raise NotImplementedError(
             "Configured OCR backend mode is not wired for tile submission yet: "
@@ -645,6 +688,7 @@ async def submit_tiles(
             quota=empty_quota,
             backend=backend,
             host_capabilities=capabilities_snapshot.to_dict(),
+            local_service=local_service,
         )
 
     server_url = _select_server_url(cfg)
@@ -718,6 +762,7 @@ async def submit_tiles(
         quota=quota_status,
         backend=backend,
         host_capabilities=capabilities_snapshot.to_dict(),
+        local_service=local_service,
         autotune=limiter.snapshot(),
         reevaluate_policy=reevaluate_policy,
         reevaluation_reason_code=reevaluation_reason_code,

@@ -59,6 +59,10 @@ class OCRSettings:
     api_key: str | None
     model: str
     local_url: str | None
+    local_autostart: bool
+    local_startup_timeout_s: int
+    local_healthcheck_timeout_s: int
+    local_max_restarts: int
     use_fp8: bool
     min_concurrency: int
     max_concurrency: int
@@ -344,6 +348,10 @@ def get_settings(env_path: str = ".env") -> Settings:
         api_key=cfg("OLMOCR_API_KEY", default=None),
         model=cfg("OLMOCR_MODEL", default="olmOCR-2-7B-1025-FP8"),
         local_url=cfg("OCR_LOCAL_URL", default=None),
+        local_autostart=_bool(cfg, "OCR_LOCAL_AUTOSTART", default=True),
+        local_startup_timeout_s=_int(cfg, "OCR_LOCAL_STARTUP_TIMEOUT_S", default=180),
+        local_healthcheck_timeout_s=_int(cfg, "OCR_LOCAL_HEALTHCHECK_TIMEOUT_S", default=5),
+        local_max_restarts=_int(cfg, "OCR_LOCAL_MAX_RESTARTS", default=1),
         use_fp8=_bool(cfg, "OCR_USE_FP8", default=True),
         min_concurrency=_int(cfg, "OCR_MIN_CONCURRENCY", default=2),
         max_concurrency=_int(cfg, "OCR_MAX_CONCURRENCY", default=8),
@@ -353,6 +361,15 @@ def get_settings(env_path: str = ".env") -> Settings:
     )
     if ocr.max_concurrency < ocr.min_concurrency:
         msg = "OCR_MAX_CONCURRENCY must be >= OCR_MIN_CONCURRENCY"
+        raise ValueError(msg)
+    if ocr.local_startup_timeout_s < 1:
+        msg = "OCR_LOCAL_STARTUP_TIMEOUT_S must be >= 1"
+        raise ValueError(msg)
+    if ocr.local_healthcheck_timeout_s < 1:
+        msg = "OCR_LOCAL_HEALTHCHECK_TIMEOUT_S must be >= 1"
+        raise ValueError(msg)
+    if ocr.local_max_restarts < 0:
+        msg = "OCR_LOCAL_MAX_RESTARTS must be >= 0"
         raise ValueError(msg)
 
     telemetry = TelemetrySettings(

@@ -899,6 +899,7 @@ def _apply_ocr_metadata(manifest: CaptureManifest, result: SubmitTilesResult) ->
     manifest.backend_reevaluate_after_s = result.backend.reevaluate_after_s
     manifest.fallback_chain = list(result.backend.fallback_chain)
     manifest.hardware_capabilities = result.host_capabilities
+    manifest.ocr_local_service = result.local_service
     manifest.ocr_quota = {
         "limit": result.quota.limit,
         "used": result.quota.used,
@@ -1065,6 +1066,16 @@ def _summarize_ocr_batches(manifest: CaptureManifest) -> dict[str, Any] | None:
         }
         if events:
             summary["autotune"]["last_event"] = events[-1]
+    local_service = getattr(manifest, "ocr_local_service", None) or {}
+    if isinstance(local_service, Mapping) and local_service:
+        summary["local_service"] = {
+            "action": local_service.get("action"),
+            "healthy": local_service.get("healthy"),
+            "reason": local_service.get("reason"),
+            "managed": local_service.get("managed"),
+            "restart_count": local_service.get("restart_count"),
+            "launch_attempts": local_service.get("launch_attempts"),
+        }
     return summary
 
 

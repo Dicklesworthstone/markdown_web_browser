@@ -323,6 +323,10 @@ class ManifestMetadata(BaseModel):
         default=None,
         description="Snapshot of hosted OCR daily quota usage",
     )
+    ocr_local_service: dict[str, Any] | None = Field(
+        default=None,
+        description="Local OCR lifecycle metadata (reuse/autostart/restart diagnostics)",
+    )
     profile_id: str | None = Field(
         default=None,
         description="Browser profile identifier used for the capture, when specified",

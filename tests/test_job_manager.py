@@ -82,6 +82,7 @@ except OSError:  # pyvips missing in CI
         stitch_ms: int | None = None
         ocr_batches: list | None = None
         ocr_quota: dict | None = None
+        ocr_local_service: dict | None = None
 
     @dataclass
     class CaptureResult:
@@ -152,6 +153,14 @@ async def _fake_runner(*, job_id: str, url: str, store: Store, config=None):  # 
             "used": 3,
             "threshold_ratio": 0.7,
             "warning_triggered": False,
+        },
+        ocr_local_service={
+            "enabled": True,
+            "endpoint": "http://localhost:8001/v1",
+            "healthy": True,
+            "action": "reused",
+            "launch_attempts": 0,
+            "restart_count": 0,
         },
         seam_markers=[
             {"tile_index": 0, "position": "top", "hash": "aaa111"},
@@ -328,6 +337,7 @@ async def test_job_manager_emits_ocr_event(tmp_path: Path):
     assert ocr_events[-1]["data"]["backend_reason_codes"] == ["policy.remote.fallback"]
     assert ocr_events[-1]["data"]["backend_reevaluate_after_s"] == 120
     assert ocr_events[-1]["data"]["gpu_count"] == 0
+    assert ocr_events[-1]["data"]["local_service"]["action"] == "reused"
 
 
 @pytest.mark.asyncio

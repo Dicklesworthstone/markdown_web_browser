@@ -88,6 +88,37 @@ def create_real_test_image(width: int = 1280, height: int = 720, text: str = "Te
     return img_bytes.getvalue()
 
 
+def _mock_local_service_ready(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    action: str = "reused",
+    reason: str | None = "service-healthy",
+) -> None:
+    class _Status:
+        def __init__(self) -> None:
+            self.healthy = True
+            self.action = action
+            self.reason = reason
+
+        def to_dict(self) -> dict[str, object]:
+            payload: dict[str, object] = {
+                "enabled": True,
+                "endpoint": "http://localhost:8001/v1",
+                "healthy": True,
+                "action": self.action,
+                "managed": False,
+                "launch_attempts": 0,
+                "restart_count": 0,
+                "reason": self.reason,
+            }
+            return payload
+
+    async def _fake_ensure_local_ocr_service(**_: object) -> _Status:
+        return _Status()
+
+    monkeypatch.setattr("app.ocr_client.ensure_local_ocr_service", _fake_ensure_local_ocr_service)
+
+
 def test_normalize_glm_file_reference_wraps_raw_base64() -> None:
     raw = base64.b64encode(b"abc123").decode("ascii")
     normalized = normalize_glm_file_reference(raw)
@@ -198,7 +229,8 @@ def test_resolve_ocr_backend_local_auto_uses_gpu_when_available() -> None:
 
 
 @pytest.mark.asyncio
-async def test_probe_ocr_backend_exposes_capabilities() -> None:
+async def test_probe_ocr_backend_exposes_capabilities(monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_local_service_ready(monkeypatch)
     probe = await probe_ocr_backend(settings=get_settings())
     assert probe.endpoint
     assert probe.model
@@ -316,7 +348,10 @@ async def test_submit_tiles_glm_maas_retries_5xx_then_succeeds(monkeypatch: pyte
 
 
 @pytest.mark.asyncio
-async def test_submit_tiles_local_openai_keeps_configured_served_model_name() -> None:
+async def test_submit_tiles_local_openai_keeps_configured_served_model_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mock_local_service_ready(monkeypatch)
     settings = get_settings()
     local_settings = replace(
         settings,
@@ -352,12 +387,15 @@ async def test_submit_tiles_local_openai_keeps_configured_served_model_name() ->
     assert seen_model == "olmOCR-2-7B-1025-FP8"
     assert result.markdown_chunks == ["local-ocr"]
     assert len(result.batches) == 1
+    assert result.local_service is not None
+    assert result.local_service["action"] == "reused"
 
 
 @pytest.mark.asyncio
 async def test_submit_tiles_local_glm_alias_fallback_on_model_not_found(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _mock_local_service_ready(monkeypatch)
     settings = get_settings()
     local_settings = replace(
         settings,
@@ -406,7 +444,10 @@ async def test_submit_tiles_local_glm_alias_fallback_on_model_not_found(
 
 
 @pytest.mark.asyncio
-async def test_submit_tiles_local_openai_extracts_content_list_as_text() -> None:
+async def test_submit_tiles_local_openai_extracts_content_list_as_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mock_local_service_ready(monkeypatch)
     settings = get_settings()
     local_settings = replace(
         settings,
@@ -445,7 +486,10 @@ async def test_submit_tiles_local_openai_extracts_content_list_as_text() -> None
 
 
 @pytest.mark.asyncio
-async def test_submit_tiles_openai_results_entry_accepts_text_key() -> None:
+async def test_submit_tiles_openai_results_entry_accepts_text_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mock_local_service_ready(monkeypatch)
     settings = get_settings()
     local_settings = replace(
         settings,
@@ -471,6 +515,7 @@ async def test_submit_tiles_openai_results_entry_accepts_text_key() -> None:
 
 @pytest.mark.asyncio
 async def test_probe_ocr_backend_local_gpu_exposes_adaptive_tuning(monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_local_service_ready(monkeypatch)
     settings = get_settings()
     local_settings = replace(
         settings,
@@ -530,12 +575,14 @@ async def test_probe_ocr_backend_local_gpu_exposes_adaptive_tuning(monkeypatch: 
     aliases = probe.capabilities["model_aliases"]
     assert isinstance(aliases, list)
     assert "glm-ocr" in aliases
+    assert isinstance(probe.capabilities["local_service"], dict)
 
 
 @pytest.mark.asyncio
 async def test_probe_ocr_backend_local_cpu_exposes_conservative_tuning(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _mock_local_service_ready(monkeypatch)
     settings = get_settings()
     local_settings = replace(
         settings,
@@ -567,12 +614,14 @@ async def test_probe_ocr_backend_local_cpu_exposes_conservative_tuning(
     assert probe.capabilities["tuning_profile"] == "local-cpu-conservative"
     assert probe.capabilities["min_concurrency"] == 1
     assert probe.capabilities["max_concurrency"] == 4
+    assert isinstance(probe.capabilities["local_service"], dict)
 
 
 @pytest.mark.asyncio
 async def test_submit_tiles_local_cpu_retry_triggers_policy_reevaluation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _mock_local_service_ready(monkeypatch)
     settings = get_settings()
     local_settings = replace(
         settings,
@@ -623,6 +672,50 @@ async def test_submit_tiles_local_cpu_retry_triggers_policy_reevaluation(
     assert result.batches[0].attempts == 2
     assert result.reevaluate_policy is True
     assert result.reevaluation_reason_code == "policy.reeval.failure"
+
+
+@pytest.mark.asyncio
+async def test_healthcheck_local_backend_returns_local_service_unhealthy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = get_settings()
+    local_settings = replace(
+        settings,
+        ocr=replace(
+            settings.ocr,
+            local_url="http://localhost:8001/v1",
+            model="glm-ocr",
+            min_concurrency=1,
+            max_concurrency=1,
+        ),
+    )
+
+    class _UnhealthyStatus:
+        healthy = False
+        action = "start-failed"
+        reason = "startup-timeout"
+
+        def to_dict(self) -> dict[str, object]:
+            return {
+                "enabled": True,
+                "endpoint": "http://localhost:8001/v1",
+                "healthy": False,
+                "action": "start-failed",
+                "reason": "startup-timeout",
+                "launch_attempts": 2,
+                "restart_count": 1,
+            }
+
+    async def _fake_ensure_local_ocr_service(**_: object) -> _UnhealthyStatus:
+        return _UnhealthyStatus()
+
+    monkeypatch.setattr("app.ocr_client.ensure_local_ocr_service", _fake_ensure_local_ocr_service)
+
+    health = await healthcheck_ocr_backend(settings=local_settings)
+    assert health.healthy is False
+    assert health.reason_code == "local-service-unhealthy"
+    assert health.local_service is not None
+    assert health.local_service["action"] == "start-failed"
 
 
 @pytest.mark.asyncio

@@ -101,6 +101,7 @@ class CaptureManifest:
     stitch_ms: int | None = None
     ocr_batches: list[dict[str, object]] = field(default_factory=list)
     ocr_quota: dict[str, object] | None = None
+    ocr_local_service: dict[str, object] | None = None
     dom_assists: list[dict[str, object]] = field(default_factory=list)
     dom_assist_summary: dict[str, object] | None = None
     ocr_autotune: dict[str, object] | None = None
