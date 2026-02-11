@@ -70,6 +70,7 @@ except OSError:  # pyvips missing in CI
         overlap_match_ratio: float
         validation_failures: list
         profile_id: str | None = None
+        cache_seed: str | None = None
         cache_key: str | None = None
         cache_hit: bool = False
         backend_id: str | None = None
@@ -83,6 +84,7 @@ except OSError:  # pyvips missing in CI
         ocr_batches: list | None = None
         ocr_quota: dict | None = None
         ocr_local_service: dict | None = None
+        ocr_failover_events: list | None = None
 
     @dataclass
     class CaptureResult:
@@ -162,11 +164,24 @@ async def _fake_runner(*, job_id: str, url: str, store: Store, config=None):  # 
             "launch_attempts": 0,
             "restart_count": 0,
         },
+        ocr_failover_events=[
+            {
+                "event": "backend_failed",
+                "backend_id": "glm-ocr-local-openai",
+                "reason_code": "runtime.failover.local-unhealthy",
+            },
+            {
+                "event": "backend_selected",
+                "backend_id": "glm-ocr-remote-openai",
+                "reason_code": "runtime.failover.promoted",
+            },
+        ],
         seam_markers=[
             {"tile_index": 0, "position": "top", "hash": "aaa111"},
             {"tile_index": 1, "position": "bottom", "hash": "bbb222"},
         ],
         profile_id=getattr(config, "profile_id", None),
+        cache_seed=getattr(config, "cache_seed", None),
         cache_key=getattr(config, "cache_key", None),
         backend_id="olmocr-remote-openai",
         backend_mode="openai-compatible",
@@ -338,6 +353,7 @@ async def test_job_manager_emits_ocr_event(tmp_path: Path):
     assert ocr_events[-1]["data"]["backend_reevaluate_after_s"] == 120
     assert ocr_events[-1]["data"]["gpu_count"] == 0
     assert ocr_events[-1]["data"]["local_service"]["action"] == "reused"
+    assert ocr_events[-1]["data"]["failover"]["event_count"] == 2
 
 
 @pytest.mark.asyncio
@@ -385,9 +401,15 @@ async def test_job_manager_passes_profile_id_to_runner(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_job_manager_reuses_cache(tmp_path: Path):
+async def test_job_manager_reuses_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     config = StorageConfig(cache_root=tmp_path / "cache", db_path=tmp_path / "runs.db")
     manager = JobManager(store=Store(config), runner=_fake_runner)
+    base_settings = jobs_module.global_settings
+    monkeypatch.setattr(
+        jobs_module,
+        "global_settings",
+        replace(base_settings, ocr=replace(base_settings.ocr, local_url="")),
+    )
 
     first = await manager.create_job(
         JobCreateRequest(url="https://example.com/cache", reuse_cache=False)
@@ -408,9 +430,15 @@ async def test_job_manager_reuses_cache(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_cache_key_respects_overrides(tmp_path: Path):
+async def test_cache_key_respects_overrides(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     config = StorageConfig(cache_root=tmp_path / "cache", db_path=tmp_path / "runs.db")
     manager = JobManager(store=Store(config), runner=_fake_runner)
+    base_settings = jobs_module.global_settings
+    monkeypatch.setattr(
+        jobs_module,
+        "global_settings",
+        replace(base_settings, ocr=replace(base_settings.ocr, local_url="")),
+    )
 
     first = await manager.create_job(
         JobCreateRequest(url="https://example.com/override", viewport_width=1400, reuse_cache=False)
@@ -589,6 +617,27 @@ async def test_cache_key_changes_when_ocr_model_differs(
         await manager._tasks[second["id"]]
     finally:
         monkeypatch.setattr(jobs_module, "global_settings", base_settings)
+
+
+def test_refresh_manifest_cache_key_uses_runtime_backend_path() -> None:
+    manifest = types.SimpleNamespace(
+        cache_seed="seed-abc",
+        backend_id="glm-ocr-remote-openai",
+        backend_mode="openai-compatible",
+        hardware_path="remote",
+        fallback_chain=["glm-ocr-local-openai", "glm-ocr-remote-openai"],
+        cache_key="stale-key",
+    )
+
+    jobs_module._refresh_manifest_cache_key(cast(Any, manifest))
+
+    assert manifest.cache_key == jobs_module._build_runtime_cache_key(
+        cache_seed="seed-abc",
+        backend_id="glm-ocr-remote-openai",
+        backend_mode="openai-compatible",
+        hardware_path="remote",
+        fallback_chain=["glm-ocr-local-openai", "glm-ocr-remote-openai"],
+    )
 
 
 class _DeleteStubStore:

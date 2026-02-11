@@ -36,6 +36,7 @@ class CaptureConfig:
     reduced_motion: bool = True
     profile_id: str | None = None
     long_side_px: int | None = None
+    cache_seed: str | None = None
     cache_key: str | None = None
 
 
@@ -88,6 +89,7 @@ class CaptureManifest:
     overlap_match_ratio: float | None
     validation_failures: list[str]
     profile_id: str | None
+    cache_seed: str | None = None
     cache_key: str | None = None
     cache_hit: bool = False
     backend_id: str | None = None
@@ -102,6 +104,7 @@ class CaptureManifest:
     ocr_batches: list[dict[str, object]] = field(default_factory=list)
     ocr_quota: dict[str, object] | None = None
     ocr_local_service: dict[str, object] | None = None
+    ocr_failover_events: list[dict[str, object]] = field(default_factory=list)
     dom_assists: list[dict[str, object]] = field(default_factory=list)
     dom_assist_summary: dict[str, object] | None = None
     ocr_autotune: dict[str, object] | None = None
@@ -195,6 +198,7 @@ async def capture_tiles(config: CaptureConfig) -> CaptureResult:
         overlap_match_ratio=sweep_stats.overlap_match_ratio,
         validation_failures=validation_failures,
         profile_id=config.profile_id,
+        cache_seed=config.cache_seed,
         cache_key=config.cache_key,
     )
 

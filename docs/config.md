@@ -121,9 +121,11 @@ in `app/schemas.py` (see `ManifestEnvironment`, `ManifestTimings`, and
 * Policy trace metadata (`backend_reason_codes`, `backend_reevaluate_after_s`) so failover behavior is explainable and replayable
 * Host hardware capability snapshot (`hardware_capabilities`) so policy decisions can be replayed against the detected CPU/GPU inventory
 * OCR request telemetry (`ocr_batches`) including latency, HTTP status, request IDs, and payload sizes, plus hosted quota status (`ocr_quota`) so ops can correlate throttling with DOM complexity
+* Failover telemetry (`ocr_failover_events`) with backend failure/skip/selection events and stable reason codes for runtime transitions
+* Runtime policy suppression metadata in `ocr_autotune` (`reevaluation_reason_code`, suppression counters, switch-window count) so anti-flap behavior is auditable in events/manifests
 * Timing metrics (`capture_ms`, `ocr_ms`, `stitch_ms`, `total_ms`) once stages
   execute
-* Cache metadata (`cache_hit`, `cache_key`) so dashboards/CLI output can distinguish fresh captures from cache replays
+* Cache metadata (`cache_hit`, `cache_seed`, `cache_key`) so dashboards/CLI output can distinguish fresh captures from cache replays and confirm runtime backend-specific cache partitioning
 * DOM assist overlays (`dom_assists`) plus the summary fields (`dom_assist_summary`) that report counts, assist density (assists ÷ tiles_total), and per-reason ratios so ops/debuggers can monitor hybrid recovery health
 
 ```jsonc
@@ -182,7 +184,8 @@ in `app/schemas.py` (see `ManifestEnvironment`, `ManifestTimings`, and
     {"tile_index": 0, "line": 3, "reason": "low-alpha", "dom_text": "Revenue Q4", "original_text": "Rev3nue?" }
   ],
   "cache_hit": false,
-  "cache_key": "cache-<sha1>"
+  "cache_seed": "<backend-agnostic-sha256>",
+  "cache_key": "<runtime-backend-sha256>"
 }
 ```
 
@@ -202,5 +205,6 @@ in `app/schemas.py` (see `ManifestEnvironment`, `ManifestTimings`, and
 * `MDWB_SERVER_IMPL` controls whether `scripts/run_server.py` launches uvicorn or Granian. The chosen runtime is echoed into manifests (`environment.server_runtime`) and stored in SQLite so cache hits/logs can be filtered by server type.
 * The warning/blocklist JSONL log now includes `sweep_stats`, overlap ratios, and any `validation_failures`, so Ops can spot retries or seam duplication even when DOM warnings don’t fire. Ensure the log rotation/search tooling ingests the new keys.
 * Prometheus scraping now covers capture/OCR/stitch latencies, warning/blocklist totals, SSE heartbeats, and job completions. Scrape `/metrics` directly or hit the exporter bound to `PROMETHEUS_PORT` when you need a dedicated port.
+* OCR runtime hysteresis defaults are currently fixed in policy code: cooldown `45s`, flap window `180s`, threshold `3` switches/window. Suppression reason codes use `policy.reeval.suppressed.cooldown` and `policy.reeval.suppressed.flapping`.
 * Persistent Chromium profiles live under `CACHE_ROOT/profiles/<id>/storage_state.json`. The UI dropdown and CLI `--profile` flag reuse these directories, and manifests/RunRecords echo `profile_id` so audits can trace which persona captured a run.
 * OCR manifests now include `ocr_autotune` (initial/final/peak concurrency plus the most recent adjustments). The CLI + UI render this block so operators know when the controller scaled up/down; set `OCR_MIN_CONCURRENCY`/`OCR_MAX_CONCURRENCY` to shape the window and override via env when debugging throttling.

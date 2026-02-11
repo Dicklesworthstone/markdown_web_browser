@@ -167,6 +167,8 @@ class JobManager:
         job_id = uuid4().hex
         active_settings = global_settings
         capture_config = _build_capture_config(request, active_settings)
+        cache_seed = _build_cache_seed(config=capture_config, settings=active_settings)
+        capture_config.cache_seed = cache_seed
         cache_key = _build_cache_key(config=capture_config, settings=active_settings)
         capture_config.cache_key = cache_key
         snapshot = build_initial_snapshot(
@@ -740,6 +742,7 @@ async def execute_capture_job(
         )
         capture_result.manifest.ocr_ms = ocr_ms
         capture_result.manifest.stitch_ms = stitch_ms
+        _refresh_manifest_cache_key(capture_result.manifest)
         metrics.observe_manifest_metrics(capture_result.manifest)
         append_warning_log(job_id=job_id, url=url, manifest=capture_result.manifest)
         dom_snapshot = getattr(capture_result, "dom_snapshot", None)
@@ -900,6 +903,7 @@ def _apply_ocr_metadata(manifest: CaptureManifest, result: SubmitTilesResult) ->
     manifest.fallback_chain = list(result.backend.fallback_chain)
     manifest.hardware_capabilities = result.host_capabilities
     manifest.ocr_local_service = result.local_service
+    manifest.ocr_failover_events = [event.to_dict() for event in result.failover_events]
     manifest.ocr_quota = {
         "limit": result.quota.limit,
         "used": result.quota.used,
@@ -961,9 +965,13 @@ def _build_capture_config(request: JobCreateRequest, settings: Settings) -> Capt
     )
 
 
-def _build_cache_key(*, config: CaptureConfig, settings: Settings) -> str:
+_OCR_PROMPT_VERSION = "v8_plain_text_accepted"
+
+
+def _build_cache_seed(*, config: CaptureConfig, settings: Settings) -> str:
+    """Build backend-agnostic cache seed for this capture request."""
+
     normalized_url = _normalize_url(config.url)
-    backend = resolve_ocr_backend(settings, capabilities=get_host_capabilities())
     payload = {
         "url": normalized_url,
         "cft_version": settings.browser.cft_version,
@@ -981,14 +989,61 @@ def _build_cache_key(*, config: CaptureConfig, settings: Settings) -> str:
         "mask_selectors": list(settings.browser.screenshot_mask_selectors),
         "ocr_model": settings.ocr.model,
         "ocr_use_fp8": settings.ocr.use_fp8,
-        "ocr_backend_id": backend.backend_id,
-        "ocr_backend_mode": backend.backend_mode,
-        "ocr_hardware_path": backend.hardware_path,
-        "ocr_fallback_chain": list(backend.fallback_chain),
-        "ocr_prompt_version": "v8_plain_text_accepted",  # Bump this when OCR prompt/model changes
+        "ocr_prompt_version": _OCR_PROMPT_VERSION,  # Bump when OCR prompt/model changes
         "profile_id": config.profile_id or "",
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _build_runtime_cache_key(
+    *,
+    cache_seed: str,
+    backend_id: str,
+    backend_mode: str,
+    hardware_path: str,
+    fallback_chain: Sequence[str],
+) -> str:
+    payload = {
+        "cache_seed": cache_seed,
+        "ocr_backend_id": backend_id,
+        "ocr_backend_mode": backend_mode,
+        "ocr_hardware_path": hardware_path,
+        "ocr_fallback_chain": [entry for entry in fallback_chain if entry],
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _build_cache_key(*, config: CaptureConfig, settings: Settings) -> str:
+    cache_seed = config.cache_seed or _build_cache_seed(config=config, settings=settings)
+    backend = resolve_ocr_backend(settings, capabilities=get_host_capabilities())
+    return _build_runtime_cache_key(
+        cache_seed=cache_seed,
+        backend_id=backend.backend_id,
+        backend_mode=backend.backend_mode,
+        hardware_path=backend.hardware_path,
+        fallback_chain=backend.fallback_chain,
+    )
+
+
+def _refresh_manifest_cache_key(manifest: CaptureManifest) -> None:
+    """Recompute cache key from runtime backend so failover outputs do not poison cache."""
+
+    cache_seed = getattr(manifest, "cache_seed", None)
+    backend_id = getattr(manifest, "backend_id", None)
+    backend_mode = getattr(manifest, "backend_mode", None)
+    hardware_path = getattr(manifest, "hardware_path", None)
+    fallback_chain = list(getattr(manifest, "fallback_chain", []) or [])
+    if not (cache_seed and backend_id and backend_mode and hardware_path):
+        return
+    if not fallback_chain:
+        fallback_chain = [backend_id]
+    manifest.cache_key = _build_runtime_cache_key(
+        cache_seed=cache_seed,
+        backend_id=backend_id,
+        backend_mode=backend_mode,
+        hardware_path=hardware_path,
+        fallback_chain=fallback_chain,
+    )
 
 
 def _normalize_url(url: str) -> str:
@@ -1063,6 +1118,14 @@ def _summarize_ocr_batches(manifest: CaptureManifest) -> dict[str, Any] | None:
             "final_limit": autotune.get("final_limit"),
             "peak_limit": autotune.get("peak_limit"),
             "event_count": len(events),
+            "reevaluate_policy": autotune.get("reevaluate_policy"),
+            "reevaluation_reason_code": autotune.get("reevaluation_reason_code"),
+            "policy_suppression_count": autotune.get("policy_suppression_count"),
+            "policy_cooldown_suppression_count": autotune.get(
+                "policy_cooldown_suppression_count"
+            ),
+            "policy_flap_suppression_count": autotune.get("policy_flap_suppression_count"),
+            "policy_switch_count_window": autotune.get("policy_switch_count_window"),
         }
         if events:
             summary["autotune"]["last_event"] = events[-1]
@@ -1076,6 +1139,24 @@ def _summarize_ocr_batches(manifest: CaptureManifest) -> dict[str, Any] | None:
             "restart_count": local_service.get("restart_count"),
             "launch_attempts": local_service.get("launch_attempts"),
         }
+    failover_events = getattr(manifest, "ocr_failover_events", None) or []
+    if isinstance(failover_events, Sequence) and failover_events:
+        summary["failover"] = {
+            "event_count": len(failover_events),
+            "backend_failures": sum(
+                1
+                for event in failover_events
+                if isinstance(event, Mapping) and event.get("event") == "backend_failed"
+            ),
+            "backend_skips": sum(
+                1
+                for event in failover_events
+                if isinstance(event, Mapping) and event.get("event") == "backend_skipped"
+            ),
+        }
+        last_event = failover_events[-1]
+        if isinstance(last_event, Mapping):
+            summary["failover"]["last_reason_code"] = last_event.get("reason_code")
     return summary
 
 

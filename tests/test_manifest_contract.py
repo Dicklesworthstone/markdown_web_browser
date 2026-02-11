@@ -75,6 +75,13 @@ def test_manifest_metadata_accepts_blocklist_and_warnings() -> None:
             "healthy": True,
             "action": "reused",
         },
+        ocr_failover_events=[
+            {
+                "event": "backend_failed",
+                "backend_id": "glm-ocr-local-openai",
+                "reason_code": "runtime.failover.local-unhealthy",
+            }
+        ],
         hardware_capabilities={
             "cpu_logical_cores": 16,
             "gpu_count": 1,
@@ -83,6 +90,8 @@ def test_manifest_metadata_accepts_blocklist_and_warnings() -> None:
         },
         backend_reason_codes=["policy.local.gpu-preferred"],
         backend_reevaluate_after_s=120,
+        cache_seed="seed-xyz",
+        cache_key="runtime-key-xyz",
         dom_assists=[
             {
                 "tile_index": 0,
@@ -106,6 +115,7 @@ def test_manifest_metadata_accepts_blocklist_and_warnings() -> None:
     assert manifest.ocr_quota.limit == 500000
     assert manifest.ocr_local_service is not None
     assert manifest.ocr_local_service["action"] == "reused"
+    assert manifest.ocr_failover_events[0]["reason_code"] == "runtime.failover.local-unhealthy"
     assert manifest.dom_assists[0]["reason"] == "low-alpha"
     assert manifest.backend_id == "olmocr-remote-openai"
     assert manifest.backend_mode == "openai-compatible"
@@ -113,5 +123,7 @@ def test_manifest_metadata_accepts_blocklist_and_warnings() -> None:
     assert manifest.fallback_chain == ["olmocr-remote-openai"]
     assert manifest.backend_reason_codes == ["policy.local.gpu-preferred"]
     assert manifest.backend_reevaluate_after_s == 120
+    assert manifest.cache_seed == "seed-xyz"
+    assert manifest.cache_key == "runtime-key-xyz"
     assert manifest.hardware_capabilities is not None
     assert manifest.hardware_capabilities["gpu_count"] == 1

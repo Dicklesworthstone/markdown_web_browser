@@ -479,6 +479,7 @@ class Store:
             if not record:
                 raise KeyError(f"Run {job_id} not found")
             manifest_dict = _manifest_to_dict(manifest)
+            _normalize_manifest_cache_key(manifest_dict)
             manifest_path = Path(record.manifest_path)
             manifest_path.parent.mkdir(parents=True, exist_ok=True)
             manifest_path.write_text(json.dumps(manifest_dict, indent=2), encoding="utf-8")
@@ -702,6 +703,61 @@ def _split_url(url: str) -> tuple[str, str]:
     # Add a short hash of the full URL so distinct query strings do not collide.
     digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:8]
     return host.replace(":", "-"), f"{slug}-{digest}"
+
+
+def _build_runtime_cache_key(
+    *,
+    cache_seed: str,
+    backend_id: str,
+    backend_mode: str,
+    hardware_path: str,
+    fallback_chain: Sequence[str],
+) -> str:
+    payload = {
+        "cache_seed": cache_seed,
+        "ocr_backend_id": backend_id,
+        "ocr_backend_mode": backend_mode,
+        "ocr_hardware_path": hardware_path,
+        "ocr_fallback_chain": [entry for entry in fallback_chain if entry],
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _normalize_manifest_cache_key(manifest_dict: dict[str, Any]) -> None:
+    """Recompute cache key from runtime backend fields when cache seed is present."""
+
+    cache_seed_raw = manifest_dict.get("cache_seed")
+    backend_id_raw = manifest_dict.get("backend_id")
+    backend_mode_raw = manifest_dict.get("backend_mode")
+    hardware_path_raw = manifest_dict.get("hardware_path")
+    if not (
+        isinstance(cache_seed_raw, str)
+        and cache_seed_raw.strip()
+        and isinstance(backend_id_raw, str)
+        and backend_id_raw.strip()
+        and isinstance(backend_mode_raw, str)
+        and backend_mode_raw.strip()
+        and isinstance(hardware_path_raw, str)
+        and hardware_path_raw.strip()
+    ):
+        return
+    cache_seed = cache_seed_raw.strip()
+    backend_id = backend_id_raw.strip()
+    backend_mode = backend_mode_raw.strip()
+    hardware_path = hardware_path_raw.strip()
+    chain_raw = manifest_dict.get("fallback_chain")
+    chain: list[str] = []
+    if isinstance(chain_raw, (list, tuple)):
+        chain = [str(entry).strip() for entry in chain_raw if str(entry).strip()]
+    if not chain:
+        chain = [backend_id]
+    manifest_dict["cache_key"] = _build_runtime_cache_key(
+        cache_seed=cache_seed,
+        backend_id=backend_id,
+        backend_mode=backend_mode,
+        hardware_path=hardware_path,
+        fallback_chain=chain,
+    )
 
 
 def _cache_segments(cache_key: str) -> tuple[str, str]:

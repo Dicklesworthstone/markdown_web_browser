@@ -13,6 +13,7 @@ import pytest
 from PIL import Image, ImageDraw, ImageFont
 from playwright.async_api import async_playwright
 
+import app.ocr_client as ocr_client_module
 from app.hardware import GPUDeviceCapability, HardwareCapabilitySnapshot, reset_host_capabilities_cache
 from app.ocr_client import (
     OCRRequest,
@@ -23,6 +24,8 @@ from app.ocr_client import (
     healthcheck_ocr_backend,
     normalize_glm_file_reference,
     probe_ocr_backend,
+    reset_policy_runtime_state,
+    reset_circuit_breakers,
     reset_quota_tracker,
     resolve_ocr_backend,
     submit_tiles,
@@ -38,9 +41,13 @@ OLMOCR_API_KEY = decouple_config("OLMOCR_API_KEY", default="")
 @pytest.fixture(autouse=True)
 def _reset_quota_tracker_fixture() -> Iterator[None]:
     reset_quota_tracker()
+    reset_circuit_breakers()
+    reset_policy_runtime_state()
     reset_host_capabilities_cache()
     yield
     reset_quota_tracker()
+    reset_circuit_breakers()
+    reset_policy_runtime_state()
     reset_host_capabilities_cache()
 
 
@@ -111,6 +118,40 @@ def _mock_local_service_ready(
                 "restart_count": 0,
                 "reason": self.reason,
             }
+            return payload
+
+    async def _fake_ensure_local_ocr_service(**_: object) -> _Status:
+        return _Status()
+
+    monkeypatch.setattr("app.ocr_client.ensure_local_ocr_service", _fake_ensure_local_ocr_service)
+
+
+def _mock_local_service_unhealthy(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    action: str = "start-failed",
+    reason: str = "startup-timeout",
+    status_code: int | None = None,
+) -> None:
+    class _Status:
+        def __init__(self) -> None:
+            self.healthy = False
+            self.action = action
+            self.reason = reason
+
+        def to_dict(self) -> dict[str, object]:
+            payload: dict[str, object] = {
+                "enabled": True,
+                "endpoint": "http://localhost:8001/v1",
+                "healthy": False,
+                "action": self.action,
+                "managed": True,
+                "launch_attempts": 1,
+                "restart_count": 0,
+                "reason": self.reason,
+            }
+            if status_code is not None:
+                payload["status_code"] = status_code
             return payload
 
     async def _fake_ensure_local_ocr_service(**_: object) -> _Status:
@@ -672,6 +713,209 @@ async def test_submit_tiles_local_cpu_retry_triggers_policy_reevaluation(
     assert result.batches[0].attempts == 2
     assert result.reevaluate_policy is True
     assert result.reevaluation_reason_code == "policy.reeval.failure"
+
+
+@pytest.mark.asyncio
+async def test_submit_tiles_local_cpu_latency_uses_hysteresis_suppression(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mock_local_service_ready(monkeypatch)
+    settings = get_settings()
+    local_settings = replace(
+        settings,
+        ocr=replace(
+            settings.ocr,
+            local_url="http://localhost:8001/v1",
+            model="glm-ocr",
+            min_concurrency=1,
+            max_concurrency=2,
+        ),
+    )
+    cpu_snapshot = HardwareCapabilitySnapshot(
+        os_platform="linux",
+        architecture="x86_64",
+        cpu_physical_cores=8,
+        cpu_logical_cores=16,
+        memory_total_mb=64000,
+        memory_available_mb=48000,
+        gpu_devices=(),
+        detection_sources=("psutil",),
+        detection_warnings=(),
+    )
+    monkeypatch.setattr("app.ocr_client.get_host_capabilities", lambda: cpu_snapshot)
+
+    async def _fake_submit_batch(  # noqa: ANN001
+        tile_batch,
+        *,
+        endpoint: str,
+        headers,
+        http_client,
+        use_fp8: bool,
+        backend_mode: str,
+        backend_id: str,
+    ):
+        del endpoint, headers, http_client, use_fp8, backend_mode, backend_id
+        tile_ids = tuple(tile.tile_id for tile in tile_batch)
+        telemetry = ocr_client_module.OCRBatchTelemetry(
+            tile_ids=tile_ids,
+            latency_ms=25_000,
+            status_code=200,
+            request_id="req-latency",
+            payload_bytes=1024,
+            attempts=1,
+        )
+        return ocr_client_module._BatchResult(
+            tile_ids=tile_ids,
+            markdown=["cpu-ok" for _ in tile_ids],
+            telemetry=telemetry,
+        )
+
+    monkeypatch.setattr(ocr_client_module, "_submit_batch", _fake_submit_batch)
+
+    request = OCRRequest(tile_id="tile-local-cpu-latency", tile_bytes=b"tile-local")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda _: httpx.Response(200))) as client:
+        first = await submit_tiles(requests=[request], settings=local_settings, client=client)
+        second = await submit_tiles(requests=[request], settings=local_settings, client=client)
+
+    assert first.reevaluate_policy is True
+    assert first.reevaluation_reason_code == "policy.reeval.latency"
+    assert second.reevaluate_policy is False
+    assert second.reevaluation_reason_code == "policy.reeval.suppressed.cooldown"
+    assert second.autotune is not None
+    assert second.autotune.policy_suppression_count >= 1
+    assert second.autotune.policy_cooldown_suppression_count >= 1
+
+
+@pytest.mark.asyncio
+async def test_submit_tiles_failover_from_local_to_remote_on_unhealthy_local(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = get_settings()
+    failover_settings = replace(
+        settings,
+        ocr=replace(
+            settings.ocr,
+            server_url="https://remote.example.com/api",
+            local_url="http://localhost:8001/v1",
+            model="glm-ocr",
+            api_key="remote-key",
+            min_concurrency=1,
+            max_concurrency=1,
+        ),
+    )
+    cpu_snapshot = HardwareCapabilitySnapshot(
+        os_platform="linux",
+        architecture="x86_64",
+        cpu_physical_cores=8,
+        cpu_logical_cores=16,
+        memory_total_mb=64000,
+        memory_available_mb=48000,
+        gpu_devices=(),
+        detection_sources=("psutil",),
+        detection_warnings=(),
+    )
+    monkeypatch.setattr("app.ocr_client.get_host_capabilities", lambda: cpu_snapshot)
+    _mock_local_service_unhealthy(monkeypatch, reason="startup-timeout", status_code=503)
+
+    seen_urls: list[str] = []
+    seen_auth: list[str | None] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        seen_urls.append(str(request.url))
+        seen_auth.append(request.headers.get("Authorization"))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "remote-ok"}}]})
+
+    request = OCRRequest(tile_id="tile-failover-001", tile_bytes=b"tile")
+    transport = httpx.MockTransport(_handler)
+    async with httpx.AsyncClient(transport=transport) as client:
+        result = await submit_tiles(requests=[request], settings=failover_settings, client=client)
+
+    assert result.backend.backend_id.endswith("-remote-openai")
+    assert result.markdown_chunks == ["remote-ok"]
+    assert seen_urls == ["https://remote.example.com/api/chat/completions"]
+    assert seen_auth == ["Bearer remote-key"]
+    assert result.failover_events
+    first_event = result.failover_events[0]
+    assert first_event.event == "backend_failed"
+    assert first_event.reason_code == "runtime.failover.local-unhealthy"
+    assert first_event.next_backend_id == "glm-ocr-remote-openai"
+    assert first_event.status_code == 503
+    assert result.failover_events[-1].event == "backend_selected"
+    assert result.failover_events[-1].reason_code == "runtime.failover.promoted"
+
+
+@pytest.mark.asyncio
+async def test_submit_tiles_failover_skips_open_circuit_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = get_settings()
+    failover_settings = replace(
+        settings,
+        ocr=replace(
+            settings.ocr,
+            server_url="https://remote.example.com/api",
+            local_url="http://localhost:8001/v1",
+            model="glm-ocr",
+            api_key="remote-key",
+            min_concurrency=1,
+            max_concurrency=1,
+        ),
+    )
+    cpu_snapshot = HardwareCapabilitySnapshot(
+        os_platform="linux",
+        architecture="x86_64",
+        cpu_physical_cores=8,
+        cpu_logical_cores=16,
+        memory_total_mb=64000,
+        memory_available_mb=48000,
+        gpu_devices=(),
+        detection_sources=("psutil",),
+        detection_warnings=(),
+    )
+    monkeypatch.setattr("app.ocr_client.get_host_capabilities", lambda: cpu_snapshot)
+
+    local_attempts = 0
+
+    class _UnhealthyStatus:
+        healthy = False
+        action = "start-failed"
+        reason = "startup-timeout"
+
+        def to_dict(self) -> dict[str, object]:
+            return {
+                "enabled": True,
+                "endpoint": "http://localhost:8001/v1",
+                "healthy": False,
+                "action": "start-failed",
+                "reason": "startup-timeout",
+            }
+
+    async def _fake_ensure_local_ocr_service(**_: object) -> _UnhealthyStatus:
+        nonlocal local_attempts
+        local_attempts += 1
+        return _UnhealthyStatus()
+
+    monkeypatch.setattr("app.ocr_client.ensure_local_ocr_service", _fake_ensure_local_ocr_service)
+
+    request = OCRRequest(tile_id="tile-circuit-001", tile_bytes=b"tile")
+
+    def _handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"choices": [{"message": {"content": "remote-ok"}}]})
+
+    transport = httpx.MockTransport(_handler)
+    async with httpx.AsyncClient(transport=transport) as client:
+        first = await submit_tiles(requests=[request], settings=failover_settings, client=client)
+        second = await submit_tiles(requests=[request], settings=failover_settings, client=client)
+        third = await submit_tiles(requests=[request], settings=failover_settings, client=client)
+
+    assert first.backend.backend_id.endswith("-remote-openai")
+    assert second.backend.backend_id.endswith("-remote-openai")
+    assert third.backend.backend_id.endswith("-remote-openai")
+    assert local_attempts == 2
+    skip_events = [event for event in third.failover_events if event.event == "backend_skipped"]
+    assert skip_events
+    assert skip_events[0].reason_code == "runtime.failover.circuit-open"
+    assert skip_events[0].circuit_open is True
 
 
 @pytest.mark.asyncio

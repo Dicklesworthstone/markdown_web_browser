@@ -327,6 +327,10 @@ class ManifestMetadata(BaseModel):
         default=None,
         description="Local OCR lifecycle metadata (reuse/autostart/restart diagnostics)",
     )
+    ocr_failover_events: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="Structured OCR backend failover transitions and circuit-breaker events",
+    )
     profile_id: str | None = Field(
         default=None,
         description="Browser profile identifier used for the capture, when specified",
@@ -335,9 +339,13 @@ class ManifestMetadata(BaseModel):
         default=None,
         description="True when artifacts were reused from cache instead of running a new capture",
     )
+    cache_seed: str | None = Field(
+        default=None,
+        description="Backend-agnostic cache fingerprint seed derived from capture/OCR inputs",
+    )
     cache_key: str | None = Field(
         default=None,
-        description="Deterministic hash used to look up cached captures",
+        description="Deterministic hash used to look up cached captures (includes runtime backend path)",
     )
     dom_assists: list[dict[str, Any]] = Field(
         default_factory=list,

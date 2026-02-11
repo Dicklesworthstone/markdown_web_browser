@@ -9,7 +9,7 @@ import tarfile
 import pytest
 import zstandard as zstd
 
-from app.store import StorageConfig, Store
+from app.store import StorageConfig, Store, _build_runtime_cache_key
 from app.tiler import TileSlice
 from app.schemas import (
     ConcurrencyWindow,
@@ -350,6 +350,70 @@ def test_store_infers_backend_fields_for_legacy_manifest(tmp_path: Path) -> None
     assert record.backend_mode == "openai-compatible"
     assert record.hardware_path == "remote"
     assert record.fallback_chain == ["olmocr-remote-openai"]
+
+
+def test_store_recomputes_cache_key_from_runtime_backend(tmp_path: Path) -> None:
+    store = _storage(tmp_path)
+    job_id = "run-runtime-cache"
+    store.allocate_run(
+        job_id=job_id,
+        url="https://example.org/runtime-cache",
+        started_at=datetime(2025, 11, 8, 9, 50, tzinfo=timezone.utc),
+        cache_key="stale-pre-ocr-key",
+    )
+    manifest_dict = {
+        "url": "https://example.org/runtime-cache",
+        "cache_seed": "seed-xyz",
+        "cache_key": "stale-pre-ocr-key",
+        "backend_id": "glm-ocr-remote-openai",
+        "backend_mode": "openai-compatible",
+        "hardware_path": "remote",
+        "fallback_chain": ["glm-ocr-local-openai", "glm-ocr-remote-openai"],
+        "environment": {
+            "cft_version": "chrome-131",
+            "viewport": {"device_scale_factor": 2},
+        },
+    }
+    store.write_manifest(job_id=job_id, manifest=manifest_dict)
+
+    expected = _build_runtime_cache_key(
+        cache_seed="seed-xyz",
+        backend_id="glm-ocr-remote-openai",
+        backend_mode="openai-compatible",
+        hardware_path="remote",
+        fallback_chain=["glm-ocr-local-openai", "glm-ocr-remote-openai"],
+    )
+    record = store.fetch_run(job_id)
+    assert record is not None
+    assert record.cache_key == expected
+    loaded = store.read_manifest(job_id)
+    assert loaded["cache_key"] == expected
+
+
+def test_store_preserves_cache_key_for_legacy_manifests_without_seed(tmp_path: Path) -> None:
+    store = _storage(tmp_path)
+    job_id = "run-legacy-cache-key"
+    store.allocate_run(
+        job_id=job_id,
+        url="https://example.org/legacy-cache",
+        started_at=datetime(2025, 11, 8, 9, 55, tzinfo=timezone.utc),
+        cache_key="legacy-cache-key",
+    )
+    manifest_dict = {
+        "url": "https://example.org/legacy-cache",
+        "cache_key": "legacy-cache-key",
+        "backend_id": "olmocr-remote-openai",
+        "backend_mode": "openai-compatible",
+        "hardware_path": "remote",
+        "fallback_chain": ["olmocr-remote-openai"],
+    }
+    store.write_manifest(job_id=job_id, manifest=manifest_dict)
+
+    record = store.fetch_run(job_id)
+    assert record is not None
+    assert record.cache_key == "legacy-cache-key"
+    loaded = store.read_manifest(job_id)
+    assert loaded["cache_key"] == "legacy-cache-key"
 
 
 def test_store_persists_ocr_batches_and_quota(tmp_path: Path) -> None:

@@ -41,7 +41,7 @@ guarded hyphenation, table seam rules)
 ### Tiling & Imaging
 - **pyvips** for crop/resize/encode — fastest/lowest memory at large sizes; PNG lossless for OCR (non‑interlaced). 
 - **Geometry**: overlap ≈120 px; pre‑downscale each slice so longest side ≤1288 px; record cssY offset, DPR, hashes.
-- **Hashes**: internal cache key via `xxh3_128`; provenance via SHA‑256 stored in manifest.
+- **Hashes**: cache keys use SHA‑256 with a two-part strategy (backend-agnostic `cache_seed` + runtime backend fingerprint) to prevent cross-backend cache poisoning; provenance hashes remain SHA‑256 in manifests.
 
 ### OCR I/O
 - **HTTP/2** `httpx.AsyncClient(http2=True)` to multiplex many small tile requests to the same host. 
@@ -63,6 +63,11 @@ guarded hyphenation, table seam rules)
       before entering normal transport backoff.
     - Lifecycle manager probes/reuses existing local services, then optionally autostarts
       with deterministic bounded restart behavior when local services are absent/unhealthy.
+    - Runtime failover executes ordered backend fallback chains with in-process
+      circuit-breaker suppression for repeatedly failing backends.
+    - Runtime policy re-evaluation applies anti-flap guardrails (cooldown + flap-window
+      hysteresis) with explicit suppression reason codes, while hard-failure signals still
+      bypass suppression immediately.
     - Exposes adaptive local-GPU concurrency metadata via `probe.capabilities`
       so orchestration can reason about effective runtime ceilings.
     - Exposes conservative local-CPU concurrency metadata and emits runtime
@@ -116,6 +121,9 @@ Both scripts live under `scripts/agents/`, are Typer CLIs, and share helpers (`s
   The prefix (`cache_key[:2]`) keeps directory fan-out manageable, and the cache key
   itself lets tooling jump straight from `_build_cache_key()` → filesystem path without
   scraping SQLite first.
+  `cache_seed` stays stable for capture inputs, while `cache_key` is finalized from
+  the runtime backend path (`backend_id/mode/hardware/fallback_chain`) so failover outputs
+  do not overwrite cache entries for a different execution path.
 - **SQLite metadata (`RUNS_DB_PATH`)** — `RunRecord`/`LinkRecord` tables capture CfT
   label/build, screenshot style hash, OCR policy, backend mode/path/fallback-chain,
   concurrency window, timing metrics,

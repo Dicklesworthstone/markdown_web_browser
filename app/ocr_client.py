@@ -18,9 +18,14 @@ from app.ocr_policy import (
     BACKEND_MODE_MAAS,
     BACKEND_MODE_OPENAI_COMPATIBLE,
     OCRBackendCandidate,
+    OCRHysteresisSettings,
     OCRPolicyDecision,
     OCRPolicyInputs,
+    OCRPolicyRuntimeState,
+    OCRReevaluationContext,
     OCRRuntimeSignal,
+    REASON_REEVAL_SUPPRESSED_COOLDOWN,
+    REASON_REEVAL_SUPPRESSED_FLAPPING,
     select_ocr_backend,
     should_reevaluate_policy,
 )
@@ -33,6 +38,13 @@ _BACKOFF_SCHEDULE = (3.0, 9.0)
 _MAX_ATTEMPTS = len(_BACKOFF_SCHEDULE) + 1
 _QUOTA_WARNING_RATIO = 0.7
 _CPU_LATENCY_SPIKE_MS = 20_000
+_CIRCUIT_BREAKER_FAILURE_THRESHOLD = 2
+_CIRCUIT_BREAKER_OPEN_SECONDS = 120
+_POLICY_HYSTERESIS_DEFAULTS = OCRHysteresisSettings()
+REASON_FAILOVER_SUBMISSION_FAILED = "runtime.failover.submission-failed"
+REASON_FAILOVER_LOCAL_UNHEALTHY = "runtime.failover.local-unhealthy"
+REASON_FAILOVER_CIRCUIT_OPEN = "runtime.failover.circuit-open"
+REASON_FAILOVER_PROMOTED = "runtime.failover.promoted"
 GLM_OPENAI_DEFAULT_MODEL = "glm-ocr"
 GLM_MAAS_DEFAULT_MODEL = "glm-ocr"
 GLM_MAAS_DEFAULT_API_URL = "https://open.bigmodel.cn/api/paas/v4/layout_parsing"
@@ -264,6 +276,41 @@ class OCRQuotaStatus:
     warning_triggered: bool
 
 
+@dataclass(slots=True)
+class OCRFailoverEvent:
+    """Structured failover transition/skip/failure metadata."""
+
+    event: str
+    backend_id: str
+    backend_mode: str
+    hardware_path: str
+    reason_code: str
+    from_backend_id: str | None = None
+    next_backend_id: str | None = None
+    status_code: int | None = None
+    detail: str | None = None
+    circuit_open: bool = False
+
+    def to_dict(self) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "event": self.event,
+            "backend_id": self.backend_id,
+            "backend_mode": self.backend_mode,
+            "hardware_path": self.hardware_path,
+            "reason_code": self.reason_code,
+            "circuit_open": self.circuit_open,
+        }
+        if self.from_backend_id is not None:
+            payload["from_backend_id"] = self.from_backend_id
+        if self.next_backend_id is not None:
+            payload["next_backend_id"] = self.next_backend_id
+        if self.status_code is not None:
+            payload["status_code"] = self.status_code
+        if self.detail is not None:
+            payload["detail"] = self.detail
+        return payload
+
+
 def _default_backend_runtime() -> OCRBackendRuntime:
     return OCRBackendRuntime(
         backend_id="olmocr-remote-openai",
@@ -286,6 +333,7 @@ class SubmitTilesResult:
     backend: OCRBackendRuntime = field(default_factory=_default_backend_runtime)
     host_capabilities: dict[str, object] | None = None
     local_service: dict[str, object] | None = None
+    failover_events: list[OCRFailoverEvent] = field(default_factory=list)
     autotune: "OcrAutotuneSnapshot | None" = None
     reevaluate_policy: bool = False
     reevaluation_reason_code: str | None = None
@@ -317,12 +365,24 @@ class OcrAutotuneSnapshot:
     final_limit: int
     peak_limit: int
     events: list[OcrAutotuneEvent] = field(default_factory=list)
+    reevaluate_policy: bool = False
+    reevaluation_reason_code: str | None = None
+    policy_suppression_count: int = 0
+    policy_cooldown_suppression_count: int = 0
+    policy_flap_suppression_count: int = 0
+    policy_switch_count_window: int = 0
 
     def to_dict(self) -> dict[str, object]:
         return {
             "initial_limit": self.initial_limit,
             "final_limit": self.final_limit,
             "peak_limit": self.peak_limit,
+            "reevaluate_policy": self.reevaluate_policy,
+            "reevaluation_reason_code": self.reevaluation_reason_code,
+            "policy_suppression_count": self.policy_suppression_count,
+            "policy_cooldown_suppression_count": self.policy_cooldown_suppression_count,
+            "policy_flap_suppression_count": self.policy_flap_suppression_count,
+            "policy_switch_count_window": self.policy_switch_count_window,
             "events": [
                 {
                     "previous_limit": e.previous_limit,
@@ -372,6 +432,59 @@ class _QuotaTracker:
 
 
 _quota_tracker = _QuotaTracker()
+
+
+class _CircuitBreaker:
+    """Simple per-backend circuit breaker with failure threshold + cooldown."""
+
+    def __init__(self, *, threshold: int, open_seconds: int) -> None:
+        self._threshold = max(1, threshold)
+        self._open_seconds = max(1, open_seconds)
+        self._consecutive_failures: dict[str, int] = {}
+        self._open_until: dict[str, float] = {}
+
+    def is_open(self, backend_id: str) -> bool:
+        until = self._open_until.get(backend_id, 0.0)
+        now = time.monotonic()
+        if until <= now:
+            if backend_id in self._open_until:
+                self._open_until.pop(backend_id, None)
+            return False
+        return True
+
+    def open_until(self, backend_id: str) -> float | None:
+        until = self._open_until.get(backend_id)
+        if until is None:
+            return None
+        remaining = until - time.monotonic()
+        if remaining <= 0:
+            self._open_until.pop(backend_id, None)
+            return None
+        return remaining
+
+    def record_failure(self, backend_id: str) -> tuple[bool, float | None]:
+        failures = self._consecutive_failures.get(backend_id, 0) + 1
+        self._consecutive_failures[backend_id] = failures
+        if failures < self._threshold:
+            return False, None
+        until = time.monotonic() + float(self._open_seconds)
+        self._open_until[backend_id] = until
+        return True, self._open_seconds
+
+    def record_success(self, backend_id: str) -> None:
+        self._consecutive_failures.pop(backend_id, None)
+        self._open_until.pop(backend_id, None)
+
+    def reset(self) -> None:
+        self._consecutive_failures.clear()
+        self._open_until.clear()
+
+
+_circuit_breaker = _CircuitBreaker(
+    threshold=_CIRCUIT_BREAKER_FAILURE_THRESHOLD,
+    open_seconds=_CIRCUIT_BREAKER_OPEN_SECONDS,
+)
+_policy_runtime_state_by_backend: dict[str, OCRPolicyRuntimeState] = {}
 
 
 class _AutotuneController:
@@ -549,7 +662,7 @@ async def probe_ocr_backend(
         )
         local_service = status.to_dict()
     endpoint = _normalize_endpoint(
-        _select_server_url(cfg),
+        _select_server_url(cfg, backend=backend),
         backend_mode=backend.backend_mode,
     )
     capabilities: dict[str, object] = {
@@ -661,23 +774,6 @@ async def submit_tiles(
     cfg = settings or get_settings()
     capabilities_snapshot = get_host_capabilities()
     backend = resolve_ocr_backend(cfg, capabilities=capabilities_snapshot)
-    local_service: dict[str, object] | None = None
-    if backend.backend_id.endswith("-local-openai"):
-        status = await ensure_local_ocr_service(
-            settings=cfg,
-            capabilities=capabilities_snapshot,
-            preferred_hardware_path=backend.hardware_path,
-        )
-        local_service = status.to_dict()
-        if not status.healthy:
-            reason = status.reason or status.action
-            raise RuntimeError(f"Local OCR service unavailable ({reason})")
-    if backend.backend_mode not in {BACKEND_MODE_OPENAI_COMPATIBLE, BACKEND_MODE_MAAS}:
-        raise NotImplementedError(
-            "Configured OCR backend mode is not wired for tile submission yet: "
-            f"{backend.backend_mode}"
-        )
-
     if not requests:
         empty_quota = OCRQuotaStatus(
             limit=None, used=None, threshold_ratio=_QUOTA_WARNING_RATIO, warning_triggered=False
@@ -688,39 +784,180 @@ async def submit_tiles(
             quota=empty_quota,
             backend=backend,
             host_capabilities=capabilities_snapshot.to_dict(),
-            local_service=local_service,
+            local_service=None,
         )
 
-    server_url = _select_server_url(cfg)
+    failover_events: list[OCRFailoverEvent] = []
+    chain = list(backend.fallback_chain)
+    if not chain:
+        chain = [backend.backend_id]
+    last_error: Exception | None = None
+    previous_backend_id: str | None = None
+
+    for idx, candidate_id in enumerate(chain):
+        candidate = _runtime_for_backend_candidate(
+            selected=backend,
+            candidate_id=candidate_id,
+            capabilities=capabilities_snapshot,
+        )
+        next_backend_id = chain[idx + 1] if idx + 1 < len(chain) else None
+
+        if _circuit_breaker.is_open(candidate.backend_id):
+            open_remaining = _circuit_breaker.open_until(candidate.backend_id)
+            detail = (
+                f"circuit-open-{open_remaining:.0f}s"
+                if isinstance(open_remaining, (int, float))
+                else "circuit-open"
+            )
+            failover_events.append(
+                OCRFailoverEvent(
+                    event="backend_skipped",
+                    backend_id=candidate.backend_id,
+                    backend_mode=candidate.backend_mode,
+                    hardware_path=candidate.hardware_path,
+                    reason_code=REASON_FAILOVER_CIRCUIT_OPEN,
+                    from_backend_id=previous_backend_id,
+                    next_backend_id=next_backend_id,
+                    detail=detail,
+                    circuit_open=True,
+                )
+            )
+            previous_backend_id = candidate.backend_id
+            continue
+
+        local_service: dict[str, object] | None = None
+        if candidate.backend_id.endswith("-local-openai"):
+            status = await ensure_local_ocr_service(
+                settings=cfg,
+                capabilities=capabilities_snapshot,
+                preferred_hardware_path=candidate.hardware_path,
+            )
+            local_service = status.to_dict()
+            if not status.healthy:
+                circuit_opened, cooldown_s = _circuit_breaker.record_failure(candidate.backend_id)
+                detail_parts = [str(status.reason or status.action)]
+                if circuit_opened and cooldown_s is not None:
+                    detail_parts.append(f"circuit-open-{int(cooldown_s)}s")
+                status_code = local_service.get("status_code")
+                failover_events.append(
+                    OCRFailoverEvent(
+                        event="backend_failed",
+                        backend_id=candidate.backend_id,
+                        backend_mode=candidate.backend_mode,
+                        hardware_path=candidate.hardware_path,
+                        reason_code=REASON_FAILOVER_LOCAL_UNHEALTHY,
+                        from_backend_id=previous_backend_id,
+                        next_backend_id=next_backend_id,
+                        status_code=status_code if isinstance(status_code, int) else None,
+                        detail=", ".join(detail_parts),
+                        circuit_open=circuit_opened,
+                    )
+                )
+                previous_backend_id = candidate.backend_id
+                last_error = RuntimeError(
+                    f"Local OCR service unavailable ({status.reason or status.action})"
+                )
+                continue
+
+        try:
+            result = await _submit_tiles_single_backend(
+                requests=requests,
+                settings=cfg,
+                capabilities=capabilities_snapshot,
+                backend=candidate,
+                local_service=local_service,
+                client=client,
+            )
+        except Exception as exc:
+            circuit_opened, cooldown_s = _circuit_breaker.record_failure(candidate.backend_id)
+            status_code = _status_code_from_exception(exc)
+            detail_parts = [f"{exc.__class__.__name__}: {exc}"]
+            if circuit_opened and cooldown_s is not None:
+                detail_parts.append(f"circuit-open-{int(cooldown_s)}s")
+            failover_events.append(
+                OCRFailoverEvent(
+                    event="backend_failed",
+                    backend_id=candidate.backend_id,
+                    backend_mode=candidate.backend_mode,
+                    hardware_path=candidate.hardware_path,
+                    reason_code=REASON_FAILOVER_SUBMISSION_FAILED,
+                    from_backend_id=previous_backend_id,
+                    next_backend_id=next_backend_id,
+                    status_code=status_code,
+                    detail=", ".join(detail_parts),
+                    circuit_open=circuit_opened,
+                )
+            )
+            previous_backend_id = candidate.backend_id
+            last_error = exc
+            continue
+
+        _circuit_breaker.record_success(candidate.backend_id)
+        if idx > 0:
+            failover_events.append(
+                OCRFailoverEvent(
+                    event="backend_selected",
+                    backend_id=candidate.backend_id,
+                    backend_mode=candidate.backend_mode,
+                    hardware_path=candidate.hardware_path,
+                    reason_code=REASON_FAILOVER_PROMOTED,
+                    from_backend_id=previous_backend_id,
+                )
+            )
+        result.failover_events = failover_events
+        return result
+
+    if last_error is None:
+        last_error = RuntimeError("No OCR backend candidates available")
+    raise RuntimeError(
+        "OCR failover exhausted all backend candidates: "
+        + ", ".join(chain)
+    ) from last_error
+
+
+async def _submit_tiles_single_backend(
+    *,
+    requests: Sequence[OCRRequest],
+    settings: Settings,
+    capabilities: HardwareCapabilitySnapshot,
+    backend: OCRBackendRuntime,
+    local_service: dict[str, object] | None,
+    client: httpx.AsyncClient | None,
+) -> SubmitTilesResult:
+    if backend.backend_mode not in {BACKEND_MODE_OPENAI_COMPATIBLE, BACKEND_MODE_MAAS}:
+        raise NotImplementedError(
+            "Configured OCR backend mode is not wired for tile submission yet: "
+            f"{backend.backend_mode}"
+        )
+
+    server_url = _select_server_url(settings, backend=backend)
     endpoint = _normalize_endpoint(server_url, backend_mode=backend.backend_mode)
 
     headers = {"Content-Type": "application/json"}
-    if cfg.ocr.api_key and not cfg.ocr.local_url:
-        headers["Authorization"] = f"Bearer {cfg.ocr.api_key}"
+    if settings.ocr.api_key and not backend.backend_id.endswith("-local-openai"):
+        headers["Authorization"] = f"Bearer {settings.ocr.api_key}"
 
     request_timeout = _resolve_request_timeout(backend=backend)
     owns_client = client is None
     http_client = client or httpx.AsyncClient(timeout=request_timeout, http2=True)
 
     min_limit, max_limit, _ = _resolve_runtime_concurrency_limits(
-        settings=cfg,
+        settings=settings,
         backend=backend,
-        capabilities=capabilities_snapshot,
+        capabilities=capabilities,
     )
     limiter = _AdaptiveLimiter(_AutotuneController(min_limit=min_limit, max_limit=max_limit))
-    encoded_tiles = [_encode_request(req, cfg) for req in requests]
+    encoded_tiles = [_encode_request(req, settings) for req in requests]
 
-    # OpenAI-compatible + GLM MaaS both return one OCR payload per request.
     max_batch_tiles = (
         1
         if backend.backend_mode in {BACKEND_MODE_OPENAI_COMPATIBLE, BACKEND_MODE_MAAS}
-        else max(1, cfg.ocr.max_batch_tiles)
+        else max(1, settings.ocr.max_batch_tiles)
     )
-
     batches = _group_tiles(
         encoded_tiles,
         max_tiles=max_batch_tiles,
-        max_bytes=max(1, cfg.ocr.max_batch_bytes),
+        max_bytes=max(1, settings.ocr.max_batch_bytes),
     )
 
     telemetry: list[OCRBatchTelemetry] = []
@@ -733,7 +970,7 @@ async def submit_tiles(
                 endpoint=endpoint,
                 headers=headers,
                 http_client=http_client,
-                use_fp8=cfg.ocr.use_fp8,
+                use_fp8=settings.ocr.use_fp8,
                 backend_mode=backend.backend_mode,
                 backend_id=backend.backend_id,
             )
@@ -749,21 +986,31 @@ async def submit_tiles(
             await http_client.aclose()
 
     quota_status = _quota_tracker.record(
-        len(requests), limit=cfg.ocr.daily_quota_tiles, ratio=_QUOTA_WARNING_RATIO
+        len(requests), limit=settings.ocr.daily_quota_tiles, ratio=_QUOTA_WARNING_RATIO
     )
-    reevaluate_policy, reevaluation_reason_code = _evaluate_runtime_policy_reevaluation(
+    reevaluate_policy, reevaluation_reason_code, policy_state = _evaluate_runtime_policy_reevaluation(
         backend=backend,
         batches=telemetry,
     )
+    autotune_snapshot = limiter.snapshot()
+    autotune_snapshot.reevaluate_policy = reevaluate_policy
+    autotune_snapshot.reevaluation_reason_code = reevaluation_reason_code
+    if policy_state is not None:
+        autotune_snapshot.policy_suppression_count = policy_state.suppression_count
+        autotune_snapshot.policy_cooldown_suppression_count = (
+            policy_state.cooldown_suppression_count
+        )
+        autotune_snapshot.policy_flap_suppression_count = policy_state.flap_suppression_count
+        autotune_snapshot.policy_switch_count_window = len(policy_state.switch_timestamps)
     markdown_chunks = [markdown_by_id[tile.tile_id] for tile in encoded_tiles]
     return SubmitTilesResult(
         markdown_chunks=markdown_chunks,
         batches=telemetry,
         quota=quota_status,
         backend=backend,
-        host_capabilities=capabilities_snapshot.to_dict(),
+        host_capabilities=capabilities.to_dict(),
         local_service=local_service,
-        autotune=limiter.snapshot(),
+        autotune=autotune_snapshot,
         reevaluate_policy=reevaluate_policy,
         reevaluation_reason_code=reevaluation_reason_code,
     )
@@ -773,6 +1020,18 @@ def reset_quota_tracker() -> None:
     """Reset quota accounting (exposed for testability)."""
 
     _quota_tracker.reset()
+
+
+def reset_circuit_breakers() -> None:
+    """Reset failover circuit breaker state (exposed for testability)."""
+
+    _circuit_breaker.reset()
+
+
+def reset_policy_runtime_state() -> None:
+    """Reset hysteresis/flapping runtime state (exposed for testability)."""
+
+    _policy_runtime_state_by_backend.clear()
 
 
 @dataclass(slots=True)
@@ -1061,8 +1320,54 @@ def _extract_request_id(response: httpx.Response, payload: dict) -> str | None:
     return None
 
 
-def _select_server_url(settings: Settings) -> str:
-    if settings.ocr.local_url:
+def _status_code_from_exception(exc: Exception) -> int | None:
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code
+    cause = getattr(exc, "__cause__", None)
+    if isinstance(cause, Exception):
+        return _status_code_from_exception(cause)
+    return None
+
+
+def _runtime_for_backend_candidate(
+    *,
+    selected: OCRBackendRuntime,
+    candidate_id: str,
+    capabilities: HardwareCapabilitySnapshot,
+) -> OCRBackendRuntime:
+    if candidate_id == selected.backend_id:
+        return selected
+
+    candidate_mode = _mode_from_backend_id(candidate_id)
+    candidate_hardware = _hardware_path_for_candidate(
+        candidate_id,
+        default_hardware_path=selected.hardware_path,
+        preferred_local_hardware=capabilities.preferred_hardware_path,
+    )
+    reason_codes = list(selected.reason_codes)
+    if REASON_FAILOVER_PROMOTED not in reason_codes:
+        reason_codes.append(REASON_FAILOVER_PROMOTED)
+    return OCRBackendRuntime(
+        backend_id=candidate_id,
+        backend_mode=candidate_mode,
+        hardware_path=candidate_hardware,
+        fallback_chain=selected.fallback_chain,
+        provider=selected.provider,
+        reason_codes=tuple(reason_codes),
+        reevaluate_after_s=selected.reevaluate_after_s,
+    )
+
+
+def _select_server_url(
+    settings: Settings,
+    *,
+    backend: OCRBackendRuntime | None = None,
+) -> str:
+    if backend and backend.backend_id.endswith("-local-openai"):
+        if settings.ocr.local_url:
+            return settings.ocr.local_url
+        return settings.ocr.server_url
+    if settings.ocr.local_url and backend is None:
         return settings.ocr.local_url
     return settings.ocr.server_url
 
@@ -1147,11 +1452,11 @@ def _evaluate_runtime_policy_reevaluation(
     *,
     backend: OCRBackendRuntime,
     batches: Sequence[OCRBatchTelemetry],
-) -> tuple[bool, str | None]:
+) -> tuple[bool, str | None, OCRPolicyRuntimeState | None]:
     if not batches:
-        return False, None
+        return False, None, None
     if not (backend.backend_id.endswith("-local-openai") and backend.hardware_path == "cpu"):
-        return False, None
+        return False, None, None
 
     signal = OCRRuntimeSignal.NO_CHANGE
     if any(batch.attempts >= 2 for batch in batches):
@@ -1160,12 +1465,22 @@ def _evaluate_runtime_policy_reevaluation(
         signal = OCRRuntimeSignal.LATENCY_SPIKE
 
     if signal == OCRRuntimeSignal.NO_CHANGE:
-        return False, None
+        return False, None, None
+
+    previous_state = _policy_runtime_state_by_backend.get(
+        backend.backend_id, OCRPolicyRuntimeState()
+    )
 
     decision = should_reevaluate_policy(
         signal=signal,
         decision=_runtime_policy_decision_from_backend(backend),
+        context=OCRReevaluationContext(
+            now_ts=time.monotonic(),
+            state=previous_state,
+            hysteresis=_POLICY_HYSTERESIS_DEFAULTS,
+        ),
     )
+    _policy_runtime_state_by_backend[backend.backend_id] = decision.state
     if decision.should_reevaluate:
         LOGGER.warning(
             "OCR runtime requested policy reevaluation (backend=%s, signal=%s, reason=%s)",
@@ -1173,8 +1488,21 @@ def _evaluate_runtime_policy_reevaluation(
             signal.value,
             decision.reason_code,
         )
-        return True, decision.reason_code
-    return False, None
+        return True, decision.reason_code, decision.state
+    if decision.reason_code in {
+        REASON_REEVAL_SUPPRESSED_COOLDOWN,
+        REASON_REEVAL_SUPPRESSED_FLAPPING,
+    }:
+        LOGGER.info(
+            "OCR runtime policy reevaluation suppressed (backend=%s, signal=%s, reason=%s, cooldown_remaining_s=%s, flap_window_count=%s)",
+            backend.backend_id,
+            signal.value,
+            decision.reason_code,
+            decision.cooldown_remaining_s,
+            decision.flap_window_count,
+        )
+        return False, decision.reason_code, decision.state
+    return False, None, decision.state
 
 
 def _model_alias_candidates(model: str, *, backend_id: str) -> tuple[str, ...]:
