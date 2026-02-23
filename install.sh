@@ -2,9 +2,9 @@
 # Markdown Web Browser - All-in-One Installer Script
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/anthropics/markdown_web_browser/main/install.sh | bash
-#   curl -fsSL https://raw.githubusercontent.com/anthropics/markdown_web_browser/main/install.sh | bash -s -- --yes
-#   wget -qO- https://raw.githubusercontent.com/anthropics/markdown_web_browser/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/markdown_web_browser/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/markdown_web_browser/main/install.sh | bash -s -- --yes
+#   wget -qO- https://raw.githubusercontent.com/Dicklesworthstone/markdown_web_browser/main/install.sh | bash
 #
 # Options:
 #   --yes, -y, --easy-mode Skip all confirmations (non-interactive mode)
@@ -17,7 +17,7 @@
 set -euo pipefail
 
 # Configuration
-REPO_URL="${MDWB_REPO_URL:-https://github.com/anthropics/markdown_web_browser.git}"
+REPO_URL="${MDWB_REPO_URL:-https://github.com/Dicklesworthstone/markdown_web_browser.git}"
 DEFAULT_INSTALL_DIR="./markdown_web_browser"
 PYTHON_VERSION="${MDWB_PYTHON_VERSION:-3.13}"
 
