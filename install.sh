@@ -308,9 +308,9 @@ setup_python_env() {
     print_color "$GREEN" "✓ Python environment ready"
 }
 
-# Function to detect Chrome for Testing version
+# Function to detect Playwright Chromium version
 detect_cft_version() {
-    print_color "$BLUE" "Detecting Chrome for Testing version..."
+    print_color "$BLUE" "Detecting Playwright Chromium version..."
 
     # Try to get version info from playwright
     local version_output=$(uv run playwright install chromium --dry-run 2>&1 || true)
@@ -329,10 +329,10 @@ detect_cft_version() {
 
     if [ -z "$cft_version" ]; then
         # Fallback: use a reasonable default if detection fails
-        print_color "$YELLOW" "Could not auto-detect CfT version, using default"
+        print_color "$YELLOW" "Could not auto-detect Chromium version, using default"
         cft_version="chrome-130.0.6723.69"
     else
-        print_color "$GREEN" "✓ Detected Chrome for Testing: $cft_version"
+        print_color "$GREEN" "✓ Detected Playwright Chromium: $cft_version"
     fi
 
     echo "$cft_version"
@@ -345,22 +345,22 @@ install_playwright_browsers() {
         return 0
     fi
 
-    print_color "$BLUE" "Installing Chrome for Testing via Playwright..."
-    print_color "$YELLOW" "  Note: This installs the deterministic Chrome for Testing build,"
-    print_color "$YELLOW" "        NOT regular Chromium, to ensure reproducible screenshots."
+    print_color "$BLUE" "Installing Playwright Chromium..."
+    print_color "$YELLOW" "  Note: This installs Playwright's pinned Chromium build,"
+    print_color "$YELLOW" "        ensuring deterministic, reproducible screenshots."
 
     # Install Chromium via Playwright (--channel=cft removed; unsupported in Playwright 1.57+)
     uv run playwright install chromium --with-deps
 
-    # Verify CfT installation with fallback checks
+    # Verify Chromium installation with fallback checks
     local verify_output=$(uv run playwright install chromium --dry-run 2>&1)
     if echo "$verify_output" | grep -qE "(is already installed|already exists)"; then
-        print_color "$GREEN" "✓ Chrome for Testing installed successfully"
+        print_color "$GREEN" "✓ Playwright Chromium installed successfully"
     elif [ -d "$HOME/.cache/ms-playwright" ] || [ -d "$HOME/Library/Caches/ms-playwright" ]; then
-        print_color "$YELLOW" "⚠ CfT verification uncertain, but browser cache exists - proceeding"
+        print_color "$YELLOW" "⚠ Chromium verification uncertain, but browser cache exists - proceeding"
     else
-        print_color "$RED" "✗ Chrome for Testing installation may have failed"
-        print_color "$YELLOW" "  The system may not work correctly without CfT"
+        print_color "$RED" "✗ Playwright Chromium installation may have failed"
+        print_color "$YELLOW" "  The system may not work correctly without Chromium"
         return 1
     fi
 
@@ -383,7 +383,7 @@ setup_config() {
         print_color "$GREEN" "✓ .env file already exists"
     fi
 
-    # Detect and update CfT version in .env
+    # Detect and update Playwright Chromium version in .env
     if [ "$INSTALL_BROWSERS" = true ] && [ -f ".env" ]; then
         local detected_version=$(detect_cft_version)
 
@@ -455,15 +455,15 @@ run_tests() {
             all_passed=false
         fi
 
-        # Verify Chrome for Testing is actually installed
+        # Verify Playwright Chromium is actually installed
         local cft_check=$(uv run playwright install chromium --dry-run 2>&1)
         if echo "$cft_check" | grep -qE "(is already installed|already exists)"; then
-            print_color "$GREEN" "✓ Chrome for Testing is installed and ready"
+            print_color "$GREEN" "✓ Playwright Chromium is installed and ready"
         elif [ -d "$HOME/.cache/ms-playwright" ] || [ -d "$HOME/Library/Caches/ms-playwright" ]; then
             # Fallback: check if Playwright browser cache exists
-            print_color "$YELLOW" "⚠ Chrome for Testing verification uncertain, but browser cache exists"
+            print_color "$YELLOW" "⚠ Playwright Chromium verification uncertain, but browser cache exists"
         else
-            print_color "$RED" "✗ Chrome for Testing not detected"
+            print_color "$RED" "✗ Playwright Chromium not detected"
             print_color "$YELLOW" "  System may not work correctly - screenshots won't be deterministic"
             all_passed=false
         fi
@@ -600,8 +600,8 @@ main() {
     echo
 
     if [ "$INSTALL_BROWSERS" = true ]; then
-        print_color "$BLUE" "Chrome for Testing Information:"
-        print_color "$BLUE" "  • Ensures deterministic, reproducible screenshots"
+        print_color "$BLUE" "Playwright Chromium Information:"
+        print_color "$BLUE" "  • Pinned build ensures deterministic, reproducible screenshots"
         print_color "$BLUE" "  • Version recorded in every manifest.json"
         print_color "$BLUE" "  • Check your .env for CFT_VERSION and CFT_LABEL settings"
         echo
