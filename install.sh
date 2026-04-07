@@ -30,7 +30,12 @@ NC='\033[0m' # No Color
 
 # Default options
 INSTALL_DIR="$DEFAULT_INSTALL_DIR"
-SKIP_CONFIRM=false
+# Auto-detect CI/non-interactive environments
+if [ "${CI:-}" = "true" ] || [ "${NONINTERACTIVE:-}" = "1" ] || [ ! -t 0 ]; then
+    SKIP_CONFIRM=true
+else
+    SKIP_CONFIRM=false
+fi
 INSTALL_DEPS=true
 INSTALL_BROWSERS=true
 OCR_API_KEY=""
