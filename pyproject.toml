@@ -10,7 +10,7 @@ requires-python = ">=3.13"
 dependencies = [
   "fastapi>=0.115",
   "uvicorn[standard]>=0.30",
-  "granian>=2.1.2",
+  "granian>=2.7.3",
   "playwright>=1.48",
   "pillow>=11.0",
   "pyvips>=2.2",
