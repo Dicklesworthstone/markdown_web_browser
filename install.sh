@@ -20,6 +20,7 @@ set -euo pipefail
 REPO_URL="${MDWB_REPO_URL:-https://github.com/Dicklesworthstone/markdown_web_browser.git}"
 DEFAULT_INSTALL_DIR="./markdown_web_browser"
 PYTHON_VERSION="${MDWB_PYTHON_VERSION:-3.13}"
+APT_LOCK_WAIT_SECONDS="${MDWB_APT_LOCK_WAIT_SECONDS:-300}"
 
 # Colors for output
 RED='\033[0;31m'
@@ -44,7 +45,7 @@ OCR_API_KEY=""
 print_color() {
     local color=$1
     shift
-    echo -e "${color}$@${NC}"
+    printf '%b%s%b\n' "$color" "$*" "$NC"
 }
 
 # Function to print usage
@@ -136,6 +137,81 @@ command_exists() {
     command -v "$1" &> /dev/null
 }
 
+sudo_noninteractive_works() {
+    command_exists sudo && sudo -n true 2>/dev/null
+}
+
+apt_lock_is_held() {
+    local lockfile="$1"
+
+    [ -e "$lockfile" ] || return 1
+
+    if command_exists fuser; then
+        if fuser "$lockfile" >/dev/null 2>&1; then
+            return 0
+        fi
+
+        if sudo_noninteractive_works && sudo -n fuser "$lockfile" >/dev/null 2>&1; then
+            return 0
+        fi
+    fi
+
+    if command_exists lsof; then
+        if lsof "$lockfile" >/dev/null 2>&1; then
+            return 0
+        fi
+
+        if sudo_noninteractive_works && sudo -n lsof "$lockfile" >/dev/null 2>&1; then
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+first_held_apt_lock() {
+    local lockfile
+    for lockfile in \
+        /var/lib/dpkg/lock-frontend \
+        /var/lib/dpkg/lock \
+        /var/lib/apt/lists/lock \
+        /var/cache/apt/archives/lock
+    do
+        if apt_lock_is_held "$lockfile"; then
+            printf '%s\n' "$lockfile"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+wait_for_apt_locks() {
+    local waited=0
+    local interval=5
+    local lockfile
+
+    while lockfile="$(first_held_apt_lock)"; do
+        if [ "$waited" -ge "$APT_LOCK_WAIT_SECONDS" ]; then
+            print_color "$RED" "Error: apt/dpkg lock still held after ${APT_LOCK_WAIT_SECONDS}s: $lockfile"
+            print_color "$YELLOW" "Wait for other package operations to finish, then rerun the installer."
+            return 1
+        fi
+
+        if [ "$waited" -eq 0 ]; then
+            print_color "$YELLOW" "APT is busy ($lockfile); waiting for the current package operation to finish..."
+        fi
+
+        sleep "$interval"
+        waited=$((waited + interval))
+    done
+}
+
+run_apt_get() {
+    wait_for_apt_locks
+    sudo env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a NEEDRESTART_SUSPEND=1 apt-get "$@"
+}
+
 # Function to detect OS
 detect_os() {
     if [[ "$OSTYPE" == "linux-gnu"* ]]; then
@@ -192,7 +268,8 @@ install_system_deps() {
         return 0
     fi
 
-    local os_type=$(detect_os)
+    local os_type
+    os_type=$(detect_os)
 
     print_color "$BLUE" "Installing system dependencies for $os_type..."
 
@@ -201,15 +278,15 @@ install_system_deps() {
             if [ "$SKIP_CONFIRM" = false ]; then
                 read -p "Install system dependencies (libvips-dev, git)? [Y/n] " -n 1 -r
                 echo
-                if [[ ! $REPLY =~ ^[Yy]$ ]] && [ ! -z "$REPLY" ]; then
+                if [[ ! $REPLY =~ ^[Yy]$ ]] && [ -n "$REPLY" ]; then
                     print_color "$YELLOW" "Skipping system dependencies"
                     return 0
                 fi
             fi
 
             print_color "$BLUE" "Installing libvips and other dependencies..."
-            sudo apt-get update
-            sudo apt-get install -y libvips-dev git
+            run_apt_get update
+            run_apt_get install -y libvips-dev git
             ;;
 
         macos)
@@ -274,16 +351,9 @@ setup_repository() {
         git pull origin main
     else
         if [ -d "$INSTALL_DIR" ]; then
-            if [ "$SKIP_CONFIRM" = false ]; then
-                read -p "Directory $INSTALL_DIR exists. Remove and reinstall? [y/N] " -n 1 -r
-                echo
-                if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-                    print_color "$YELLOW" "Installation cancelled"
-                    exit 1
-                fi
-            fi
-            # Safe to remove after validation above
-            rm -rf "$INSTALL_DIR"
+            print_color "$RED" "Error: $INSTALL_DIR exists but is not a git checkout."
+            print_color "$YELLOW" "Choose a different --dir path or move the existing directory aside before reinstalling."
+            exit 1
         fi
 
         print_color "$BLUE" "Cloning repository..."
@@ -318,7 +388,8 @@ detect_cft_version() {
     print_color "$BLUE" "Detecting Playwright Chromium version..."
 
     # Try to get version info from playwright
-    local version_output=$(uv run playwright install chromium --dry-run 2>&1 || true)
+    local version_output
+    version_output=$(uv run playwright install chromium --dry-run 2>&1 || true)
 
     # Extract version from output (format varies, try multiple patterns)
     local cft_version=""
@@ -328,7 +399,8 @@ detect_cft_version() {
         cft_version=$(echo "$version_output" | grep -oE "chrome-[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" | head -1)
     elif echo "$version_output" | grep -qE "[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+"; then
         # Sometimes it's just the version without "chrome-" prefix
-        local raw_version=$(echo "$version_output" | grep -oE "[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" | head -1)
+        local raw_version
+        raw_version=$(echo "$version_output" | grep -oE "[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" | head -1)
         cft_version="chrome-${raw_version}"
     fi
 
@@ -355,10 +427,14 @@ install_playwright_browsers() {
     print_color "$YELLOW" "        ensuring deterministic, reproducible screenshots."
 
     # Install Chromium via Playwright (--channel=cft removed; unsupported in Playwright 1.57+)
+    if [ "$(detect_os)" = "debian" ]; then
+        wait_for_apt_locks
+    fi
     uv run playwright install chromium --with-deps
 
     # Verify Chromium installation with fallback checks
-    local verify_output=$(uv run playwright install chromium --dry-run 2>&1)
+    local verify_output
+    verify_output=$(uv run playwright install chromium --dry-run 2>&1)
     if echo "$verify_output" | grep -qE "(is already installed|already exists)"; then
         print_color "$GREEN" "✓ Playwright Chromium installed successfully"
     elif [ -d "$HOME/.cache/ms-playwright" ] || [ -d "$HOME/Library/Caches/ms-playwright" ]; then
@@ -390,9 +466,10 @@ setup_config() {
 
     # Detect and update Playwright Chromium version in .env
     if [ "$INSTALL_BROWSERS" = true ] && [ -f ".env" ]; then
-        local detected_version=$(detect_cft_version)
+        local detected_version
+        detected_version=$(detect_cft_version)
 
-        if [ ! -z "$detected_version" ]; then
+        if [ -n "$detected_version" ]; then
             # Update CFT_VERSION in .env (safe approach: remove old line, append new)
             if grep -q "^CFT_VERSION=" .env; then
                 # Create temp file without CFT_VERSION line, then append new value
@@ -415,7 +492,7 @@ setup_config() {
     fi
 
     # Set OCR API key if provided
-    if [ ! -z "$OCR_API_KEY" ]; then
+    if [ -n "$OCR_API_KEY" ]; then
         if [ -f ".env" ] && grep -q "^OLMOCR_API_KEY=" .env; then
             # Safe approach: remove old line, append new (handles special chars in API key)
             grep -v "^OLMOCR_API_KEY=" .env > .env.tmp || true
@@ -461,7 +538,8 @@ run_tests() {
         fi
 
         # Verify Playwright Chromium is actually installed
-        local cft_check=$(uv run playwright install chromium --dry-run 2>&1)
+        local cft_check
+        cft_check=$(uv run playwright install chromium --dry-run 2>&1)
         if echo "$cft_check" | grep -qE "(is already installed|already exists)"; then
             print_color "$GREEN" "✓ Playwright Chromium is installed and ready"
         elif [ -d "$HOME/.cache/ms-playwright" ] || [ -d "$HOME/Library/Caches/ms-playwright" ]; then
@@ -485,8 +563,9 @@ run_tests() {
     # Test environment configuration
     if [ -f ".env" ]; then
         # Check for non-empty OLMOCR_API_KEY value (any format)
-        local api_key_value=$(grep "^OLMOCR_API_KEY=" .env 2>/dev/null | cut -d= -f2-)
-        if [ ! -z "$api_key_value" ] && [ "$api_key_value" != "sk-***" ]; then
+        local api_key_value
+        api_key_value=$(grep "^OLMOCR_API_KEY=" .env 2>/dev/null | cut -d= -f2-)
+        if [ -n "$api_key_value" ] && [ "$api_key_value" != "sk-***" ]; then
             print_color "$GREEN" "✓ OCR API key configured in .env"
         else
             print_color "$YELLOW" "⚠ OCR API key not set - system will not work until configured"
@@ -519,7 +598,8 @@ EOF
     chmod +x "$launcher_path"
 
     # Get absolute path for display
-    local abs_launcher_path="$(cd "$(dirname "$launcher_path")" && pwd)/$(basename "$launcher_path")"
+    local abs_launcher_path
+    abs_launcher_path="$(cd "$(dirname "$launcher_path")" && pwd)/$(basename "$launcher_path")"
 
     print_color "$GREEN" "✓ Created launcher script: $abs_launcher_path"
     print_color "$YELLOW" "  You can add it to your PATH or create an alias:"
@@ -540,7 +620,7 @@ main() {
     print_color "$YELLOW" "  • Install system deps: $INSTALL_DEPS"
     print_color "$YELLOW" "  • Install browsers: $INSTALL_BROWSERS"
 
-    if [ ! -z "$OCR_API_KEY" ]; then
+    if [ -n "$OCR_API_KEY" ]; then
         print_color "$YELLOW" "  • OCR API key: ${OCR_API_KEY:0:10}..."
     fi
     echo
@@ -549,7 +629,7 @@ main() {
     if [ "$SKIP_CONFIRM" = false ]; then
         read -p "Proceed with installation? [Y/n] " -n 1 -r
         echo
-        if [[ ! $REPLY =~ ^[Yy]$ ]] && [ ! -z "$REPLY" ]; then
+        if [[ ! $REPLY =~ ^[Yy]$ ]] && [ -n "$REPLY" ]; then
             print_color "$YELLOW" "Installation cancelled"
             exit 0
         fi
@@ -586,7 +666,8 @@ main() {
     echo
 
     # Get absolute install path for display
-    local abs_install_path="$(pwd)"
+    local abs_install_path
+    abs_install_path="$(pwd)"
 
     print_color "$BLUE" "Quick Start:"
     print_color "$BLUE" "  cd $abs_install_path"
