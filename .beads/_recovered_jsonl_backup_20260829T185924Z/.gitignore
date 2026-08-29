@@ -39,5 +39,3 @@ daemon-*.log.gz
 
 # Local history backups
 .br_history/
-.write.lock
-*.tmp
