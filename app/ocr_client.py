@@ -707,22 +707,10 @@ async def healthcheck_ocr_backend(
 
     probe = await probe_ocr_backend(settings=settings, client=client)
     cfg = settings or get_settings()
-    if (
-        probe.backend.backend_id.endswith("-local-openai")
-        and probe.local_service is not None
-        and not bool(probe.local_service.get("healthy"))
-    ):
-        local_status_value = probe.local_service.get("status_code")
-        local_status_code = local_status_value if isinstance(local_status_value, int) else None
-        reason = str(probe.local_service.get("reason") or "local-service-unhealthy")
-        return OCRBackendHealth(
-            backend=probe.backend,
-            healthy=False,
-            status_code=local_status_code,
-            reason_code="local-service-unhealthy",
-            detail=reason,
-            local_service=probe.local_service,
-        )
+    # The HTTP probe is the source of truth: a reachable endpoint (status < 500) wins
+    # even when the local vLLM autostart failed. Only when both the probe failed AND
+    # local service is unhealthy do we surface local-service-unhealthy so operators see
+    # the actionable cause instead of a generic network-error.
     request_timeout = _resolve_request_timeout(backend=probe.backend)
     owns_client = client is None
     http_client = client or httpx.AsyncClient(timeout=request_timeout, http2=True)
@@ -752,6 +740,27 @@ async def healthcheck_ocr_backend(
     finally:
         if owns_client:
             await http_client.aclose()
+    # When the probe failed with a network error AND local service is unhealthy AND
+    # the configured backend is local-openai, prefer the actionable local reason over
+    # network-error so operators see the real cause (vLLM not running).
+    local_service = probe.local_service or {}
+    if (
+        not healthy
+        and reason_code == "network-error"
+        and probe.backend.backend_id.endswith("-local-openai")
+        and not bool(local_service.get("healthy"))
+    ):
+        local_status_value = local_service.get("status_code")
+        local_status_code = local_status_value if isinstance(local_status_value, int) else None
+        local_reason = str(local_service.get("reason") or "local-service-unhealthy")
+        return OCRBackendHealth(
+            backend=probe.backend,
+            healthy=False,
+            status_code=local_status_code,
+            reason_code="local-service-unhealthy",
+            detail=local_reason,
+            local_service=probe.local_service,
+        )
     return OCRBackendHealth(
         backend=probe.backend,
         healthy=healthy,

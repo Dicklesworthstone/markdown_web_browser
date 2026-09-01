@@ -85,17 +85,17 @@ def _slice_sync(
         # Fallback to sequential if needed
         image = vips.Image.new_from_buffer(image_bytes, "", access="sequential")
 
-    # Downscale only when the width exceeds the 1288 px guidance; height is handled via tiling.
+    # Downscale only when the width exceeds the 1288 px guidance. We use vscale=1.0
+    # so the height is preserved (width-only resize); the resulting tile's reported
+    # height matches the source even though it shares the same scale ratio.
     scale = 1.0
     if image.width > target_long_side_px:
         scale = target_long_side_px / image.width
-        image = image.resize(scale)
+        image = image.resize(scale, vscale=1.0)
 
     tiles: List[TileSlice] = []
     height = image.height
     width = image.width
-
-    overlap_px = min(overlap_px, target_long_side_px)
 
     if height <= target_long_side_px:
         # Use pngsave_buffer for more reliable PNG encoding

@@ -99,7 +99,7 @@ from app.store import StorageConfig, Store  # noqa: E402
 from app.tiler import TileSlice  # noqa: E402
 
 
-async def _fake_runner(*, job_id: str, url: str, store: Store, config=None):  # noqa: ANN001
+async def _fake_runner(*, job_id: str, url: str, store: Store, config=None, request=None):  # noqa: ANN001
     manifest_cls = cast(Any, CaptureManifest)
     scroll_policy_cls = cast(Any, ScrollPolicy)
     sweep_stats_cls = cast(Any, SweepStats)
@@ -383,9 +383,9 @@ async def test_job_manager_passes_profile_id_to_runner(tmp_path: Path):
     config = StorageConfig(cache_root=tmp_path / "cache", db_path=tmp_path / "runs.db")
     captured: dict[str, Any] = {}
 
-    async def runner(*, job_id: str, url: str, store: Store, config=None):  # noqa: ANN001
+    async def runner(*, job_id: str, url: str, store: Store, config=None, request=None):  # noqa: ANN001
         captured["profile_id"] = getattr(config, "profile_id", None)
-        return await _fake_runner(job_id=job_id, url=url, store=store, config=config)
+        return await _fake_runner(job_id=job_id, url=url, store=store, config=config, request=request)
 
     manager = JobManager(store=Store(config), runner=runner)
     snapshot = await manager.create_job(

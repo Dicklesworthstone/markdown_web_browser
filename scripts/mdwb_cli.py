@@ -1147,6 +1147,19 @@ def fetch(
         "--cache/--no-cache",
         help="Reuse cached captures when an identical configuration already exists.",
     ),
+    semantic_post: bool = typer.Option(
+        False,
+        "--semantic-post/--no-semantic-post",
+        help=(
+            "Run the optional LLM semantic post-processing pass on the stitched "
+            "Markdown. Requires SEMANTIC_POST_ENDPOINT in the server environment."
+        ),
+    ),
+    semantic_post_max_chars: Optional[int] = typer.Option(
+        None,
+        "--semantic-post-max-chars",
+        help="Cap Markdown characters sent to the semantic fixer (default 50000).",
+    ),
     reuse_session: bool = typer.Option(
         False,
         "--reuse-session/--no-reuse-session",
@@ -1219,6 +1232,10 @@ def fetch(
             if profile:
                 payload["profile_id"] = profile
             payload["reuse_cache"] = cache
+            if semantic_post:
+                payload["semantic_post_enabled"] = True
+            if semantic_post_max_chars:
+                payload["semantic_post_max_chars"] = semantic_post_max_chars
             if ocr_policy:
                 payload["ocr"] = {"policy": ocr_policy}
 
@@ -1441,6 +1458,242 @@ def watch(
     finally:
         if shared_client is not None:
             shared_client.close()
+
+
+        if shared_client is not None:
+            shared_client.close()
+
+
+@cli.command()
+def crawl(
+    url: str = typer.Argument(..., help="Seed URL to crawl"),
+    api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
+    max_pages: int = typer.Option(10, "--max-pages", help="Hard cap on captured pages"),
+    max_depth: int = typer.Option(1, "--max-depth", help="0=seed only, 1=seed+discovered"),
+    domain_allowlist: Optional[str] = typer.Option(
+        None,
+        "--domain-allowlist",
+        help="Comma-separated domain list to restrict expansion",
+    ),
+    respect_robots_txt: bool = typer.Option(
+        True, "--respect-robots/--no-respect-robots", help="Honor robots.txt"
+    ),
+    crawl_delay_ms: int = typer.Option(500, "--crawl-delay-ms", help="Delay between requests"),
+    reuse_cache: bool = typer.Option(True, "--reuse-cache/--no-cache"),
+    profile: Optional[str] = typer.Option(None, "--profile"),
+    ocr_policy: Optional[str] = typer.Option(None, "--ocr-policy"),
+    watch: bool = typer.Option(
+        True,
+        "--watch/--no-watch",
+        help="Poll /crawl/{id} until completion and print live progress.",
+    ),
+    poll_interval: float = typer.Option(2.0, "--poll-interval", help="Seconds between polls."),
+    json_output: bool = typer.Option(False, "--json", help="Emit final crawl status as JSON."),
+    http2: bool = typer.Option(True, "--http2/--no-http2"),
+) -> None:
+    """Crawl a seed URL with depth-1 expansion (PLAN §15)."""
+    api_root = _resolve_settings(api_base).base_url
+    payload: dict[str, Any] = {
+        "url": url,
+        "max_pages": max_pages,
+        "max_depth": max_depth,
+        "domain_allowlist": [
+            d.strip() for d in (domain_allowlist or "").split(",") if d.strip()
+        ],
+        "respect_robots_txt": respect_robots_txt,
+        "crawl_delay_ms": crawl_delay_ms,
+        "reuse_cache": reuse_cache,
+    }
+    if profile:
+        payload["profile_id"] = profile
+    if ocr_policy:
+        payload["ocr_policy"] = ocr_policy
+    with httpx.Client(http2=http2, timeout=30.0) as client:
+        response = client.post(f"{api_root}/jobs/crawl", json=payload)
+        response.raise_for_status()
+        initial = response.json()
+        if not watch:
+            if json_output:
+                typer.echo(json.dumps(initial, indent=2))
+            else:
+                typer.echo(
+                    f"crawl_id={initial['crawl_id']} seed={initial['seed_url']} status={initial['status']}"
+                )
+            return
+        crawl_id = initial["crawl_id"]
+        typer.echo(
+            f"crawl_id={crawl_id} seed={initial['seed_url']} "
+            f"queued={initial.get('queued_urls', [])}"
+        )
+        last_status: str | None = None
+        while True:
+            poll = client.get(f"{api_root}/crawl/{crawl_id}")
+            poll.raise_for_status()
+            snap = poll.json()
+            status = snap.get("status")
+            if status != last_status:
+                typer.echo(
+                    f"[{snap.get('visited', 0)} visited / {snap.get('completed', 0)} done / "
+                    f"{snap.get('failed', 0)} failed / {snap.get('pending', 0)} pending] status={status}"
+                )
+                last_status = status
+            if status in {"completed", "failed"}:
+                if json_output:
+                    typer.echo(json.dumps(snap, indent=2))
+                else:
+                    for r in snap.get("results", []):
+                        typer.echo(
+                            f"  - [{r.get('status'):>7}] {r.get('url')} job_id={r.get('job_id')}"
+                        )
+                return
+            time.sleep(poll_interval)
+
+
+@cli.command()
+def slo(
+    api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
+    json_output: bool = typer.Option(False, "--json", help="Emit raw JSON instead of a table."),
+    budget_file: Optional[Path] = typer.Option(
+        None,
+        "--budget-file",
+        help="Path to the SLO budget YAML (defaults to scripts/slo_budgets.yaml if present).",
+    ),
+) -> None:
+    """Print the latest capture/OCR SLO rollup.
+
+    Hits /metrics/slo (which runs compute_slo_summary in-process against the
+    freshest manifest index) and prints the per-category p50/p95 + breaches.
+    """
+    api_root = _resolve_settings(api_base).base_url
+    with httpx.Client(timeout=15.0) as client:
+        response = client.get(f"{api_root}/metrics/slo")
+        response.raise_for_status()
+        data = response.json()
+    if json_output:
+        typer.echo(json.dumps(data, indent=2))
+        return
+    if data.get("status") == "no-data":
+        typer.echo("[yellow]No manifests recorded yet — run a capture or smoke first.[/]")
+        return
+    typer.echo(f"SLO rollup generated_at={data.get('generated_at')} entries={data.get('entry_count', 0)}")
+    for category, metrics in (data.get("categories") or {}).items():
+        if not isinstance(metrics, dict):
+            continue
+        p50 = metrics.get("p50_total_ms") or metrics.get("p50_ms") or "-"
+        p95 = metrics.get("p95_total_ms") or metrics.get("p95_ms") or "-"
+        breaches = metrics.get("breach_count") or metrics.get("breaches") or 0
+        budget = metrics.get("budget_p95_ms") or "-"
+        typer.echo(
+            f"  {category:>20s}  p50={p50}  p95={p95}  budget={budget}  breaches={breaches}"
+        )
+
+
+@cli.command()
+def discover(
+    api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
+    json_output: bool = typer.Option(False, "--json", help="Emit JSON instead of text."),
+    live: bool = typer.Option(
+        True,
+        "--live/--no-live",
+        help="Augment the static catalog with the live /openapi.json summary (offline-safe).",
+    ),
+) -> None:
+    """Print a machine-friendly catalog of every endpoint + command.
+
+    Combines a curated surface (cli, artifacts, capabilities) with the live
+    FastAPI OpenAPI schema so an agent can discover what the running server
+    actually exposes without reading source code.
+    """
+    api_root = _resolve_settings(api_base).base_url  # validated for default api base
+    live_endpoints: list[dict[str, Any]] = []
+    if live:
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                schema_resp = client.get(f"{api_root}/openapi.json")
+                schema_resp.raise_for_status()
+                schema = schema_resp.json()
+            for path, ops in schema.get("paths", {}).items():
+                for method, info in ops.items():
+                    if method.lower() not in {"get", "post", "put", "delete", "patch"}:
+                        continue
+                    summary = (info or {}).get("summary") or (info or {}).get("description", "")
+                    live_endpoints.append(
+                        {"method": method.upper(), "path": path, "summary": summary[:200]}
+                    )
+        except Exception as exc:  # pragma: no cover - offline-safe
+            typer.echo(f"[dim](discover: live schema fetch failed: {exc})[/dim]", err=True)
+
+    catalog = {
+        "api": {
+            "POST /jobs": "Create a capture (returns job_id; supports profile_id, ocr_policy, reuse_cache)",
+            "POST /jobs/crawl": "Kick off a depth-1 crawl that reuses the capture pipeline",
+            "POST /replay": "Replay a stored manifest",
+            "GET /jobs/{id}": "Fetch latest job snapshot",
+            "GET /jobs/{id}/stream": "SSE: live state + manifest progress",
+            "GET /jobs/{id}/events": "NDJSON: structured event log",
+            "GET /jobs/{id}/links.json": "DOM-harvested anchors/forms/headings",
+            "GET /jobs/{id}/manifest.json": "Full CfT + timings + OCR telemetry",
+            "GET /jobs/{id}/result.md": "Final Markdown output",
+            "GET /jobs/{id}/artifact/highlight": "HTML viewer for a tile region",
+            "GET /jobs/{id}/artifact/{path}": "Read any artifact (tiles, links.json, dom_snapshot.html)",
+            "POST /jobs/{id}/embeddings/search": "Search sqlite-vec section embeddings",
+            "POST /jobs/{id}/webhooks": "Register a webhook callback",
+            "GET /jobs/{id}/webhooks": "List active webhook subscriptions",
+            "DELETE /jobs/{id}/webhooks": "Remove a webhook (by id or url)",
+            "GET /crawl/{id}": "Live crawl status",
+            "GET /health": "Health check",
+            "GET /metrics": "Prometheus scrape endpoint",
+        },
+        "cli": {
+            "mdwb fetch <url> [--watch] [--reuse-cache]": "Submit + optionally stream a capture",
+            "mdwb show <job_id> [--ocr-metrics]": "Dump latest snapshot (table or JSON)",
+            "mdwb stream <job_id>": "Tail SSE feed",
+            "mdwb events <job_id>": "Tail NDJSON event log",
+            "mdwb watch <job_id>": "Live progress overlay",
+            "mdwb crawl <seed_url> [--watch]": "Depth-1 crawl",
+            "mdwb discover": "Print this catalog",
+            "mdwb diag <job_id>": "CfT/Playwright/timings triage",
+            "mdwb dom links --job-id <id>": "Render stored links.json",
+            "mdwb replay manifest <manifest.json>": "Resubmit a stored manifest",
+            "mdwb jobs ocr-metrics <job_id>": "OCR batch telemetry",
+            "mdwb jobs embeddings search <job_id>": "sqlite-vec section search",
+            "mdwb jobs bundle <job_id>": "Tar+compress job artifacts",
+            "mdwb jobs agents bead-summary <plan.md>": "Convert checklist to bead summaries",
+            "mdwb warnings --count N": "Tail ops/warnings.jsonl",
+            "mdwb demo stream|snapshot|events": "Exercise demo endpoints (no live pipeline)",
+            "mdwb resume status --root PATH": "Inspect resume state",
+        },
+        "artifacts": {
+            "out.md": "Final Markdown with provenance comments",
+            "links.json": "DOM-harvested anchors/forms/headings/meta",
+            "dom_snapshot.html": "Raw DOM capture",
+            "artifact/tiles/tile_*.png": "Viewport-sweep tiles (1288 px long side)",
+            "manifest.json": "CfT label/build + Playwright version + screenshot style hash + timings",
+            "bundle.tar.zst": "Optional tarball (via jobs bundle)",
+        },
+        "capabilities": {
+            "cache_key": "url + CfT + viewport + DSF + OCR model + profile (content-addressed)",
+            "ocr_models": "Hosted (olmOCR-2-7B-1025-FP8 default) + local vLLM/SGLang adapters",
+            "ocr_autotune": "Adaptive concurrency min->max based on latency/error",
+            "profiles": "Persistent Chromium storage_state, slug-safe ids",
+            "embeddings": "sqlite-vec section-level search (1536 dim)",
+            "determinism": "Chrome for Testing pinned + reduced motion + animation freeze",
+        },
+    }
+    catalog["api_live"] = {f"{e['method']} {e['path']}": e["summary"] for e in live_endpoints}
+
+    if json_output:
+        typer.echo(json.dumps(catalog, indent=2))
+        return
+    for surface, items in catalog.items():
+        typer.echo(f"== {surface} ==")
+        for endpoint, description in items.items():
+            typer.echo(f"  {endpoint}")
+            typer.echo(f"    {description}")
+        typer.echo("")
+
+
+
 
 
 @demo_cli.command("snapshot")

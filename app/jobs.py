@@ -12,6 +12,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Mapping, Sequence, Type
 from uuid import uuid4
 
 import hashlib
+import os
 import hmac
 import json
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
@@ -36,6 +37,7 @@ from app.ocr_client import OCRRequest, SubmitTilesResult, resolve_ocr_backend, s
 from app.schemas import JobCreateRequest, ManifestMetadata
 from app.settings import Settings, settings as global_settings
 from app.store import Store, build_store
+from app.semantic_post import SemanticPostSettings, apply_semantic_post
 from app.stitch import stitch_markdown
 from app.warning_log import append_warning_log, summarize_dom_assists
 
@@ -210,7 +212,7 @@ class JobManager:
             return self._snapshot_payload(job_id)
 
         task = asyncio.create_task(
-            self._run_job(job_id=job_id, url=request.url, config=capture_config)
+            self._run_job(job_id=job_id, url=request.url, config=capture_config, request=request)
         )
         self._tasks[job_id] = task
         return self._snapshot_payload(job_id)
@@ -434,7 +436,14 @@ class JobManager:
                 LOGGER.exception("Watchdog loop error: %s", exc)
                 # Continue running despite errors
 
-    async def _run_job(self, *, job_id: str, url: str, config: CaptureConfig | None = None) -> None:
+    async def _run_job(
+        self,
+        *,
+        job_id: str,
+        url: str,
+        config: CaptureConfig | None = None,
+        request: JobCreateRequest | None = None,
+    ) -> None:
         storage = self.store
         started_at = datetime.now(timezone.utc)
         profile_id = getattr(config, "profile_id", None)
@@ -459,6 +468,7 @@ class JobManager:
                 url=url,
                 store=self.store,
                 config=config,
+                request=request,
             )
             run_record = self.store.fetch_run(job_id)
             manifest_path = str(run_record.manifest_path) if run_record else ""
@@ -728,6 +738,7 @@ async def execute_capture_job(
     url: str,
     store: Store | None = None,
     config: CaptureConfig | None = None,
+    request: JobCreateRequest | None = None,
 ) -> tuple[CaptureResult, list[dict[str, object]]]:
     """Run the capture pipeline, persisting artifacts + manifest via ``Store``."""
 
@@ -739,6 +750,7 @@ async def execute_capture_job(
         markdown, ocr_ms, stitch_ms, ocr_links = await _run_ocr_pipeline(
             job_id=job_id,
             capture_result=capture_result,
+            request=request,
         )
         capture_result.manifest.ocr_ms = ocr_ms
         capture_result.manifest.stitch_ms = stitch_ms
@@ -807,6 +819,7 @@ async def _run_ocr_pipeline(
     *,
     job_id: str,
     capture_result: CaptureResult,
+    request: JobCreateRequest | None = None,
 ) -> tuple[str, int | None, int | None, Sequence[LinkRecord]]:
     """Submit tiles to olmOCR and stitch the resulting Markdown."""
 
@@ -877,6 +890,30 @@ async def _run_ocr_pipeline(
             for event in seam_events
         ]
     stitch_ms = int((time.perf_counter() - stitch_start) * 1000)
+
+    # Optional semantic post-processing pass: LLM cleans the stitched Markdown.
+    # Honors request-level semantic_post_enabled + max_chars; env provides endpoint/model/key.
+    semantic_settings = SemanticPostSettings(
+        enabled=bool(getattr(request, "semantic_post_enabled", False)),
+        endpoint=os.environ.get("SEMANTIC_POST_ENDPOINT", "") or "",
+        model=os.environ.get("SEMANTIC_POST_MODEL", "") or "",
+        api_key=os.environ.get("SEMANTIC_POST_API_KEY", "") or "",
+        max_chars=getattr(request, "semantic_post_max_chars", None),
+    )
+    if semantic_settings.enabled:
+        sem_start = time.perf_counter()
+        sem_result = await apply_semantic_post(
+            markdown=markdown,
+            manifest=capture_result.manifest,
+            job_id=job_id,
+            settings=semantic_settings,
+        )
+        markdown = sem_result.markdown
+        capture_result.manifest.semantic_post_summary = sem_result.summary
+        capture_result.manifest.semantic_post_ms = int(
+            (time.perf_counter() - sem_start) * 1000
+        )
+
     ocr_links = extract_links_from_markdown(markdown)
     return markdown, ocr_ms, stitch_ms, ocr_links
 

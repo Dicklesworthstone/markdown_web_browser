@@ -110,6 +110,8 @@ class CaptureManifest:
     ocr_autotune: dict[str, object] | None = None
     seam_markers: list[dict[str, object]] = field(default_factory=list)
     seam_marker_events: list[dict[str, object]] = field(default_factory=list)
+    semantic_post_summary: dict[str, object] | None = None
+    semantic_post_ms: int | None = None
 
 
 @dataclass(slots=True)

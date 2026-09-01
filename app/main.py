@@ -24,9 +24,14 @@ from prometheus_client import start_http_server
 from prometheus_fastapi_instrumentator import Instrumentator
 
 from app import metrics
+from app.crawler import CrawlConfig, get_crawler, submit_and_wait_for_job
 from app.dom_links import blend_dom_with_ocr, demo_dom_links, demo_ocr_links, serialize_links
 from app.jobs import JobManager, JobSnapshot, JobState, build_signed_webhook_sender
 from app.schemas import (
+    CrawlRequest,
+    CrawlResponse,
+    CrawlStatusResponse,
+    CrawlUrlResult,
     EmbeddingSearchRequest,
     EmbeddingSearchResponse,
     JobCreateRequest,
@@ -87,6 +92,7 @@ except ValueError:  # pragma: no cover - already registered
 
 JOB_MANAGER = JobManager(webhook_sender=build_signed_webhook_sender(settings.webhook_secret))
 store = build_store()
+_crawler = get_crawler(store=store)
 
 
 def _demo_manifest_payload() -> dict:
@@ -268,6 +274,67 @@ async def healthcheck() -> dict[str, str]:
     return {"status": "ok"}
 
 
+def _compute_live_slo_summary() -> dict[str, Any]:
+    """Compute a capture/OCR SLO rollup from the latest manifest index.
+
+    Falls back to an empty rollup when no manifests have been recorded yet, so
+    the endpoint is always safe to call (operators use this for dashboards and
+    pager health checks).
+    """
+    import json as _json
+    from scripts.compute_slo import (
+        compute_slo_summary,
+        load_budgets,
+    )
+
+    summary: dict[str, Any] = {"status": "no-data", "categories": {}, "generated_at": datetime.now(timezone.utc).isoformat()}
+    candidates = [
+        Path("benchmarks/production/latest_manifest_index.json"),
+        Path("benchmarks/production/weekly_summary.json"),
+    ]
+    entries: list[dict[str, Any]] = []
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        try:
+            payload = _json.loads(candidate.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if isinstance(payload, list):
+            entries = payload
+            break
+        if isinstance(payload, dict):
+            for key in ("entries", "manifests", "items"):
+                if isinstance(payload.get(key), list):
+                    entries = payload[key]
+                    break
+            else:
+                entries = [payload]
+            break
+    if entries:
+        budgets = load_budgets(None)
+        rollup = compute_slo_summary(entries, budget_map=budgets)
+        summary = {
+            "status": "ok",
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "categories": rollup,
+            "entry_count": len(entries),
+        }
+    return summary
+
+
+@app.get("/metrics/slo", tags=["observability"])
+async def metrics_slo() -> dict[str, Any]:
+    """Return the latest capture/OCR SLO rollup as JSON.
+
+    Reads the most recent manifest index (production smoke or weekly summary)
+    and runs ``compute_slo_summary`` in-process so dashboards and pager checks
+    can hit a single stable endpoint instead of running the CLI separately.
+    """
+
+    return _compute_live_slo_summary()
+
+
 @app.get("/jobs/demo")
 async def demo_job_snapshot() -> dict:
     """Return a deterministic demo job snapshot."""
@@ -279,6 +346,65 @@ async def demo_job_snapshot() -> dict:
 async def create_job(request: JobCreateRequest) -> JobSnapshotResponse:
     snapshot = await JOB_MANAGER.create_job(request)
     return _snapshot_to_response(snapshot)
+
+
+@app.post("/jobs/crawl", response_model=CrawlResponse, status_code=status.HTTP_202_ACCEPTED)
+async def start_crawl(request: CrawlRequest) -> CrawlResponse:
+    """Kick off a multi-URL crawl that reuses the capture pipeline."""
+    config = CrawlConfig(
+        seed_url=str(request.url),
+        max_pages=request.max_pages,
+        max_depth=request.max_depth,
+        domain_allowlist=list(request.domain_allowlist),
+        respect_robots_txt=request.respect_robots_txt,
+        crawl_delay_ms=request.crawl_delay_ms,
+    )
+
+    async def _capture(url: str) -> str:
+        return await submit_and_wait_for_job(
+            JOB_MANAGER,
+            url=url,
+            profile_id=request.profile_id,
+            ocr_policy=request.ocr_policy,
+            reuse_cache=request.reuse_cache,
+        )
+
+    crawl_id = await _crawler.start_crawl(config, capture_fn=_capture)
+    import asyncio
+
+    await asyncio.sleep(0)
+    snapshot = _crawler.get_crawl_status(crawl_id) or {}
+    return CrawlResponse(
+        crawl_id=crawl_id,
+        seed_url=config.seed_url,
+        status=snapshot.get("status", "running"),
+        started_at=snapshot.get("started_at", ""),
+        child_job_ids=[r.get("job_id") for r in snapshot.get("results", []) if r.get("job_id")],
+        queued_urls=list(snapshot.get("queued_urls") or [config.seed_url]),
+    )
+
+
+@app.get("/crawl/{crawl_id}", response_model=CrawlStatusResponse)
+async def get_crawl_status(crawl_id: str) -> CrawlStatusResponse:
+    snapshot = _crawler.get_crawl_status(crawl_id)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="Crawl not found")
+    return CrawlStatusResponse(
+        crawl_id=snapshot["crawl_id"],
+        seed_url=snapshot["seed_url"],
+        status=snapshot["status"],
+        started_at=snapshot["started_at"],
+        finished_at=snapshot["finished_at"],
+        max_pages=snapshot["max_pages"],
+        max_depth=snapshot["max_depth"],
+        visited=snapshot["visited"],
+        completed=snapshot["completed"],
+        failed=snapshot["failed"],
+        pending=snapshot["pending"],
+        queued_urls=snapshot.get("queued_urls", []),
+        results=[CrawlUrlResult(**r) for r in snapshot.get("results", [])],
+    )
+
 
 
 @app.get("/jobs/{job_id}", response_model=JobSnapshotResponse)

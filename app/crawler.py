@@ -12,6 +12,8 @@ from typing import Any, Dict, List, Optional, Set
 from urllib.parse import urljoin, urlparse
 from urllib.robotparser import RobotFileParser
 
+import json
+from pathlib import Path
 import httpx
 
 LOGGER = logging.getLogger(__name__)
@@ -117,9 +119,12 @@ class RobotsChecker:
 class CrawlOrchestrator:
     """Orchestrates depth-1 web crawling."""
 
-    def __init__(self):
+    def __init__(self, *, store: Any | None = None) -> None:
         self._active_crawls: Dict[str, CrawlState] = {}
         self._robots_checker: Optional[RobotsChecker] = None
+        # Optional JobManager-backed store; lets the crawler read links.json from
+        # completed jobs so depth-1 expansion follows real anchors (not stubs).
+        self._store = store
 
     def _should_crawl(self, url: str, config: CrawlConfig, current_depth: int) -> bool:
         """Determine if a URL should be crawled.
@@ -157,23 +162,51 @@ class CrawlOrchestrator:
 
         return True
 
-    async def _extract_links(self, url: str) -> List[str]:
-        """Extract links from a page's capture result.
+    async def _extract_links(
+        self,
+        *,
+        job_id: str,
+        store: Any | None = None,
+    ) -> List[str]:
+        """Extract outbound links from a completed capture job.
 
-        Args:
-            url: URL that was captured
-
-        Returns:
-            List of absolute URLs found on the page
+        Reads ``links.json`` (harvested by ``app.dom_links``) so depth-1 expansion
+        follows the same anchors operators see in the dashboard. Returns absolute
+        URLs only; relative URLs and fragments are dropped (handled by the seed
+        domain filter at expansion time).
         """
-        # In a real implementation, this would:
-        # 1. Get the job_id for this URL from the capture
-        # 2. Fetch links.json from the job artifacts
-        # 3. Parse and return the links
-
-        # For now, return empty list as this requires integration
-        # with the job system
-        return []
+        if not job_id or store is None:
+            return []
+        try:
+            record = store.get_run_record(job_id)  # type: ignore[attr-defined]
+        except Exception as exc:
+            LOGGER.warning("crawl: could not load run record for %s: %s", job_id, exc)
+            return []
+        if record is None:
+            return []
+        try:
+            artifact_root = record.artifact_root
+        except AttributeError:
+            return []
+        links_path = Path(artifact_root) / "links.json"
+        if not links_path.exists():
+            return []
+        try:
+            payload = json.loads(links_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            LOGGER.warning("crawl: failed to parse links.json for %s: %s", job_id, exc)
+            return []
+        anchors = payload.get("anchors") if isinstance(payload, dict) else None
+        if not isinstance(anchors, list):
+            return []
+        urls: list[str] = []
+        for entry in anchors:
+            if not isinstance(entry, dict):
+                continue
+            href = entry.get("href")
+            if isinstance(href, str) and href.startswith(("http://", "https://")):
+                urls.append(href)
+        return urls
 
     async def start_crawl(
         self,
@@ -274,11 +307,12 @@ class CrawlOrchestrator:
                         result.job_id = job_id
                         result.status = "success"
 
-                        # Extract links if at depth 0 (seed page)
-                        if depth == 0:
-                            # In a real implementation, wait for job to complete
-                            # and extract links from the result
-                            links = await self._extract_links(url)
+                        # Extract links from the just-completed seed job
+                        if depth == 0 and job_id:
+                            links = await self._extract_links(
+                                job_id=job_id,
+                                store=self._store,
+                            )
                             result.discovered_links = links
 
                             # Add discovered links to pending
@@ -374,14 +408,52 @@ class CrawlOrchestrator:
 _global_crawler: Optional[CrawlOrchestrator] = None
 
 
-def get_crawler() -> CrawlOrchestrator:
+def get_crawler(*, store: Any | None = None) -> CrawlOrchestrator:
     """Get or create the global crawler instance."""
     global _global_crawler
 
     if _global_crawler is None:
-        _global_crawler = CrawlOrchestrator()
+        _global_crawler = CrawlOrchestrator(store=store)
 
     return _global_crawler
+
+
+async def submit_and_wait_for_job(
+    job_manager: Any,
+    *,
+    url: str,
+    profile_id: str | None = None,
+    ocr_policy: str | None = None,
+    reuse_cache: bool = True,
+    poll_interval_s: float = 1.0,
+    timeout_s: float = 600.0,
+) -> str:
+    """Submit a capture via JobManager and block until it finishes.
+
+    Returns the job id. This is the bridge between CrawlOrchestrator and the
+    capture pipeline so depth-1 expansion reuses the same profile/OCR/cache
+    plumbing as a direct ``POST /jobs`` call.
+    """
+    from app.schemas import JobCreateRequest
+
+    request = JobCreateRequest(
+        url=url,
+        profile_id=profile_id,
+        ocr_policy=ocr_policy,
+        reuse_cache=reuse_cache,
+    )
+    snapshot = await job_manager.create_job(request)
+    job_id = str(snapshot["job_id"]) if isinstance(snapshot, dict) else snapshot.job_id
+    deadline = asyncio.get_event_loop().time() + timeout_s
+    while asyncio.get_event_loop().time() < deadline:
+        snap = job_manager.get_snapshot(job_id)
+        if snap is None:
+            return job_id
+        state = snap.get("state") if isinstance(snap, dict) else getattr(snap, "state", None)
+        if state in {"DONE", "FAILED", "CANCELLED"}:
+            return job_id
+        await asyncio.sleep(poll_interval_s)
+    return job_id
 
 
 # Convenience function for simple crawls

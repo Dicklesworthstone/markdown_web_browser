@@ -6,7 +6,7 @@ from datetime import datetime
 from typing import Any
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, HttpUrl, field_validator, model_validator
 
 from app.embeddings import EMBEDDING_DIM
 
@@ -62,6 +62,20 @@ class JobCreateRequest(BaseModel):
     )
     reuse_cache: bool = Field(
         default=True, description="Reuse cached captures when an identical configuration exists"
+    )
+    semantic_post_enabled: bool = Field(
+        default=False,
+        description=(
+            "Run the optional LLM semantic post-processing pass on the stitched "
+            "Markdown. Requires SEMANTIC_POST_ENDPOINT (and optional model/api_key) "
+            "to be set in the environment; no-op otherwise."
+        ),
+    )
+    semantic_post_max_chars: int | None = Field(
+        default=None,
+        ge=1,
+        le=200_000,
+        description="Cap the Markdown characters sent to the semantic fixer (default 50000).",
     )
 
 
@@ -186,6 +200,11 @@ class ManifestTimings(BaseModel):
     ocr_ms: int | None = Field(default=None, ge=0)
     stitch_ms: int | None = Field(default=None, ge=0)
     total_ms: int | None = Field(default=None, ge=0)
+    semantic_post_ms: int | None = Field(
+        default=None,
+        ge=0,
+        description="Wall-clock time spent in the optional LLM semantic post-processor.",
+    )
 
 
 class ManifestSweepStats(BaseModel):
@@ -246,7 +265,7 @@ class ManifestDeduplicationStats(BaseModel):
 
 
 class ManifestMetadata(BaseModel):
-    """Top-level manifest payload stub until capture pipeline is wired."""
+    """Top-level manifest metadata for a capture run (CfT/Playwright/timings/OCR telemetry)."""
 
     environment: ManifestEnvironment
     timings: ManifestTimings = Field(default_factory=ManifestTimings)
@@ -354,6 +373,13 @@ class ManifestMetadata(BaseModel):
     dom_assist_summary: dict[str, Any] | None = Field(
         default=None,
         description="Aggregated DOM-assist counts/reasons for quick diagnostics",
+    )
+    semantic_post_summary: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Optional LLM semantic post-processor summary (status, applied, "
+            "elapsed_ms, provider, reason). Null when the pass was not requested."
+        ),
     )
     seam_markers: list[dict[str, Any]] = Field(
         default_factory=list,
@@ -489,3 +515,63 @@ class WebhookDeleteRequest(BaseModel):
         if self.id is None and not self.url:
             raise ValueError("Provide id or url to delete a webhook")
         return self
+
+
+class CrawlRequest(BaseModel):
+    """Request to crawl a seed URL with depth-1 expansion via the existing capture pipeline.
+
+    Agents use this to bulk-discover and capture multiple pages sharing a domain in one
+    request, reusing the same OCR/concurrency settings across the entire crawl.
+    """
+
+    url: HttpUrl = Field(..., description="Seed URL to crawl (becomes depth 0)")
+    max_pages: int = Field(default=10, ge=1, le=200, description="Hard cap on captured pages")
+    max_depth: int = Field(default=1, ge=0, le=2, description="0=seed only, 1=seed+discovered, 2=two hops")
+    domain_allowlist: list[str] = Field(
+        default_factory=list,
+        description="Restrict expansion to these domains (and subdomains). Empty = follow any link.",
+    )
+    respect_robots_txt: bool = Field(default=True, description="Honor robots.txt Disallow rules")
+    crawl_delay_ms: int = Field(default=500, ge=0, le=60_000, description="Delay between requests (ms)")
+    reuse_cache: bool = Field(default=True, description="Reuse content-addressed captures")
+    profile_id: str | None = Field(default=None, description="Auth profile id (passed to each child job)")
+    ocr_policy: str | None = Field(default=None, description="OCR policy key for each child")
+
+
+class CrawlResponse(BaseModel):
+    """Initial response for /jobs/crawl: the crawl id and queued seed."""
+
+    crawl_id: str
+    seed_url: str
+    status: str
+    started_at: str
+    child_job_ids: list[str] = Field(default_factory=list)
+    queued_urls: list[str] = Field(default_factory=list)
+
+
+class CrawlUrlResult(BaseModel):
+    """Per-URL outcome inside a crawl."""
+
+    url: str
+    status: str
+    job_id: str | None
+    depth: int
+    discovered_links: int
+
+
+class CrawlStatusResponse(BaseModel):
+    """Live status of a crawl, including per-URL outcomes as they complete."""
+
+    crawl_id: str
+    seed_url: str
+    status: str
+    started_at: str
+    finished_at: str | None
+    max_pages: int
+    max_depth: int
+    visited: int
+    completed: int
+    failed: int
+    pending: int
+    queued_urls: list[str]
+    results: list[CrawlUrlResult]
