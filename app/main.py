@@ -28,6 +28,9 @@ from app.crawler import CrawlConfig, get_crawler, submit_and_wait_for_job
 from app.dom_links import blend_dom_with_ocr, demo_dom_links, demo_ocr_links, serialize_links
 from app.jobs import JobManager, JobSnapshot, JobState, build_signed_webhook_sender
 from app.schemas import (
+    BatchJobItem,
+    BatchJobRequest,
+    BatchJobResponse,
     CrawlRequest,
     CrawlResponse,
     CrawlStatusResponse,
@@ -35,9 +38,14 @@ from app.schemas import (
     EmbeddingSearchRequest,
     EmbeddingSearchResponse,
     JobCreateRequest,
+    JobListItem,
+    JobListResponse,
     JobSnapshotResponse,
     ReplayRequest,
     SectionEmbeddingMatch,
+    StructuredResult,
+    JobTagRequest,
+    JobTagResponse,
     WebhookRegistrationRequest,
     WebhookSubscription,
     WebhookDeleteRequest,
@@ -274,6 +282,107 @@ async def healthcheck() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/schema", tags=["observability"])
+async def schema_discovery() -> dict[str, Any]:
+    """Return a compact, agent-oriented schema discovery payload.
+
+    Unlike the full FastAPI /openapi.json (which is for HTTP clients that
+    understand Swagger), this endpoint is optimized for LLM agents:
+
+    - Groups endpoints by their job lifecycle (capture / live / artifacts /
+      embed / control / observability).
+    - For every endpoint, lists its HTTP method, path, request/response
+      schemas (field names + types), and a one-line intent.
+    - Includes invariants an agent must respect (cache_key composition,
+      supported OCR models, content limits).
+
+    Replaces the need for an LLM to read the entire FastAPI source.
+    """
+    return {
+        "version": "1.0",
+        "service": "markdown-web-browser",
+        "intent": "Render any URL to clean Markdown via tiled screenshots + olmOCR.",
+        "invariants": {
+            "cache_key": "url + CfT + viewport + DSF + OCR model + profile_id (content-addressed)",
+            "ocr_models_default": "olmOCR-2-7B-1025-FP8 (hosted). Local: any OpenAI-compatible vLLM/SGLang server.",
+            "determinism": "Chrome for Testing pinned, reduced motion, animations frozen.",
+            "long_side_px": 1288,
+            "viewport_overlap_px": 120,
+            "embedding_dim": 1536,
+            "rate_limit_429": "Honor Retry-After; back off 2-4 seconds.",
+        },
+        "endpoints": {
+            "capture": {
+                "POST /jobs": "Submit a single URL. Returns 202 + JobSnapshot.",
+                "POST /jobs/batch": "Submit up to 200 URLs in one request. Returns 202 + BatchJobResponse with per-URL cache_hit and job_id.",
+                "POST /jobs/crawl": "Kick off a depth-1 crawl that reuses the capture pipeline.",
+                "POST /replay": "Replay a stored manifest by enqueueing a new capture.",
+            },
+            "live": {
+                "GET /jobs": "List jobs with filters (state, profile_id, url_contains, cache_hit, tag, limit, offset).",
+                "GET /jobs/{id}": "Fetch latest job snapshot. Returns JobSnapshotResponse.",
+                "GET /jobs/{id}/stream": "SSE: live state + manifest progress events.",
+                "GET /jobs/{id}/events": "NDJSON: structured event log (cursor-based via ?since=ISO).",
+                "GET /crawl/{id}": "Live crawl status with per-URL outcomes.",
+            },
+            "artifacts": {
+                "GET /jobs/{id}/links.json": "DOM-harvested anchors/forms/headings.",
+                "GET /jobs/{id}/manifest.json": "Full CfT + timings + OCR telemetry + autotune + warnings.",
+                "GET /jobs/{id}/result.md": "Final Markdown output (raw text/markdown).",
+                "GET /jobs/{id}/result.json": "Structured sections (heading + body) + normalized links. Use this when you want a TOC without re-parsing Markdown.",
+                "GET /jobs/{id}/artifact/highlight?tile=...&y0=...&y1=...": "HTML viewer for a tile region referenced by a provenance comment.",
+                "GET /jobs/{id}/artifact/{path}": "Read any artifact (tiles, links.json, dom_snapshot.html, manifest.json).",
+            },
+            "embed": {
+                "POST /jobs/{id}/embeddings/search": "Search sqlite-vec section embeddings. Body: {vector: [..], top_k: 5}.",
+            },
+            "control": {
+                "POST /jobs/{id}/webhooks": "Register a webhook callback. Body: {url, events: ['DONE','FAILED']}.",
+                "GET /jobs/{id}/webhooks": "List active webhook subscriptions.",
+                "DELETE /jobs/{id}/webhooks": "Remove a webhook (by id or url).",
+            },
+            "observability": {
+                "GET /health": "Health check (returns {\"status\": \"ok\"}).",
+                "GET /metrics": "Prometheus scrape endpoint (text).",
+                "GET /metrics/slo": "JSON: latest capture/OCR SLO rollup with per-category p50/p95 + budget breaches.",
+                "GET /schema": "This endpoint. Optimized for LLM agents.",
+                "GET /openapi.json": "Standard FastAPI OpenAPI 3 schema (for code-gen clients).",
+            },
+        },
+        "cli": {
+            "mdwb fetch <url> [--watch] [--reuse-cache] [--semantic-post]": "Submit + optionally stream a capture.",
+            "mdwb crawl <seed_url> [--watch] [--max-pages] [--domain-allowlist]": "Depth-1 crawl.",
+            "mdwb show <job_id> [--ocr-metrics]": "Dump latest snapshot (table or JSON).",
+            "mdwb stream <job_id>": "Tail SSE feed.",
+            "mdwb events <job_id>": "Tail NDJSON event log.",
+            "mdwb watch <job_id>": "Live progress overlay.",
+            "mdwb diag <job_id>": "CfT/Playwright/timings triage.",
+            "mdwb dom links --job-id <id>": "Render stored links.json.",
+            "mdwb replay manifest <manifest.json>": "Resubmit a stored manifest.",
+            "mdwb jobs ocr-metrics <job_id>": "OCR batch telemetry.",
+            "mdwb jobs embeddings search <job_id>": "sqlite-vec section search.",
+            "mdwb jobs bundle <job_id> --out file.tar.zst": "Tar+compress job artifacts.",
+            "mdwb jobs artifacts manifest <job_id>": "List artifact paths.",
+            "mdwb jobs agents bead-summary <plan.md>": "Convert checklist to bead summaries.",
+            "mdwb warnings --count N": "Tail ops/warnings.jsonl.",
+            "mdwb slo --json": "Latest capture/OCR SLO rollup.",
+            "mdwb discover --json": "Static catalog of every endpoint + command (use this for offline discovery).",
+            "mdwb demo stream|snapshot|events": "Exercise demo endpoints (no live pipeline).",
+            "mdwb resume status --root PATH": "Inspect resume state.",
+        },
+        "agent_tips": [
+            "Always pass reuse_cache=true on retry; the cache_key is content-addressed and stable.",
+            "Prefer POST /jobs/batch for >2 URLs to amortize connection overhead.",
+            "Prefer GET /jobs/{id}/result.json over /result.md when you need a TOC or outbound link list.",
+            "GET /schema gives a 5-KB intent map; GET /openapi.json gives the full type schema (~50 KB).",
+            "Webhooks (DONE/FAILED) beat polling for long captures.",
+            "Embeddings are 1536-dim float32; send raw vectors in the search body, not text.",
+            "For deep research, use mdwb crawl --max-pages 10 + --domain-allowlist to scope.",
+        ],
+    }
+
+
+
 def _compute_live_slo_summary() -> dict[str, Any]:
     """Compute a capture/OCR SLO rollup from the latest manifest index.
 
@@ -346,6 +455,98 @@ async def demo_job_snapshot() -> dict:
 async def create_job(request: JobCreateRequest) -> JobSnapshotResponse:
     snapshot = await JOB_MANAGER.create_job(request)
     return _snapshot_to_response(snapshot)
+
+
+@app.get("/jobs", response_model=JobListResponse)
+async def list_jobs(
+    state: str | None = None,
+    profile_id: str | None = None,
+    url_contains: str | None = None,
+    cache_hit: bool | None = None,
+    tag: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> JobListResponse:
+    """List jobs with filters for agent inspection.
+
+    Filters are AND-combined. Tags are stored on RunRecord.metadata; jobs
+    submitted via /jobs/batch carry the request's tags automatically so an
+    agent can scope a follow-up query (e.g. all jobs in dataset:2026-q1).
+    """
+    items, total = JOB_MANAGER.list_jobs(
+        state=state,
+        profile_id=profile_id,
+        url_contains=url_contains,
+        cache_hit=cache_hit,
+        tag=tag,
+        limit=limit,
+        offset=offset,
+    )
+    applied = {
+        k: v
+        for k, v in {
+            "state": state,
+            "profile_id": profile_id,
+            "url_contains": url_contains,
+            "cache_hit": str(cache_hit) if cache_hit is not None else None,
+            "tag": tag,
+            "limit": str(limit),
+            "offset": str(offset),
+        }.items()
+        if v is not None
+    }
+    return JobListResponse(
+        items=[JobListItem(**i) for i in items],
+        total=total,
+        filtered=len(items),
+        filters=applied,
+    )
+
+
+@app.post("/jobs/batch", response_model=BatchJobResponse, status_code=status.HTTP_202_ACCEPTED)
+async def batch_create_jobs(request: BatchJobRequest) -> BatchJobResponse:
+    """Submit many URLs in one round-trip; each becomes its own job.
+
+    Agents use this for "process this list of pages" workflows so they don't
+    pay N×RTT overhead. The response is a list of per-URL outcomes mirroring
+    the single-URL POST /jobs contract (id, state, cache_hit, etc.).
+    """
+    items: list[BatchJobItem] = []
+    cache_hits = 0
+    queued = 0
+    failed = 0
+    for url in request.urls:
+        try:
+            job_request = JobCreateRequest(
+                url=url,
+                profile_id=request.profile_id,
+                reuse_cache=request.reuse_cache,
+                ocr_policy=request.ocr_policy,
+            )
+            snapshot = await JOB_MANAGER.create_job(job_request, tags=request.tags)
+            cache_hit_flag = bool(snapshot.get("cache_hit"))
+            if cache_hit_flag:
+                cache_hits += 1
+            else:
+                queued += 1
+            items.append(
+                BatchJobItem(
+                    url=url,
+                    job_id=str(snapshot.get("job_id") or snapshot.get("id")),
+                    state=str(snapshot.get("state", "PENDING")),
+                    cache_hit=cache_hit_flag,
+                )
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            failed += 1
+            items.append(BatchJobItem(url=url, error=str(exc)))
+    return BatchJobResponse(
+        submitted=len(request.urls),
+        cache_hits=cache_hits,
+        queued=queued,
+        failed=failed,
+        items=items,
+    )
 
 
 @app.post("/jobs/crawl", response_model=CrawlResponse, status_code=status.HTTP_202_ACCEPTED)
@@ -526,6 +727,29 @@ async def job_manifest(job_id: str) -> JSONResponse:
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Manifest not available yet") from None
     return JSONResponse(manifest)
+
+
+@app.post("/jobs/{job_id}/tag", response_model=JobTagResponse)
+async def job_add_tag(job_id: str, request: JobTagRequest) -> JobTagResponse:
+    """Append a tag to a job so it shows up in `GET /jobs?tag=...` queries."""
+    JOB_MANAGER.add_tag(job_id, request.tag)
+    snap = JOB_MANAGER.get_snapshot(job_id) or {}
+    return JobTagResponse(job_id=job_id, tags=list(snap.get("tags") or []))
+
+
+@app.get("/jobs/{job_id}/result.json", response_model=StructuredResult)
+async def job_result_json(job_id: str) -> StructuredResult:
+    """Machine-friendly, parsed result for /jobs/{id}.
+
+    Returns the stitched Markdown split into a heading + body hierarchy plus
+    the normalized outbound links. Agents can answer "give me the headings"
+    or "give me the outbound links" without re-parsing the raw Markdown.
+    """
+    snapshot = JOB_MANAGER.get_snapshot(job_id)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    structured = JOB_MANAGER.get_structured_result(job_id)
+    return StructuredResult(**structured)
 
 
 @app.get("/jobs/{job_id}/result.md")

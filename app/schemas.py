@@ -517,6 +517,120 @@ class WebhookDeleteRequest(BaseModel):
         return self
 
 
+class BatchJobRequest(BaseModel):
+    """Submit N URLs in one round-trip; each becomes its own job.
+
+    Agents use this for "process this list of pages" workflows so they don't
+    pay N×RTT overhead. The response is a list of per-URL outcomes mirroring
+    the single-URL POST /jobs contract (id, state, cache_hit, etc.).
+    """
+
+    urls: list[str] = Field(..., min_length=1, max_length=200, description="URLs to capture in parallel")
+    profile_id: str | None = Field(default=None)
+    reuse_cache: bool = True
+    ocr_policy: str | None = None
+    tags: list[str] = Field(
+        default_factory=list,
+        description="Free-form labels (e.g. 'dataset:2026-q1', 'team:research') for later /jobs filtering",
+    )
+
+
+class JobTagRequest(BaseModel):
+    """Append a single tag to a job's tag set."""
+
+    tag: str = Field(..., min_length=1, max_length=200, description="Tag label to append")
+
+
+class JobTagResponse(BaseModel):
+    """Response for POST /jobs/{id}/tag."""
+
+    job_id: str
+    tags: list[str] = Field(default_factory=list)
+
+
+class BatchJobItem(BaseModel):
+    """Single-URL outcome inside a batch submission."""
+
+    url: str
+    job_id: str | None = None
+    state: str | None = None
+    cache_hit: bool = False
+    error: str | None = None
+
+
+class BatchJobResponse(BaseModel):
+    """Response for POST /jobs/batch."""
+
+    submitted: int
+    cache_hits: int
+    queued: int
+    failed: int
+    items: list[BatchJobItem]
+
+
+class JobListItem(BaseModel):
+    """Compact summary entry for GET /jobs."""
+
+    id: str
+    url: str
+    state: str
+    created_at: str | None = None
+    finished_at: str | None = None
+    cache_hit: bool = False
+    profile_id: str | None = None
+    tags: list[str] = Field(default_factory=list)
+    error: str | None = None
+    manifest_path: str | None = None
+
+
+class JobListResponse(BaseModel):
+    """Filtered list of jobs for GET /jobs."""
+
+    items: list[JobListItem]
+    total: int
+    filtered: int
+    filters: dict[str, str]
+
+
+class StructuredSection(BaseModel):
+    """A heading + its associated body, parsed from the stitched Markdown."""
+
+    level: int = Field(ge=1, le=6, description="Heading level 1-6")
+    heading: str
+    body: str
+    anchor: str | None = Field(default=None, description="GitHub-style slug for cross-referencing")
+    tile_indices: list[int] = Field(default_factory=list)
+
+
+class StructuredLink(BaseModel):
+    """A normalized outbound link with provenance."""
+
+    href: str
+    text: str | None = None
+    title: str | None = None
+    source: str = Field(description="dom | ocr | both")
+    delta: str | None = Field(default=None, description="match | mismatch | null")
+
+
+class StructuredResult(BaseModel):
+    """Machine-friendly, parsed result for /jobs/{id}/result.json.
+
+    Sections + structured links let agents extract a table-of-contents or
+    answer "give me the headings" without re-parsing Markdown. Headings come
+    from the stitched output; links are the DOM/OCR blend.
+    """
+
+    job_id: str
+    url: str
+    state: str
+    word_count: int
+    char_count: int
+    sections: list[StructuredSection]
+    links: list[StructuredLink]
+    cache_hit: bool = False
+    profile_id: str | None = None
+
+
 class CrawlRequest(BaseModel):
     """Request to crawl a seed URL with depth-1 expansion via the existing capture pipeline.
 

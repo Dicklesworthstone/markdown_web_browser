@@ -93,6 +93,11 @@ class RunRecord(SQLModel, table=True):
         default=None,
         sa_column=Column(SQLITE_JSON),
     )
+    tags: list[str] | None = Field(
+        default=None,
+        sa_column=Column(SQLITE_JSON),
+        description="Free-form labels (e.g. 'dataset:2026-q1') for agent queries",
+    )
 
 
 class LinkRecord(SQLModel, table=True):
@@ -283,6 +288,7 @@ class Store:
         started_at: datetime,
         profile_id: str | None = None,
         cache_key: str | None = None,
+        tags: list[str] | None = None,
     ) -> RunPaths:
         paths = RunPaths.from_url(
             url=url, started_at=started_at, config=self.config, cache_key=cache_key
@@ -296,11 +302,77 @@ class Store:
             manifest_path=str(paths.manifest_path),
             profile_id=profile_id,
             cache_key=cache_key,
+            tags=list(tags) if tags else None,
         )
         with self.session() as session:
             session.add(record)
             session.commit()
         return paths
+
+    def set_tags(self, *, job_id: str, tags: list[str]) -> None:
+        """Replace the tag set on a run (idempotent)."""
+        with self.session() as session:
+            run = session.get(RunRecord, job_id)
+            if run is None:
+                return
+            run.tags = list(tags)
+            session.add(run)
+            session.commit()
+
+    def add_tag(self, *, job_id: str, tag: str) -> None:
+        """Append a single tag to a run's tag set."""
+        with self.session() as session:
+            run = session.get(RunRecord, job_id)
+            if run is None:
+                return
+            current = list(run.tags or [])
+            if tag not in current:
+                current.append(tag)
+            run.tags = current
+            session.add(run)
+            session.commit()
+
+    def list_runs(
+        self,
+        *,
+        state: str | None = None,
+        profile_id: str | None = None,
+        url_contains: str | None = None,
+        cache_hit: bool | None = None,
+        tag: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[list[RunRecord], int]:
+        """Filter runs by any combination of (state, profile, url substring, tag)."""
+        with self.session() as session:
+            stmt = select(RunRecord)
+            count_stmt = select(RunRecord)
+            if state:
+                stmt = stmt.where(RunRecord.status == state)
+                count_stmt = count_stmt.where(RunRecord.status == state)
+            if profile_id:
+                stmt = stmt.where(RunRecord.profile_id == profile_id)
+                count_stmt = count_stmt.where(RunRecord.profile_id == profile_id)
+            if url_contains:
+                stmt = stmt.where(RunRecord.url.contains(url_contains))  # type: ignore[attr-defined]
+                count_stmt = count_stmt.where(RunRecord.url.contains(url_contains))  # type: ignore[attr-defined]
+            if tag:
+                try:
+                    stmt = stmt.where(
+                        text("EXISTS (SELECT 1 FROM json_each(runs.tags) WHERE json_each.value = :tag)").bindparams(tag=tag)
+                    )
+                    count_stmt = count_stmt.where(
+                        text("EXISTS (SELECT 1 FROM json_each(runs.tags) WHERE json_each.value = :tag)").bindparams(tag=tag)
+                    )
+                except Exception:
+                    pass
+            if cache_hit is not None and cache_hit:
+                stmt = stmt.where(RunRecord.cache_key.is_not(None))  # type: ignore[union-attr]
+                count_stmt = count_stmt.where(RunRecord.cache_key.is_not(None))  # type: ignore[union-attr]
+            stmt = stmt.order_by(desc(RunRecord.started_at)).offset(max(0, offset)).limit(max(1, limit))
+            rows = list(session.exec(stmt))
+            total = len(list(session.exec(count_stmt)))
+            return rows, total
 
     def find_cache_hit(self, cache_key: str | None) -> RunRecord | None:
         if not cache_key:

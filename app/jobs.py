@@ -15,6 +15,7 @@ import hashlib
 import os
 import hmac
 import json
+import re
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 import logging
 
@@ -84,7 +85,7 @@ class JobSnapshot(TypedDict, total=False):
     seam_marker_count: int | None
     seam_hash_count: int | None
     seam_markers: list[dict[str, object]]
-
+    tags: list[str]
 
 def build_initial_snapshot(
     url: str,
@@ -161,11 +162,21 @@ class JobManager:
         self._pending_webhooks: Dict[str, List[dict[str, Any]]] = {}
         self._webhook_sender = webhook_sender or _default_webhook_sender
         self._cache_keys: Dict[str, str | None] = {}
-        self._job_timeout_seconds = job_timeout_seconds
+        self._job_tags: Dict[str, list[str]] = {}
         self._watchdog_task: asyncio.Task[None] | None = None
         self._shutdown = False
 
-    async def create_job(self, request: JobCreateRequest) -> JobSnapshot:
+    async def create_job(
+        self,
+        request: JobCreateRequest,
+        *,
+        tags: list[str] | None = None,
+    ) -> JobSnapshot:
+        """Submit a new job (or reuse cache hit).
+
+        ``tags`` are persisted on the underlying RunRecord so agents can scope
+        follow-up queries (e.g. all jobs in dataset:2026-q1) via GET /jobs?tag=...
+        """
         job_id = uuid4().hex
         active_settings = global_settings
         capture_config = _build_capture_config(request, active_settings)
@@ -179,10 +190,14 @@ class JobManager:
             profile_id=capture_config.profile_id,
             cache_hit=False,
         )
+        snapshot["tags"] = list(tags) if tags else []
         self._snapshots[job_id] = snapshot.copy()
         self._event_logs[job_id] = []
         self._event_sequences[job_id] = 0
         self._cache_keys[job_id] = cache_key
+        if tags:
+            self._job_tags[job_id] = list(tags)
+            snapshot["tags"] = list(tags)
         self._broadcast(job_id)
 
         cache_record = None
@@ -262,8 +277,121 @@ class JobManager:
             self._record_custom_event(snapshot["id"], "replay_request", metadata)
         return snapshot
 
-    def get_snapshot(self, job_id: str) -> JobSnapshot:
-        return self._snapshot_payload(job_id)
+    def get_snapshot(self, job_id: str) -> JobSnapshot | None:
+        try:
+            return self._snapshot_payload(job_id)
+        except KeyError:
+            return None
+
+    def add_tag(self, job_id: str, tag: str) -> None:
+        """Append a tag to the in-memory + persisted run record."""
+        current = self._job_tags.get(job_id, [])
+        if tag in current:
+            return
+        current.append(tag)
+        self._job_tags[job_id] = current
+        try:
+            self.store.add_tag(job_id=job_id, tag=tag)
+        except Exception:  # pragma: no cover - persistence is best-effort
+            pass
+        snapshot = self._snapshots.get(job_id)
+        if snapshot is not None:
+            snapshot["tags"] = list(current)
+            self._broadcast(job_id)
+
+    def list_jobs(
+        self,
+        *,
+        state: str | None = None,
+        profile_id: str | None = None,
+        url_contains: str | None = None,
+        cache_hit: bool | None = None,
+        tag: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """List jobs from the store with optional filters.
+
+        Returns (items, total_before_pagination). Each item is a flat dict
+        ready to be wrapped in JobListItem.
+        """
+        rows, total = self.store.list_runs(
+            state=state,
+            profile_id=profile_id,
+            url_contains=url_contains,
+            cache_hit=cache_hit,
+            tag=tag,
+            limit=limit,
+            offset=offset,
+        )
+        items: list[dict[str, Any]] = []
+        for r in rows:
+            items.append(
+                {
+                    "id": r.id,
+                    "url": r.url,
+                    "state": r.status or "PENDING",
+                    "created_at": r.started_at.isoformat() if r.started_at else None,
+                    "finished_at": r.finished_at.isoformat() if r.finished_at else None,
+                    "cache_hit": bool(r.cache_key),
+                    "profile_id": r.profile_id,
+                    "tags": list(r.tags or []),
+                    "error": None,
+                    "manifest_path": r.manifest_path,
+                }
+            )
+        return items, total
+
+    def get_structured_result(self, job_id: str) -> dict[str, Any]:
+        """Return a parsed view of the job's Markdown for agent consumption.
+
+        Splits the stitched Markdown into a heading + body hierarchy (sections)
+        and merges DOM/OCR links into a single normalized list. Falls back to a
+        minimal payload if the artifacts have been pruned.
+        """
+        snap = self._snapshots.get(job_id) or {}
+        manifest = snap.get("manifest") or {}
+        markdown = ""
+        try:
+            markdown = self.store.read_markdown(job_id)
+        except Exception:
+            markdown = ""
+        sections = _parse_markdown_sections(markdown)
+        links_raw: list[dict[str, Any]] = []
+        try:
+            links_payload = self.store.read_links(job_id)
+        except Exception:
+            links_payload = None
+        if isinstance(links_payload, dict):
+            anchors = links_payload.get("anchors") or []
+            for entry in anchors:
+                if not isinstance(entry, dict):
+                    continue
+                links_raw.append(
+                    {
+                        "href": entry.get("href") or "",
+                        "text": entry.get("text"),
+                        "title": entry.get("title"),
+                        "source": entry.get("source") or "dom",
+                        "delta": entry.get("delta"),
+                    }
+                )
+        if not links_raw:
+            # Fallback: parse links from the markdown
+            for href in _extract_markdown_links(markdown):
+                links_raw.append({"href": href, "text": None, "title": None, "source": "ocr", "delta": None})
+        state = snap.get("state") or "UNKNOWN"
+        return {
+            "job_id": job_id,
+            "url": snap.get("url") or (manifest.get("url") if isinstance(manifest, dict) else ""),
+            "state": str(state),
+            "word_count": len(markdown.split()) if markdown else 0,
+            "char_count": len(markdown) if markdown else 0,
+            "sections": sections,
+            "links": links_raw[:200],  # cap so agent calls stay cheap
+            "cache_hit": bool(snap.get("cache_hit")),
+            "profile_id": snap.get("profile_id"),
+        }
 
     def subscribe(self, job_id: str) -> asyncio.Queue[JobSnapshot]:
         if job_id not in self._snapshots:
@@ -456,6 +584,7 @@ class JobManager:
             started_at=started_at,
             profile_id=profile_id,
             cache_key=cache_key,
+            tags=self._job_tags.get(job_id) or None,
         )
         await asyncio.to_thread(storage.update_status, job_id=job_id, status=JobState.CAPTURING)
         pending = self._pending_webhooks.pop(job_id, [])
@@ -1224,3 +1353,67 @@ def _webhook_matches(entry: dict[str, Any], webhook_id: int | None, url: str | N
     if url:
         return entry_url == url
     return False
+
+
+# ---------------------------------------------------------------------------
+# Structured-result helpers (for /jobs/{id}/result.json)
+# ---------------------------------------------------------------------------
+
+_HEADING_LINE_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
+_LINK_RE = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
+_SLUG_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _slugify(text: str) -> str:
+    slug = _SLUG_RE.sub("-", text.lower()).strip("-")
+    return slug or "section"
+
+
+def _parse_markdown_sections(markdown: str) -> list[dict[str, Any]]:
+    """Split a stitched Markdown into heading + body sections.
+
+    Returns a list of {level, heading, body, anchor, tile_indices}. Body text
+    is everything between this heading and the next; tile_indices is empty
+    here (the stitcher emits provenance comments inline; we don't re-parse
+    tile provenance into sections).
+    """
+    if not markdown:
+        return []
+    sections: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    for line in markdown.splitlines():
+        match = _HEADING_LINE_RE.match(line)
+        if match:
+            if current is not None:
+                sections.append(current)
+            heading_text = match.group(2).strip()
+            current = {
+                "level": len(match.group(1)),
+                "heading": heading_text,
+                "body": "",
+                "anchor": _slugify(heading_text),
+                "tile_indices": [],
+            }
+        else:
+            if current is None:
+                continue
+            if current["body"]:
+                current["body"] += "\n" + line
+            else:
+                current["body"] = line
+    if current is not None:
+        sections.append(current)
+    return sections
+
+
+def _extract_markdown_links(markdown: str) -> list[str]:
+    """Pull http(s) hrefs out of [text](href) Markdown links."""
+    if not markdown:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for href in _LINK_RE.findall(markdown):
+        if href.startswith(("http://", "https://")) and href not in seen:
+            seen.add(href)
+            out.append(href)
+    return out

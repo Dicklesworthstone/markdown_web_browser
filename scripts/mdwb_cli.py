@@ -1549,6 +1549,140 @@ def crawl(
             time.sleep(poll_interval)
 
 
+def _watch_jobs_blocking(job_ids: list[str], api_root: str, poll_interval: float = 1.0) -> None:
+    """Poll /jobs/{id} for a list of job ids until all are DONE or FAILED.
+
+    Used by `mdwb batch` to give the user a single command that captures N
+    pages and waits for every child to finish before exiting.
+    """
+    pending: set[str] = {j for j in job_ids if j}
+    while pending:
+        time.sleep(poll_interval)
+        with httpx.Client(timeout=10.0) as client:
+            still_pending: list[str] = []
+            for jid in list(pending):
+                try:
+                    response = client.get(f"{api_root}/jobs/{jid}")
+                    response.raise_for_status()
+                    snap = response.json()
+                    state = str(snap.get("state", "")).upper()
+                    if state in {"DONE", "FAILED", "CANCELLED"}:
+                        pending.discard(jid)
+                        marker = "[green]done[/]" if state == "DONE" else f"[red]{state.lower()}[/]"
+                        console.print(f"  {marker}  {jid}  {snap.get('url', '')[:60]}")
+                    else:
+                        still_pending.append(jid)
+                except Exception:
+                    still_pending.append(jid)
+            pending = set(still_pending)
+
+
+@cli.command()
+def batch(
+    urls: Optional[str] = typer.Argument(
+        None, help="Path to a file with one URL per line, or `-` for stdin. Omit to read stdin."
+    ),
+    url_inline: Optional[list[str]] = typer.Option(
+        None, "--url", help="Inline URL(s) to capture (repeatable)."
+    ),
+    api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
+    profile: Optional[str] = typer.Option(None, "--profile"),
+    ocr_policy: Optional[str] = typer.Option(None, "--ocr-policy"),
+    tag: Optional[list[str]] = typer.Option(
+        None, "--tag", help="Tag applied to every job (repeat for multiple)."
+    ),
+    reuse_cache: bool = typer.Option(True, "--reuse-cache/--no-cache"),
+    watch: bool = typer.Option(
+        True, "--watch/--no-watch", help="Poll each child job until DONE."
+    ),
+    http2: bool = typer.Option(True, "--http2/--no-http2"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Submit a list of URLs as one batch (POST /jobs/batch).
+
+    Each URL becomes its own job; all share the same profile/OCR/tags so a
+    follow-up `mdwb jobs list --tag X` can scope the run cheaply.
+    """
+    payload_urls: list[str] = []
+    if url_inline:
+        payload_urls.extend(url_inline)
+    if urls:
+        if urls == "-":
+            stdin_data = sys.stdin.read()
+            payload_urls.extend(line.strip() for line in stdin_data.splitlines() if line.strip())
+        else:
+            p = Path(urls)
+            if not p.exists():
+                raise typer.BadParameter(f"File not found: {urls}")
+            payload_urls.extend(line.strip() for line in p.read_text().splitlines() if line.strip())
+    if not payload_urls:
+        raise typer.BadParameter("No URLs provided. Pass --url, a file path, or `-` for stdin.")
+    if len(payload_urls) > 200:
+        raise typer.BadParameter(f"Too many URLs ({len(payload_urls)}). Max 200 per batch.")
+    api_root = _resolve_settings(api_base).base_url
+    body: dict[str, Any] = {
+        "urls": payload_urls,
+        "reuse_cache": reuse_cache,
+    }
+    if profile:
+        body["profile_id"] = profile
+    if ocr_policy:
+        body["ocr_policy"] = ocr_policy
+    if tag:
+        body["tags"] = list(tag)
+    with httpx.Client(http2=http2, timeout=60.0) as client:
+        response = client.post(f"{api_root}/jobs/batch", json=body)
+        response.raise_for_status()
+        result = response.json()
+    if json_output:
+        typer.echo(json.dumps(result, indent=2))
+        return
+    console.print(
+        f"[green]Batch submitted[/]: {result['submitted']} URLs "
+        f"({result['cache_hits']} cache hits, {result['queued']} queued, {result['failed']} failed)"
+    )
+    for item in result.get("items", []):
+        marker = "[cyan]hit[/]" if item.get("cache_hit") else "[yellow]new[/]"
+        console.print(f"  {marker}  {item.get('url')} -> {item.get('job_id') or item.get('error')}")
+    if watch and result.get("items"):
+        job_ids = [it["job_id"] for it in result["items"] if it.get("job_id")]
+        _watch_jobs_blocking(job_ids, api_root)
+
+
+@cli.command()
+def schema(
+    api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
+    json_output: bool = typer.Option(False, "--json", help="Emit JSON."),
+    http2: bool = typer.Option(True, "--http2/--no-http2"),
+) -> None:
+    """Print the live agent-oriented /schema payload.
+
+    This is a thin wrapper around GET /schema — the endpoint that exists
+    specifically so AI agents can orient without reading source code.
+    """
+    api_root = _resolve_settings(api_base).base_url
+    with httpx.Client(http2=http2, timeout=15.0) as client:
+        response = client.get(f"{api_root}/schema")
+        response.raise_for_status()
+        data = response.json()
+    if json_output:
+        typer.echo(json.dumps(data, indent=2))
+        return
+    typer.echo(f"[dim]{data.get('service', 'markdown-web-browser')} v{data.get('version', '?')}[/]")
+    typer.echo(data.get("intent", ""))
+    typer.echo("")
+    for surface, items in (data.get("endpoints") or {}).items():
+        typer.echo(f"== {surface} ==")
+        for endpoint, desc in items.items():
+            typer.echo(f"  {endpoint}")
+            typer.echo(f"    {desc}")
+        typer.echo("")
+    if data.get("agent_tips"):
+        typer.echo("== agent_tips ==")
+        for tip in data["agent_tips"]:
+            typer.echo(f"  - {tip}")
+
+
 @cli.command()
 def slo(
     api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
@@ -2865,6 +2999,95 @@ def jobs_bundle(
     ),
 ) -> None:
     _download_bundle(job_id, api_base, out)
+
+
+@jobs_cli.command("list")
+def jobs_list(
+    state: Optional[str] = typer.Option(None, "--state", help="Filter by job state (DONE|FAILED|PENDING|...)"),
+    profile_id: Optional[str] = typer.Option(None, "--profile", help="Filter by profile_id"),
+    url_contains: Optional[str] = typer.Option(None, "--url-contains", help="Substring match on URL"),
+    cache_hit: Optional[bool] = typer.Option(None, "--cache-hit/--no-cache-hit", help="Filter by cache state"),
+    tag: Optional[str] = typer.Option(None, "--tag", help="Filter by tag"),
+    limit: int = typer.Option(50, "--limit", help="Max jobs to return"),
+    offset: int = typer.Option(0, "--offset"),
+    api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
+    json_output: bool = typer.Option(False, "--json", help="Emit JSON instead of a table."),
+    http2: bool = typer.Option(True, "--http2/--no-http2"),
+) -> None:
+    """List jobs with filters (mirrors GET /jobs).
+
+    Defaults to the most recent 50 jobs in any state. Combine --state DONE
+    with --tag <label> to scope a follow-up query cheaply.
+    """
+    api_root = _resolve_settings(api_base).base_url
+    params: dict[str, str] = {"limit": str(limit), "offset": str(offset)}
+    if state:
+        params["state"] = state
+    if profile_id:
+        params["profile_id"] = profile_id
+    if url_contains:
+        params["url_contains"] = url_contains
+    if cache_hit is not None:
+        params["cache_hit"] = "true" if cache_hit else "false"
+    if tag:
+        params["tag"] = tag
+    with httpx.Client(http2=http2, timeout=30.0) as client:
+        response = client.get(f"{api_root}/jobs", params=params)
+        response.raise_for_status()
+        data = response.json()
+    if json_output:
+        typer.echo(json.dumps(data, indent=2))
+        return
+    console.print(
+        f"[dim]{data.get('filtered', 0)} of {data.get('total', 0)} jobs (filters={data.get('filters', {})})[/]"
+    )
+    for item in data.get("items", []):
+        tags = ",".join(item.get("tags") or [])
+        cache_marker = "[cyan]hit[/]" if item.get("cache_hit") else " "
+        console.print(
+            f"  {item.get('id', '?')[:8]:8s} [{item.get('state', '?'):>8s}] {cache_marker} "
+            f"{item.get('url', '?')[:60]}{'  [' + tags + ']' if tags else ''}"
+        )
+
+
+@jobs_cli.command("tag")
+def jobs_tag(
+    job_id: str = typer.Argument(..., help="Job to tag"),
+    tag: str = typer.Argument(..., help="Tag label (e.g. 'dataset:2026-q1')"),
+    api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
+    http2: bool = typer.Option(True, "--http2/--no-http2"),
+) -> None:
+    """Append a tag to a job (persists on the run record)."""
+    api_root = _resolve_settings(api_base).base_url
+    with httpx.Client(http2=http2, timeout=15.0) as client:
+        response = client.post(
+            f"{api_root}/jobs/{job_id}/tag",
+            json={"tag": tag},
+        )
+        response.raise_for_status()
+    console.print(f"[green]Tagged {job_id}[/] with {tag!r}")
+
+
+@jobs_cli.command("result")
+def jobs_result(
+    job_id: str = typer.Argument(..., help="Job identifier"),
+    api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
+    json_output: bool = typer.Option(False, "--json", help="Emit structured result.json instead of raw Markdown."),
+    http2: bool = typer.Option(True, "--http2/--no-http2"),
+) -> None:
+    """Fetch a job's result: raw Markdown by default, structured sections + links with --json."""
+    api_root = _resolve_settings(api_base).base_url
+    if json_output:
+        with httpx.Client(http2=http2, timeout=15.0) as client:
+            response = client.get(f"{api_root}/jobs/{job_id}/result.json")
+            response.raise_for_status()
+            data = response.json()
+        typer.echo(json.dumps(data, indent=2))
+        return
+    with httpx.Client(http2=http2, timeout=15.0) as client:
+        response = client.get(f"{api_root}/jobs/{job_id}/result.md")
+        response.raise_for_status()
+        typer.echo(response.text)
 
 
 @jobs_cli.command("bundle")
