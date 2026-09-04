@@ -1578,6 +1578,150 @@ def _watch_jobs_blocking(job_ids: list[str], api_root: str, poll_interval: float
 
 
 @cli.command()
+def rerun(
+    job_id: str = typer.Argument(..., help="Job to re-capture (URL + profile + tags persist)"),
+    api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
+    reuse_cache: bool = typer.Option(False, "--reuse-cache/--no-cache"),
+    watch: bool = typer.Option(True, "--watch/--no-watch"),
+    http2: bool = typer.Option(True, "--http2/--no-http2"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Re-capture the same URL with the same profile + tags (POST /jobs/{id}/rerun)."""
+    api_root = _resolve_settings(api_base).base_url
+    params = {"reuse_cache": "true" if reuse_cache else "false"}
+    with httpx.Client(http2=http2, timeout=30.0) as client:
+        response = client.post(f"{api_root}/jobs/{job_id}/rerun", params=params)
+        response.raise_for_status()
+        data = response.json()
+    if json_output:
+        typer.echo(json.dumps(data, indent=2))
+    else:
+        console.print(
+            f"[green]Rerun submitted[/]: original={data['original_job_id']} "
+            f"new={data['new_job_id']}  reuse_cache={data['reuse_cache']}"
+        )
+    if watch:
+        new_id = data.get("new_job_id", "")
+        if new_id:
+            _watch_jobs_blocking([new_id], api_root)
+
+
+@cli.command()
+def diff(
+    a: str = typer.Argument(..., help="First job id (the 'before' capture)"),
+    b: str = typer.Argument(..., help="Second job id (the 'after' capture)"),
+    api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
+    include_links: bool = typer.Option(True, "--links/--no-links", help="Also diff link sets"),
+    max_chars_per_section: int = typer.Option(2000, "--max-chars", help="Cap excerpt length per section"),
+    json_output: bool = typer.Option(False, "--json"),
+    http2: bool = typer.Option(True, "--http2/--no-http2"),
+) -> None:
+    """Diff two captures section-by-section (POST /jobs/{id}/diff)."""
+    api_root = _resolve_settings(api_base).base_url
+    with httpx.Client(http2=http2, timeout=30.0) as client:
+        response = client.post(
+            f"{api_root}/jobs/{a}/diff",
+            json={
+                "other_job_id": b,
+                "include_links": include_links,
+                "max_chars_per_section": max_chars_per_section,
+            },
+        )
+        response.raise_for_status()
+        data = response.json()
+    if json_output:
+        typer.echo(json.dumps(data, indent=2))
+        return
+    console.print(
+        f"[dim]A[/] {data['a_url']} (words={data['a_word_count']})  "
+        f"[dim]B[/] {data['b_url']} (words={data['b_word_count']})"
+    )
+    counts = {"added": 0, "removed": 0, "changed": 0, "unchanged": 0}
+    for s in data.get("sections", []):
+        counts[s["state"]] = counts.get(s["state"], 0) + 1
+    console.print(
+        f"  added={counts['added']}  removed={counts['removed']}  "
+        f"changed={counts['changed']}  unchanged={counts['unchanged']}"
+    )
+    for s in data.get("sections", []):
+        if s["state"] == "unchanged":
+            continue
+        marker = {"added": "[green]+[/]", "removed": "[red]-[/]", "changed": "[yellow]~[/]"}.get(s["state"], "?")
+        console.print(f"  {marker} {s['heading']}  (a={s['a_chars']}c, b={s['b_chars']}c)")
+    if include_links:
+        la = data.get("links_a_only") or []
+        lb = data.get("links_b_only") or []
+        if la:
+            console.print(f"  [red]links only in A[/]: {len(la)} (e.g. {la[0] if la else ''})")
+        if lb:
+            console.print(f"  [green]links only in B[/]: {len(lb)} (e.g. {lb[0] if lb else ''})")
+
+
+@cli.command()
+def search(
+    query: str = typer.Argument(..., help="Search query. Quoted phrases match literally."),
+    state: Optional[str] = typer.Option(None, "--state", help="Restrict to a job state"),
+    url_contains: Optional[str] = typer.Option(None, "--url-contains", help="Substring match on URL"),
+    tag: Optional[str] = typer.Option(None, "--tag"),
+    limit: int = typer.Option(25, "--limit"),
+    api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
+    json_output: bool = typer.Option(False, "--json"),
+    http2: bool = typer.Option(True, "--http2/--no-http2"),
+) -> None:
+    """Full-text search across stored Markdown (POST /jobs/search)."""
+    api_root = _resolve_settings(api_base).base_url
+    body = {"query": query, "limit": limit}
+    if state:
+        body["state"] = state
+    if url_contains:
+        body["url_contains"] = url_contains
+    if tag:
+        body["tag"] = tag
+    with httpx.Client(http2=http2, timeout=60.0) as client:
+        response = client.post(f"{api_root}/jobs/search", json=body)
+        response.raise_for_status()
+        data = response.json()
+    if json_output:
+        typer.echo(json.dumps(data, indent=2))
+        return
+    console.print(
+        f"[dim]Scanned {data['total_scanned']} jobs, returned {data['returned']} for[/] "
+        f"[bold]{query!r}[/]"
+    )
+    for hit in data.get("matches", []):
+        console.print(
+            f"  {hit['job_id'][:8]} [{hit['state']:>8s}] (score={hit['score']:.3f}) "
+            f"L{hit['line_number']:>4d}  {hit['matched_line'][:100]}"
+        )
+
+
+@cli.command()
+def embed(
+    text: str = typer.Argument(..., help="Text to embed (returns 1536-dim float32 vector)"),
+    api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
+    json_output: bool = typer.Option(False, "--json"),
+    http2: bool = typer.Option(True, "--http2/--no-http2"),
+) -> None:
+    """Compute a deterministic embedding vector (POST /embeddings/text).
+
+    Uses the built-in hash-bucket-v1 embedder; no model weights required.
+    The output is a 1536-dim L2-normalized float32 vector suitable for
+    /jobs/{id}/embeddings/search.
+    """
+    api_root = _resolve_settings(api_base).base_url
+    with httpx.Client(http2=http2, timeout=15.0) as client:
+        response = client.post(f"{api_root}/embeddings/text", json={"text": text})
+        response.raise_for_status()
+        data = response.json()
+    if json_output:
+        typer.echo(json.dumps(data, indent=2))
+        return
+    console.print(f"[dim]model={data['model']} dim={data['dim']} text_chars={data['text_chars']}[/]")
+    head = ", ".join(f"{v:.4f}" for v in data["vector"][:8])
+    console.print(f"  vector[:8]=[{head}, ...]")
+
+
+@cli.command()
 def batch(
     urls: Optional[str] = typer.Argument(
         None, help="Path to a file with one URL per line, or `-` for stdin. Omit to read stdin."

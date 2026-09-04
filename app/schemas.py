@@ -689,3 +689,138 @@ class CrawlStatusResponse(BaseModel):
     pending: int
     queued_urls: list[str]
     results: list[CrawlUrlResult]
+
+
+class JobRerunResponse(BaseModel):
+    """Response for POST /jobs/{id}/rerun.
+
+    A new job_id is created (so tags/cache/profile_id/profile persist) but the
+    new run is independent (failure of original does not block re-run; success
+    of re-run does not retroactively mark original as DONE).
+    """
+
+    original_job_id: str
+    new_job_id: str
+    url: str
+    reuse_cache: bool = False
+
+
+class JobDiffRequest(BaseModel):
+    """Request for POST /jobs/{id}/diff."""
+
+    other_job_id: str = Field(..., min_length=1, max_length=128)
+    include_links: bool = Field(default=True, description="Also diff link sets")
+    max_chars_per_section: int = Field(default=2000, ge=0, le=50_000)
+
+
+class JobDiffSection(BaseModel):
+    """One section-level diff entry."""
+
+    heading: str
+    anchor: str | None = None
+    state: str = Field(description="added | removed | changed | unchanged")
+    a_chars: int = 0
+    b_chars: int = 0
+    a_excerpt: str = ""
+    b_excerpt: str = ""
+
+
+class JobDiffResponse(BaseModel):
+    """Response for POST /jobs/{id}/diff.
+
+    Two captures compared at the section (heading) level. `added` = present in B
+    but not A; `removed` = present in A but not B; `changed` = same heading
+    with different body; `unchanged` = same heading + same body hash.
+    """
+
+    a_job_id: str
+    b_job_id: str
+    a_word_count: int
+    b_word_count: int
+    a_url: str
+    b_url: str
+    sections: list[JobDiffSection]
+    links_a_only: list[str] = Field(default_factory=list)
+    links_b_only: list[str] = Field(default_factory=list)
+    links_common: list[str] = Field(default_factory=list)
+
+
+class JobSearchRequest(BaseModel):
+    """Request for POST /jobs/search.
+
+    Full-text search across stored Markdown. Case-insensitive substring + simple
+    boolean (split on whitespace; "word1 word2" matches both; quoted "exact
+    phrase" matches literal substring). Returns up to ``limit`` matches ranked
+    by word density.
+    """
+
+    query: str = Field(..., min_length=1, max_length=512)
+    state: str | None = Field(default=None, description="Restrict to a given state (default: any)")
+    limit: int = Field(default=25, ge=1, le=200)
+    url_contains: str | None = None
+    tag: str | None = None
+    context_chars: int = Field(default=80, ge=0, le=400)
+
+
+class JobSearchHit(BaseModel):
+    """A single search hit."""
+
+    job_id: str
+    url: str
+    state: str
+    matched_line: str
+    line_number: int
+    score: float = Field(ge=0.0, description="Higher is better; density-based")
+
+
+class JobSearchResponse(BaseModel):
+    """Response for POST /jobs/search."""
+
+    query: str
+    matches: list[JobSearchHit]
+    total_scanned: int
+    returned: int
+
+
+class EmbeddingTextRequest(BaseModel):
+    """Request for POST /embeddings/text.
+
+    Returns a deterministic 1536-dim float32 vector computed from the input
+    text without shipping a model. Useful for agents that want to score
+    candidate queries against a job's stored embeddings.
+    """
+
+    text: str = Field(..., min_length=1, max_length=20_000, description="Text to embed")
+    model: str = Field(
+        default="hash-bucket-v1",
+        description=(
+            "Embedder to use. Only 'hash-bucket-v1' is built-in; this is a "
+            "hash-bucketed projection that gives a stable 1536-dim vector "
+            "without any model weights. Agents that bring their own embedder "
+            "should call /jobs/{id}/embeddings/search directly with the vector."
+        ),
+    )
+
+
+class EmbeddingTextResponse(BaseModel):
+    """Response for POST /embeddings/text."""
+
+    model: str
+    dim: int
+    vector: list[float]
+    text_chars: int
+
+
+class Slosummary(BaseModel):
+    """Per-category SLO summary, returned by /metrics/slo.json + /jobs/{id}/slo."""
+
+    p50_total_ms: int | None = None
+    p95_total_ms: int | None = None
+    p50_capture_ms: int | None = None
+    p95_capture_ms: int | None = None
+    p50_ocr_ms: int | None = None
+    p95_ocr_ms: int | None = None
+    budget_ms: int | None = None
+    budget_breaches: int = 0
+    status: str = "unknown"
+    count: int = 0

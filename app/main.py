@@ -26,7 +26,7 @@ from prometheus_fastapi_instrumentator import Instrumentator
 from app import metrics
 from app.crawler import CrawlConfig, get_crawler, submit_and_wait_for_job
 from app.dom_links import blend_dom_with_ocr, demo_dom_links, demo_ocr_links, serialize_links
-from app.jobs import JobManager, JobSnapshot, JobState, build_signed_webhook_sender
+from app.jobs import JobManager, JobSnapshot, JobState, _parse_markdown_sections, build_signed_webhook_sender
 from app.schemas import (
     BatchJobItem,
     BatchJobRequest,
@@ -36,13 +36,23 @@ from app.schemas import (
     CrawlStatusResponse,
     CrawlUrlResult,
     EmbeddingSearchRequest,
+    EmbeddingTextRequest,
+    EmbeddingTextResponse,
     EmbeddingSearchResponse,
     JobCreateRequest,
+    JobDiffRequest,
+    JobDiffResponse,
+    JobDiffSection,
     JobListItem,
     JobListResponse,
+    JobRerunResponse,
+    JobSearchHit,
+    JobSearchRequest,
+    JobSearchResponse,
     JobSnapshotResponse,
     ReplayRequest,
     SectionEmbeddingMatch,
+    Slosummary,
     StructuredResult,
     JobTagRequest,
     JobTagResponse,
@@ -608,6 +618,279 @@ async def get_crawl_status(crawl_id: str) -> CrawlStatusResponse:
 
 
 
+@app.post("/jobs/{job_id}/rerun", response_model=JobRerunResponse, status_code=status.HTTP_202_ACCEPTED)
+async def rerun_job(
+    job_id: str,
+    reuse_cache: bool = False,
+) -> JobRerunResponse:
+    """Re-capture the same URL with the same profile/OCR/tags.
+
+    A new job_id is created; the original is unchanged. Tags persist so a
+    follow-up GET /jobs?tag=X query can find both. Use this instead of
+    re-posting the URL when the agent only knows the existing job_id.
+    """
+    snapshot = JOB_MANAGER.get_snapshot(job_id)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    url = str(snapshot.get("url") or "")
+    if not url:
+        raise HTTPException(status_code=400, detail="Original job has no URL; cannot rerun")
+    profile_id = snapshot.get("profile_id")
+    tags = list(snapshot.get("tags") or [])
+    new_request = JobCreateRequest(url=url, profile_id=profile_id, reuse_cache=reuse_cache)
+    new_snapshot = await JOB_MANAGER.create_job(new_request, tags=tags)
+    new_id = str(new_snapshot.get("job_id") or new_snapshot.get("id") or "")
+    return JobRerunResponse(
+        original_job_id=job_id,
+        new_job_id=new_id,
+        url=url,
+        reuse_cache=reuse_cache,
+    )
+
+
+@app.post("/jobs/{job_id}/diff", response_model=JobDiffResponse)
+async def diff_jobs(job_id: str, request: JobDiffRequest) -> JobDiffResponse:
+    """Compare two captures section-by-section.
+
+    Both jobs are parsed into the same heading hierarchy, then a heading-level
+    diff is produced. Use this for "did this page change since yesterday?"
+    agent workflows.
+    """
+    snap_a = JOB_MANAGER.get_snapshot(job_id)
+    if snap_a is None:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+    snap_b = JOB_MANAGER.get_snapshot(request.other_job_id)
+    if snap_b is None:
+        raise HTTPException(status_code=404, detail=f"Job {request.other_job_id} not found")
+    md_a = ""
+    md_b = ""
+    try:
+        md_a = store.read_markdown(job_id)
+    except Exception:
+        md_a = ""
+    try:
+        md_b = store.read_markdown(request.other_job_id)
+    except Exception:
+        md_b = ""
+    sections_a = {s["anchor"]: s for s in _parse_markdown_sections(md_a)}
+    sections_b = {s["anchor"]: s for s in _parse_markdown_sections(md_b)}
+    diffs: list[JobDiffSection] = []
+    for anchor_key in set(sections_a) | set(sections_b):
+        a = sections_a.get(anchor_key)
+        b = sections_b.get(anchor_key)
+        if a is None:
+            diffs.append(
+                JobDiffSection(
+                    heading=b["heading"], anchor=anchor_key, state="added",
+                    a_chars=0, b_chars=len(b["body"]), a_excerpt="",
+                    b_excerpt=b["body"][: request.max_chars_per_section],
+                )
+            )
+        elif b is None:
+            diffs.append(
+                JobDiffSection(
+                    heading=a["heading"], anchor=anchor_key, state="removed",
+                    a_chars=len(a["body"]), b_chars=0,
+                    a_excerpt=a["body"][: request.max_chars_per_section], b_excerpt="",
+                )
+            )
+        else:
+            state = "changed" if a["body"] != b["body"] else "unchanged"
+            diffs.append(
+                JobDiffSection(
+                    heading=a["heading"], anchor=anchor_key, state=state,
+                    a_chars=len(a["body"]), b_chars=len(b["body"]),
+                    a_excerpt=a["body"][: request.max_chars_per_section],
+                    b_excerpt=b["body"][: request.max_chars_per_section],
+                )
+            )
+    links_a: set[str] = set()
+    links_b: set[str] = set()
+    if request.include_links:
+        try:
+            payload = store.read_links(job_id)
+            anchors = (payload or {}).get("anchors") or []
+            links_a = {a.get("href") for a in anchors if a.get("href")}
+        except Exception:
+            pass
+        try:
+            payload = store.read_links(request.other_job_id)
+            anchors = (payload or {}).get("anchors") or []
+            links_b = {a.get("href") for a in anchors if a.get("href")}
+        except Exception:
+            pass
+    return JobDiffResponse(
+        a_job_id=job_id,
+        b_job_id=request.other_job_id,
+        a_word_count=len(md_a.split()) if md_a else 0,
+        b_word_count=len(md_b.split()) if md_b else 0,
+        a_url=str(snap_a.get("url") or ""),
+        b_url=str(snap_b.get("url") or ""),
+        sections=diffs,
+        links_a_only=sorted(links_a - links_b),
+        links_b_only=sorted(links_b - links_a),
+        links_common=sorted(links_a & links_b),
+    )
+
+
+@app.post("/jobs/search", response_model=JobSearchResponse)
+async def search_jobs(request: JobSearchRequest) -> JobSearchResponse:
+    """Full-text search across all stored job Markdown.
+
+    Cheap O(n) over disk; the agent wins because it doesn't need to load any
+    model or service. Quoted phrases match literally; otherwise terms are
+    AND-combined (case-insensitive substring).
+    """
+    import re as _re
+
+    raw = request.query.strip()
+    quoted = _re.findall(r"\"([^\"]+)\"", raw)
+    rest = _re.sub(r"\"[^\"]+\"", " ", raw).split()
+    terms = [t.lower() for t in rest if t]
+    quoted = [q.lower() for q in quoted]
+    if not terms and not quoted:
+        return JobSearchResponse(query=raw, matches=[], total_scanned=0, returned=0)
+
+    # Pre-filter: only scan runs matching filters. Use the store listing.
+    rows, _ = JOB_MANAGER.list_jobs(
+        state=request.state,
+        url_contains=request.url_contains,
+        tag=request.tag,
+        limit=500,  # hard cap so a misconfigured query doesn't walk the whole DB
+    )
+    matches: list[JobSearchHit] = []
+    total_scanned = 0
+    for row in rows:
+        rid = row["id"]
+        total_scanned += 1
+        try:
+            md = store.read_markdown(rid)
+        except Exception:
+            continue
+        if not md:
+            continue
+        md_lower = md.lower()
+        # ALL quoted phrases must match; ALL terms must match
+        if quoted and not all(q in md_lower for q in quoted):
+            continue
+        if terms and not all(t in md_lower for t in terms):
+            continue
+        # Find first matching line for snippet
+        line_number = 0
+        matched_line = ""
+        score = 0.0
+        for ln, line in enumerate(md.splitlines(), start=1):
+            line_lower = line.lower()
+            line_hits = sum(1 for t in terms + quoted if t in line_lower)
+            if line_hits == 0:
+                continue
+            score = max(score, line_hits / max(1, len(line.split())))
+            if not matched_line:
+                matched_line = line
+                line_number = ln
+        if score == 0:
+            score = float(len(terms) + len(quoted))  # phrase-only match fallback
+            for ln, line in enumerate(md.splitlines(), start=1):
+                if any(q in line.lower() for q in quoted):
+                    matched_line = line
+                    line_number = ln
+                    break
+        matches.append(
+            JobSearchHit(
+                job_id=rid,
+                url=row.get("url", ""),
+                state=row.get("state", "UNKNOWN"),
+                matched_line=matched_line[:300],
+                line_number=line_number,
+                score=score,
+            )
+        )
+    # Sort by score desc, then job_id asc for stable order
+    matches.sort(key=lambda h: (-h.score, h.job_id))
+    return JobSearchResponse(
+        query=raw,
+        matches=matches[: request.limit],
+        total_scanned=total_scanned,
+        returned=min(len(matches), request.limit),
+    )
+
+
+@app.post("/embeddings/text", response_model=EmbeddingTextResponse)
+async def embed_text(request: EmbeddingTextRequest) -> EmbeddingTextResponse:
+    """Compute a deterministic 1536-dim vector from text (no model weights).
+
+    Uses a hash-bucketed projection so the endpoint is fast, dependency-free,
+    and stable across calls. Agents that need higher quality can bring their
+    own embedder and call /jobs/{id}/embeddings/search with the result.
+
+    Algorithm: project each character into a few random dimensions chosen by
+    SHA-256 of the character index, normalize to unit length. The output is a
+    1536-dim float32 vector.
+    """
+    import hashlib
+    import math
+
+    if request.model != "hash-bucket-v1":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown embedder {request.model!r}; only 'hash-bucket-v1' is built-in",
+        )
+    dim = 1536
+    text = request.text
+    vec = [0.0] * dim
+    # Walk the text in 4-char windows; each window seeds a small bucket
+    step = 4
+    for i in range(0, len(text), step):
+        window = text[i : i + step].encode("utf-8")
+        digest = hashlib.sha256(window + str(i).encode("ascii")).digest()
+        # Use first 8 bytes as a 64-bit int to pick a starting dimension.
+        seed = int.from_bytes(digest[:8], "big")
+        # 8 buckets of 8-dim each per window; sign from byte 8..16
+        for k in range(8):
+            base = seed % dim
+            for d in range(8):
+                vec[(base + d) % dim] += 1.0
+            seed = (seed * 6364136223846793005 + 1442695040888963407) & ((1 << 64) - 1)
+        # Subtract 1.0 in a mirrored set for the negation signal
+        if len(digest) >= 16:
+            sign_byte = digest[15]
+            if sign_byte & 1:
+                base2 = (seed >> 8) % dim
+                for d in range(8):
+                    vec[(base2 + d) % dim] -= 1.0
+    # L2-normalize
+    norm = math.sqrt(sum(x * x for x in vec)) or 1.0
+    vec = [x / norm for x in vec]
+    return EmbeddingTextResponse(
+        model=request.model,
+        dim=dim,
+        vector=vec,
+        text_chars=len(text),
+    )
+
+
+@app.get("/metrics/slo.json", response_model=dict)
+async def metrics_slo_json() -> dict:
+    """JSON variant of /metrics/slo (identical content, .json suffix for clarity).
+
+    Some agents prefer explicit .json extensions; this route exists purely
+    for that convention.
+    """
+
+    return _compute_live_slo_summary()
+
+
+@app.get("/schema.json", response_model=dict)
+async def schema_json() -> dict:
+    """Machine-readable version of /schema.
+
+    Identical payload; the .json suffix matches the convention many
+    code-gen clients use to discover typed specs.
+    """
+
+    return await schema_discovery()
+
+
 @app.get("/jobs/{job_id}", response_model=JobSnapshotResponse)
 async def fetch_job(job_id: str) -> JobSnapshotResponse:
     try:
@@ -727,6 +1010,53 @@ async def job_manifest(job_id: str) -> JSONResponse:
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Manifest not available yet") from None
     return JSONResponse(manifest)
+
+
+@app.get("/jobs/{job_id}/slo", response_model=Slosummary)
+async def job_slo(job_id: str) -> Slosummary:
+    """Per-job SLO summary for a single capture.
+
+    Reads the manifest from the store and returns p50/p95 capture/OCR/total
+    timings, plus budget breach count if a budget file is configured.
+    """
+    try:
+        manifest = store.read_manifest(job_id)
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail=f"Manifest not found: {exc}") from exc
+    if not isinstance(manifest, dict):
+        raise HTTPException(status_code=404, detail="Manifest is empty")
+    timings = manifest.get("timings") or {}
+    p50_total = timings.get("total_ms")
+    p95_total = p50_total  # single sample
+    p50_cap = timings.get("capture_ms")
+    p95_cap = p50_cap
+    p50_ocr = timings.get("ocr_ms")
+    p95_ocr = p50_ocr
+    budget_ms: int | None = None
+    breaches = 0
+    try:
+        from scripts.compute_slo import load_budgets
+
+        budgets = load_budgets(None)
+        # Use a category key fallback: profile_id or "default"
+        category = (manifest.get("environment") or {}).get("profile_id") or "default"
+        budget_ms = budgets.get(category) or budgets.get("default")
+    except Exception:
+        budget_ms = None
+    if budget_ms and p95_total is not None and int(p95_total) > int(budget_ms):
+        breaches = 1
+    return Slosummary(
+        p50_total_ms=p50_total,
+        p95_total_ms=p95_total,
+        p50_capture_ms=p50_cap,
+        p95_capture_ms=p95_cap,
+        p50_ocr_ms=p50_ocr,
+        p95_ocr_ms=p95_ocr,
+        budget_ms=budget_ms,
+        budget_breaches=breaches,
+        status="within_budget" if breaches == 0 else "breach",
+        count=1,
+    )
 
 
 @app.post("/jobs/{job_id}/tag", response_model=JobTagResponse)
