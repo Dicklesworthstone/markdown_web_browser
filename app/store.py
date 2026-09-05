@@ -746,6 +746,37 @@ class Store:
                     tar.add(paths.root, arcname=arcname, filter=_filter)
         return bundle_path
 
+    def upsert_embeddings(
+        self,
+        *,
+        run_id: str,
+        sections,
+    ) -> None:
+        """Persist section embeddings for a run (replaces existing same-section_id rows)."""
+        from .embeddings import upsert_embeddings as _upsert
+        with self.session() as session:
+            _upsert(session=session, run_id=run_id, sections=list(sections))
+
+    def delete_section_embeddings(
+        self,
+        *,
+        job_id: str,
+        model: str | None = None,
+    ) -> int:
+        """Drop all section embeddings for a job (optionally filtered by model prefix)."""
+        from sqlalchemy import text as _text
+        with self.session() as session:
+            stmt = _text("DELETE FROM section_embeddings WHERE run_id = :rid")
+            params: dict = {"rid": job_id}
+            if model:
+                stmt = _text(
+                    "DELETE FROM section_embeddings WHERE run_id = :rid AND section_id LIKE :prefix"
+                )
+                params["prefix"] = f"{job_id}-%"
+            result = session.execute(stmt, params)
+            session.commit()
+            return int(result.rowcount or 0)
+
     def search_section_embeddings(
         self,
         *,

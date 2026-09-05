@@ -68,6 +68,9 @@ jobs_cli.add_typer(jobs_webhooks_cli, name="webhooks")
 warnings_cli = typer.Typer(help="Warning/blocklist log helpers.")
 cli.add_typer(warnings_cli, name="warnings")
 
+beads_cli = typer.Typer(help="Bead (issue) helpers: health snapshots, weekly reports.")
+cli.add_typer(beads_cli, name="beads")
+
 OutputFormat = Literal["json", "toon"]
 
 
@@ -1696,6 +1699,22 @@ def search(
 
 
 @cli.command()
+def embedders(
+    api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
+    http2: bool = typer.Option(True, "--http2/--no-http2"),
+) -> None:
+    """List available text-embedder backends (GET /embedders)."""
+    api_root = _resolve_settings(api_base).base_url
+    with httpx.Client(http2=http2, timeout=15.0) as client:
+        response = client.get(f"{api_root}/embedders")
+        response.raise_for_status()
+        data = response.json()
+    console.print(f"[dim]default=[bold]{data.get('default')}[/bold][/]")
+    for name in data.get("embedders", []):
+        console.print(f"  - {name}")
+
+
+@cli.command()
 def embed(
     text: str = typer.Argument(..., help="Text to embed (returns 1536-dim float32 vector)"),
     api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
@@ -1917,6 +1936,97 @@ def batch_status_cmd(
         marker = "[cyan]hit[/]" if s.get("cache_hit") else " "
         console.print(
             f"  {s['job_id'][:8]:8s} [{s['state']:>9s}] {marker} {s.get('url', '')[:60]}"
+        )
+
+
+@beads_cli.command("health")
+def beads_health(
+    out: Optional[Path] = typer.Option(
+        None, "--out", help="JSONL output path (default: ops/bead_health.jsonl)"
+    ),
+    read: bool = typer.Option(False, "--read", help="Print the most recent snapshot and exit."),
+) -> None:
+    """Run or read the bead-health telemetry.
+
+    ``mdwb beads health`` (no args) computes a fresh snapshot from ``br list``
+    and appends it to ``ops/bead_health.jsonl`` (or ``--out``).
+
+    ``mdwb beads health --read`` prints the most recent snapshot.
+    """
+    from scripts import bead_health
+
+    out_path = out or Path(os.environ.get("MDWB_BEAD_HEALTH_OUT", str(bead_health.DEFAULT_OUTPUT)))
+    if read:
+        snap = bead_health.read_latest(out_path)
+        typer.echo(json.dumps(snap, indent=2))
+        return
+    written = bead_health.write_report(out_path)
+    snap = bead_health.read_latest(out_path)
+    console.print(f"[green]Wrote bead-health snapshot to {written}[/]")
+    console.print(f"  total={snap.get('total')}  by_status={snap.get('by_status')}")
+    age = snap.get("open_age") or {}
+    if age.get("count", 0) > 0:
+        console.print(
+            f"  open_age: oldest={age['oldest_days']}d  "
+            f"median={age['median_days']}d  p95={age['p95_days']}d"
+        )
+
+
+@cli.command()
+def share(
+    job_id: str = typer.Argument(..., help="Job to share"),
+    ttl_seconds: int = typer.Option(86_400, "--ttl", help="Token TTL in seconds (default 24h)"),
+    api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
+    json_output: bool = typer.Option(False, "--json"),
+    http2: bool = typer.Option(True, "--http2/--no-http2"),
+) -> None:
+    """Mint a signed share token (POST /jobs/{id}/share).
+
+    Anyone with the token can GET /jobs/share/{token} to view a redacted
+    public snapshot without an API key. Default TTL is 24 hours.
+    """
+    api_root = _resolve_settings(api_base).base_url
+    with httpx.Client(http2=http2, timeout=15.0) as client:
+        response = client.post(
+            f"{api_root}/jobs/{job_id}/share",
+            params={"ttl_seconds": ttl_seconds},
+        )
+        response.raise_for_status()
+        data = response.json()
+    if json_output:
+        typer.echo(json.dumps(data, indent=2))
+    else:
+        console.print(
+            f"[green]Share token issued[/]: expires={data['expires_at']}  "
+            f"share_url={data['share_url']}"
+        )
+        console.print(f"  token: {data['token']}")
+
+
+@cli.command(name="store-embeddings")
+def store_embeddings_cmd(
+    job_id: str = typer.Argument(..., help="Job identifier"),
+    model: str = typer.Option("hash-bucket-v1", "--model"),
+    replace: bool = typer.Option(False, "--replace/--no-replace"),
+    api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
+    json_output: bool = typer.Option(False, "--json"),
+    http2: bool = typer.Option(True, "--http2/--no-http2"),
+) -> None:
+    """Re-compute and persist section embeddings (POST /jobs/{id}/embeddings/store)."""
+    api_root = _resolve_settings(api_base).base_url
+    with httpx.Client(http2=http2, timeout=60.0) as client:
+        response = client.post(
+            f"{api_root}/jobs/{job_id}/embeddings/store",
+            json={"model": model, "replace": replace},
+        )
+        response.raise_for_status()
+        data = response.json()
+    if json_output:
+        typer.echo(json.dumps(data, indent=2))
+    else:
+        console.print(
+            f"[green]Embeddings stored[/]: model={data['model']}  "
+            f"stored={data['stored']}  replaced={data['replaced']}  dim={data['dim']}"
         )
 
 
@@ -3468,6 +3578,75 @@ def jobs_bundle_alias(
     """Download the tar bundle (tiles, manifest, markdown, links) for a job."""
 
     _download_bundle(job_id, api_base, out)
+
+
+@jobs_cli.command("compare")
+def jobs_compare(
+    a: str = typer.Argument(..., help="First job id ('before' capture)"),
+    b: str = typer.Argument(..., help="Second job id ('after' capture)"),
+    max_chars: int = typer.Option(2000, "--max-chars"),
+    api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
+    json_output: bool = typer.Option(False, "--json"),
+    http2: bool = typer.Option(True, "--http2/--no-http2"),
+) -> None:
+    """Diff two captures (alias for `mdwb diff`)."""
+    api_root = _resolve_settings(api_base).base_url
+    with httpx.Client(http2=http2, timeout=30.0) as client:
+        response = client.post(
+            f"{api_root}/jobs/{a}/diff",
+            json={"other_job_id": b, "include_links": True, "max_chars_per_section": max_chars},
+        )
+        response.raise_for_status()
+        data = response.json()
+    if json_output:
+        typer.echo(json.dumps(data, indent=2))
+        return
+    counts = {"added": 0, "removed": 0, "changed": 0, "unchanged": 0}
+    for s in data.get("sections", []):
+        counts[s["state"]] = counts.get(s["state"], 0) + 1
+    console.print(
+        f"[dim]A[/] {data['a_url']} (words={data['a_word_count']})  "
+        f"[dim]B[/] {data['b_url']} (words={data['b_word_count']})"
+    )
+    console.print(
+        f"  added={counts['added']}  removed={counts['removed']}  "
+        f"changed={counts['changed']}  unchanged={counts['unchanged']}"
+    )
+    for s in data.get("sections", []):
+        if s["state"] == "unchanged":
+            continue
+        marker = {"added": "[green]+[/]", "removed": "[red]-[/]", "changed": "[yellow]~[/]"}.get(s["state"], "?")
+        console.print(f"  {marker} {s['heading']}  (a={s['a_chars']}c, b={s['b_chars']}c)")
+
+
+@jobs_cli.command("tree")
+def jobs_tree(
+    job_id: str = typer.Argument(..., help="Job identifier"),
+    api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
+    max_depth: int = typer.Option(3, "--max-depth", help="Heading levels to render (1-6)"),
+    json_output: bool = typer.Option(False, "--json"),
+    http2: bool = typer.Option(True, "--http2/--no-http2"),
+) -> None:
+    """Print an ASCII tree of the job's heading structure (from /jobs/{id}/result.json)."""
+    api_root = _resolve_settings(api_base).base_url
+    with httpx.Client(http2=http2, timeout=15.0) as client:
+        response = client.get(f"{api_root}/jobs/{job_id}/result.json")
+        response.raise_for_status()
+        data = response.json()
+    if json_output:
+        typer.echo(json.dumps(data.get("sections", []), indent=2))
+        return
+    sections = data.get("sections", [])
+    if not sections:
+        console.print(f"  (no sections for {job_id})")
+        return
+    for s in sections:
+        lvl = max(1, min(6, int(s.get("level", 1))))
+        if lvl > max_depth:
+            continue
+        indent = "  " * (lvl - 1)
+        body_chars = len((s.get("body") or "").strip())
+        console.print(f"{indent}- [bold]{s.get('heading')}[/]  ({body_chars} chars)")
 
 
 @jobs_cli.command("ocr-metrics")

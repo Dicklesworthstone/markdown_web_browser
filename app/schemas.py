@@ -906,3 +906,61 @@ class JobEventsJsonResponse(BaseModel):
     job_id: str
     count: int
     events: list[dict] = Field(default_factory=list)
+
+
+class JobShareResponse(BaseModel):
+    """Response for POST /jobs/{id}/share."""
+
+    job_id: str
+    token: str
+    expires_at: str
+    share_url: str
+
+
+class JobSharePublicResponse(BaseModel):
+    """Public view of a job accessible via a share token (no API key needed).
+
+    Mirrors a subset of JobSnapshotResponse so an external agent can use a
+    shared run without enrolling in the host system.
+    """
+
+    job_id: str
+    url: str
+    state: str
+    cache_hit: bool = False
+    profile_id: str | None = None
+    tags: list[str] = Field(default_factory=list)
+    created_at: str | None = None
+    finished_at: str | None = None
+    manifest: dict[str, Any] | None = None
+    share_expires_at: str | None = None
+
+
+class EmbeddingStoreRequest(BaseModel):
+    """Request for POST /jobs/{id}/embeddings/store."""
+
+    model: str = Field(
+        default="hash-bucket-v1",
+        description="Embedder to use (hash-bucket-v1 | openai-compatible | sentence-transformers)",
+    )
+    sections: list[str] | None = Field(
+        default=None,
+        description=(
+            "Override the section list to embed (default: re-derive from "
+            "result.json). Useful for incremental re-embedding."
+        ),
+    )
+    replace: bool = Field(
+        default=False,
+        description="If true, drop existing embeddings before re-storing",
+    )
+
+
+class EmbeddingStoreResponse(BaseModel):
+    """Response for POST /jobs/{id}/embeddings/store."""
+
+    job_id: str
+    model: str
+    stored: int
+    replaced: int
+    dim: int

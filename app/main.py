@@ -56,7 +56,11 @@ from app.schemas import (
     Slosummary,
     StructuredResult,
     JobTagRequest,
+    JobSharePublicResponse,
+    JobShareResponse,
     JobTagResponse,
+    EmbeddingStoreRequest,
+    EmbeddingStoreResponse,
     BatchStatusItem,
     BatchStatusRequest,
     BatchStatusResponse,
@@ -297,6 +301,47 @@ async def healthcheck() -> dict[str, str]:
     """Return a simple status useful for smoke tests."""
 
     return {"status": "ok"}
+
+
+@app.get("/health/beads", tags=["health"])
+async def health_beads() -> dict:
+    """Return the latest bead-health snapshot (from scripts/bead_health.py)."""
+    import importlib
+    import sys
+    from pathlib import Path as _P
+
+    # Ensure the project root is importable so ``import scripts`` works regardless
+    # of the test harness's cwd (e.g. when tmp_path fixtures chdir).
+    project_root = str(_P(__file__).resolve().parent.parent)
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
+
+    try:
+        bead_health = importlib.import_module("scripts.bead_health")
+    except Exception as exc:
+        return {"status": "error", "detail": f"bead_health module unavailable: {exc}"}
+
+    try:
+        # Prefer ops/bead_health.jsonl (committed by ops tooling); fall back to a fresh snapshot.
+        candidate = _P("ops/bead_health.jsonl")
+        if candidate.exists():
+            data = bead_health.read_latest(candidate)
+            if data.get("status") != "no-data":
+                return data
+        return bead_health.snapshot()
+    except Exception as exc:  # pragma: no cover - best-effort
+        return {"status": "error", "detail": str(exc)}
+
+
+
+
+
+@app.get("/embedders", tags=["embed"])
+async def list_embedders_endpoint() -> dict[str, Any]:
+    """List available embedders + which one is the default."""
+    from app.embedders import list_embedders
+
+    return {"embedders": list_embedders(), "default": "hash-bucket-v1"}
 
 
 @app.get("/schema", tags=["observability"])
@@ -824,55 +869,35 @@ async def search_jobs(request: JobSearchRequest) -> JobSearchResponse:
 
 @app.post("/embeddings/text", response_model=EmbeddingTextResponse)
 async def embed_text(request: EmbeddingTextRequest) -> EmbeddingTextResponse:
-    """Compute a deterministic 1536-dim vector from text (no model weights).
+    """Compute a vector for ``request.text`` using the named embedder.
 
-    Uses a hash-bucketed projection so the endpoint is fast, dependency-free,
-    and stable across calls. Agents that need higher quality can bring their
-    own embedder and call /jobs/{id}/embeddings/search with the result.
-
-    Algorithm: project each character into a few random dimensions chosen by
-    SHA-256 of the character index, normalize to unit length. The output is a
-    1536-dim float32 vector.
+    Supported embedders (see :func:`app.embedders.list_embedders`):
+    - ``hash-bucket-v1`` (default): deterministic 1536-dim projection, no model weights
+    - ``openai-compatible``: proxies to any OpenAI-compatible /v1/embeddings endpoint
+      (reads ``OPENAI_BASE_URL`` / ``OPENAI_API_KEY`` / ``OPENAI_EMBEDDING_MODEL``)
+    - ``sentence-transformers``: local model, requires the optional ``local-ocr`` extras
     """
-    import hashlib
-    import math
+    from app.embedders import get_embedder, list_embedders
 
-    if request.model != "hash-bucket-v1":
+    known = list_embedders()
+    if request.model not in known:
         raise HTTPException(
             status_code=400,
-            detail=f"Unknown embedder {request.model!r}; only 'hash-bucket-v1' is built-in",
+            detail=f"Unknown embedder {request.model!r}; known: {known}",
         )
-    dim = 1536
-    text = request.text
-    vec = [0.0] * dim
-    # Walk the text in 4-char windows; each window seeds a small bucket
-    step = 4
-    for i in range(0, len(text), step):
-        window = text[i : i + step].encode("utf-8")
-        digest = hashlib.sha256(window + str(i).encode("ascii")).digest()
-        # Use first 8 bytes as a 64-bit int to pick a starting dimension.
-        seed = int.from_bytes(digest[:8], "big")
-        # 8 buckets of 8-dim each per window; sign from byte 8..16
-        for k in range(8):
-            base = seed % dim
-            for d in range(8):
-                vec[(base + d) % dim] += 1.0
-            seed = (seed * 6364136223846793005 + 1442695040888963407) & ((1 << 64) - 1)
-        # Subtract 1.0 in a mirrored set for the negation signal
-        if len(digest) >= 16:
-            sign_byte = digest[15]
-            if sign_byte & 1:
-                base2 = (seed >> 8) % dim
-                for d in range(8):
-                    vec[(base2 + d) % dim] -= 1.0
-    # L2-normalize
-    norm = math.sqrt(sum(x * x for x in vec)) or 1.0
-    vec = [x / norm for x in vec]
+    try:
+        embedder = get_embedder(request.model)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"embedder {request.model!r} unavailable: {exc}",
+        ) from exc
+    vector = embedder.embed(request.text)
     return EmbeddingTextResponse(
         model=request.model,
-        dim=dim,
-        vector=vec,
-        text_chars=len(text),
+        dim=len(vector),
+        vector=vector,
+        text_chars=len(request.text),
     )
 
 
@@ -1103,6 +1128,170 @@ async def job_cancel(job_id: str, reason: str = "cancelled by user") -> JobSnaps
     if snapshot is None:
         raise HTTPException(status_code=404, detail="Job not found")
     return _snapshot_to_response(snapshot)
+
+
+@app.post("/jobs/{job_id}/share", response_model=JobShareResponse)
+async def share_job(
+    job_id: str,
+    ttl_seconds: int = 86_400,
+) -> JobShareResponse:
+    """Mint a signed share token (HMAC-SHA256, WEBHOOK_SECRET-bound)."""
+    import time
+    import hmac
+    import hashlib
+    import base64
+    import json as _json
+    from datetime import datetime, timezone
+
+    secret = (settings.webhook_secret or "mdwb-dev-webhook").encode("utf-8")
+    expires_at = int(time.time()) + max(60, ttl_seconds)
+    payload = {"job_id": job_id, "exp": expires_at}
+    body = _json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    sig = hmac.new(secret, body, hashlib.sha256).digest()
+    token = base64.urlsafe_b64encode(body + b"." + sig).decode("ascii").rstrip("=")
+    return JobShareResponse(
+        job_id=job_id,
+        token=token,
+        expires_at=datetime.fromtimestamp(expires_at, tz=timezone.utc).isoformat(),
+        share_url=f"/jobs/share/{token}",
+    )
+
+
+@app.get("/jobs/share/{token}", response_model=JobSharePublicResponse)
+async def public_share_view(token: str) -> JobSharePublicResponse:
+    """Resolve a share token; return redacted public snapshot (no API key needed)."""
+    import hmac
+    import hashlib
+    import base64
+    import json as _json
+    import time as _time
+
+    secret = (settings.webhook_secret or "mdwb-dev-webhook").encode("utf-8")
+    pad = "=" * ((4 - len(token) % 4) % 4)
+    try:
+        decoded = base64.urlsafe_b64decode(token + pad)
+    except Exception:
+        raise HTTPException(status_code=404, detail="Invalid share token") from None
+    if b"." not in decoded:
+        raise HTTPException(status_code=404, detail="Invalid share token")
+    body, sig = decoded.rsplit(b".", 1)
+    expected = hmac.new(secret, body, hashlib.sha256).digest()
+    if not hmac.compare_digest(sig, expected):
+        raise HTTPException(status_code=404, detail="Invalid share token")
+    try:
+        payload = _json.loads(body)
+    except Exception:
+        raise HTTPException(status_code=404, detail="Invalid share token") from None
+    if int(payload.get("exp", 0)) < _time.time():
+        raise HTTPException(status_code=404, detail="Share token expired")
+    target_job = payload.get("job_id")
+    if not isinstance(target_job, str):
+        raise HTTPException(status_code=404, detail="Invalid share token")
+    snap = JOB_MANAGER.get_snapshot(target_job)
+    if snap is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return JobSharePublicResponse(
+        job_id=target_job,
+        url=str(snap.get("url") or ""),
+        state=str(snap.get("state", "UNKNOWN")),
+        cache_hit=bool(snap.get("cache_hit")),
+        profile_id=snap.get("profile_id"),
+        tags=list(snap.get("tags") or []),
+        created_at=str(snap.get("started_at") or "") or None,
+        finished_at=str(snap.get("finished_at") or "") or None,
+        manifest=snap.get("manifest"),
+        share_expires_at=str(payload.get("exp") or ""),
+    )
+
+
+@app.post("/jobs/{job_id}/embeddings/store", response_model=EmbeddingStoreResponse)
+async def store_embeddings(
+    job_id: str, request: EmbeddingStoreRequest
+) -> EmbeddingStoreResponse:
+    """Re-compute and persist section embeddings (any model in /embedders)."""
+    from app.embedders import get_embedder, list_embedders
+
+    if request.model not in list_embedders():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown embedder {request.model!r}; known: {list_embedders()}",
+        )
+    try:
+        embedder = get_embedder(request.model)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"embedder unavailable: {exc}") from exc
+
+    sections_text: list[str] = []
+    if request.sections:
+        sections_text = list(request.sections)
+    else:
+        try:
+            structured = JOB_MANAGER.get_structured_result(job_id)
+        except Exception:
+            structured = {"sections": []}
+        for s in structured.get("sections", []) or []:
+            text = (s.get("heading") or "") + " " + (s.get("body") or "")
+            if text.strip():
+                sections_text.append(text.strip())
+
+    if not sections_text:
+        return EmbeddingStoreResponse(
+            job_id=job_id, model=request.model, stored=0, replaced=0, dim=embedder.dim
+        )
+
+    if request.replace:
+        try:
+            store.delete_section_embeddings(job_id=job_id, model=request.model)
+        except Exception:
+            pass
+        replaced = len(sections_text)
+    else:
+        replaced = 0
+
+    from app.embeddings import SectionEmbedding
+
+    embeddings = []
+    for i, text in enumerate(sections_text):
+        try:
+            vec = embedder.embed(text)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503, detail=f"embedder {request.model} failed: {exc}"
+            ) from exc
+        embeddings.append(
+            {
+                "section_id": f"{job_id}-{i}",
+                "tile_start": i,
+                "tile_end": i + 1,
+                "vector": vec,
+            }
+        )
+    try:
+        store.upsert_embeddings(
+            run_id=job_id,
+            sections=[SectionEmbedding(**e) for e in embeddings],
+        )
+    except Exception as exc:  # pragma: no cover
+        raise HTTPException(
+            status_code=500, detail=f"failed to persist embeddings: {exc}"
+        ) from exc
+
+    return EmbeddingStoreResponse(
+        job_id=job_id,
+        model=request.model,
+        stored=len(embeddings),
+        replaced=replaced,
+        dim=embedder.dim,
+    )
+
+
+@app.get("/jobs/{job_id}/raw")
+async def job_raw_events(job_id: str) -> dict:
+    """JSON array of the entire event log (single-shot, vs. the streaming NDJSON at /events)."""
+    events = JOB_MANAGER.get_events(job_id, since=None, min_sequence=0)
+    return {"job_id": job_id, "count": len(events), "events": events}
+
+
 
 
 @app.get("/jobs/{job_id}/slo.json", response_model=Slosummary)

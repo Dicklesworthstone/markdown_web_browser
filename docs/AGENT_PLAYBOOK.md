@@ -275,3 +275,86 @@ mdwb schema.json --out /tmp/schema.json   # offline reference
 - `docs/ops.md` — operational playbooks
 - `GET /schema` — live, agent-oriented API surface
 - `GET /openapi.json` — full Swagger schema for code-gen clients
+
+## 16. Round-5 surfaces (real embedders + sharing + bead health)
+
+### Pluggable embedders (no model weights required)
+
+```bash
+# List available embedders + which is the default
+curl http://localhost:8000/embedders
+# {"embedders": ["hash-bucket-v1", "openai-compatible", "sentence-transformers"], "default": "hash-bucket-v1"}
+
+# Get a vector for arbitrary text
+curl -X POST http://localhost:8000/embeddings/text -d '{"text":"hello"}' -H 'Content-Type: application/json'
+
+# The openai-compatible backend reads OPENAI_BASE_URL + OPENAI_API_KEY
+export OPENAI_BASE_URL=https://api.openai.com
+export OPENAI_API_KEY=sk-...
+curl -X POST http://localhost:8000/embeddings/text -d '{"text":"x","model":"openai-compatible"}' -H 'Content-Type: application/json'
+```
+
+### Re-embed + re-store sections (use a different model mid-flight)
+
+```bash
+curl -X POST http://localhost:8000/jobs/$ID/embeddings/store   -d '{"model":"hash-bucket-v1","replace":true}' -H 'Content-Type: application/json'
+# Returns {"job_id":..., "stored": N, "replaced": N, "dim": 1536}
+```
+
+### Share a run with a no-API-key public URL
+
+```bash
+# Mint a signed token (HMAC-SHA256, WEBHOOK_SECRET-bound, default 24h)
+curl -X POST http://localhost:8000/jobs/$ID/share -d '{}' -H 'Content-Type: application/json'
+# Returns {"token": "...", "share_url": "/jobs/share/...", "expires_at": "..."}
+
+# Anyone with the token can GET the redacted public snapshot
+curl http://localhost:8000/jobs/share/$TOKEN
+# No API key needed; 404 on bad/expired token
+```
+
+### Single-shot raw events (vs. streaming NDJSON)
+
+```bash
+# /jobs/$ID/events  streams NDJSON (one line per event as they happen)
+# /jobs/$ID/raw     returns a single JSON array (one round-trip)
+curl http://localhost:8000/jobs/$ID/raw | jq '.events | length'
+```
+
+### Bead health telemetry (auto-skips on missing `br`)
+
+```bash
+# Append a fresh snapshot to ops/bead_health.jsonl
+mdwb beads health
+mdwb beads health --out /tmp/agent_beads.jsonl
+
+# Read the most recent snapshot
+mdwb beads health --read
+
+# Exposed over HTTP for dashboards
+curl http://localhost:8000/health/beads | jq '.open_age, .by_status'
+```
+
+### CLI quick reference (R5 additions)
+
+```bash
+mdwb embedders                                 # list available embedders
+mdwb share <id> [--ttl N]                      # mint share token
+mdwb store-embeddings <id> [--model X] [--replace]
+mdwb jobs compare <a> <b>                      # alias for `mdwb diff`
+mdwb jobs tree <id>                            # ASCII TOC from /result.json
+```
+
+### Tip: capture → re-embed pipeline
+
+```bash
+# 1. Capture (default embedder: hash-bucket-v1)
+mdwb fetch https://example.com --watch
+
+# 2. Re-embed with openai-compatible (if you have OPENAI_API_KEY)
+mdwb store-embeddings <id> --model openai-compatible --replace
+
+# 3. Now searches use the new embeddings
+curl -X POST http://localhost:8000/jobs/<id>/embeddings/search   -d '{"vector":[...]}'
+```
+
