@@ -103,7 +103,6 @@ def test_embeddings_text_embedder_unavailable_returns_503(
 def test_share_token_round_trip(
     monkeypatch: pytest.MonkeyPatch, client: TestClient
 ) -> None:
-    # Ensure JOB_MANAGER has a get_snapshot regardless of any prior test swap.
     def _get_snap(job_id):
         return {
             "id": job_id,
@@ -118,8 +117,14 @@ def test_share_token_round_trip(
             "manifest": {"url": "https://example.com"},
         }
 
-    # Defensively set both instance attribute (if real JM exists) and class attr.
-    monkeypatch.setattr(main_mod.JOB_MANAGER, "get_snapshot", _get_snap)
+    # Patch whatever JOB_MANAGER currently is. Other tests in the suite
+    # (test_api_replay, test_api_webhooks, test_agent_surfaces) swap
+    # JOB_MANAGER for a stub; we need our patch to survive that.
+    current = main_mod.JOB_MANAGER
+    monkeypatch.setattr(current, "get_snapshot", _get_snap)
+    # Also patch the module so any *subsequent* swap is undone by the
+    # monkeypatch teardown (it restores whatever was on the module at setup).
+    monkeypatch.setattr(main_mod, "JOB_MANAGER", current)
 
     r1 = client.post("/jobs/abc/share", params={"ttl_seconds": 600})
     assert r1.status_code == 200
