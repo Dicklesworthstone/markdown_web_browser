@@ -202,6 +202,70 @@ mdwb jobs embeddings search <id> --vector @query.vec.json
 | 500 | OCR backend unreachable | Check `mdwb diag` + `mdwb jobs ocr-metrics ID`; or set `OCR_LOCAL_URL` for local |
 | 502 | host unreachable (during capture) | Network; retry with `reuse_cache=true` once the host recovers |
 
+## 15. Round-4 surfaces (new in this round)
+
+### Tag, compare, search, embed, slice — without re-rolling the job
+
+```bash
+# Multi-tag in one call
+curl -X POST http://localhost:8000/jobs/$ID/tags -d '{"tags":["a","b","c"]}' -H 'Content-Type: application/json'
+
+# Single-tag delete
+curl -X DELETE http://localhost:8000/jobs/$ID/tag/some-tag
+
+# Cancel an in-flight job
+curl -X POST http://localhost:8000/jobs/$ID/cancel?reason=user+stop
+
+# Diff two captures (sections + link sets)
+curl -X POST http://localhost:8000/jobs/$A/diff -d '{"other_job_id":"$B"}' -H 'Content-Type: application/json'
+
+# Full-text search across all stored Markdown
+curl -X POST http://localhost:8000/jobs/search -d '{"query":"pricing","tag":"dataset:2026-q1"}' -H 'Content-Type: application/json'
+
+# Deterministic embedding (no model weights)
+curl -X POST http://localhost:8000/embeddings/text -d '{"text":"hello"}' -H 'Content-Type: application/json'
+# Returns 1536-dim L2-normalized float32 vector
+```
+
+### Per-job surfaces
+
+```bash
+# Raw Markdown (no provenance comments) — perfect for LLM input
+curl 'http://localhost:8000/jobs/$ID/result.md?raw=true'
+curl 'http://localhost:8000/jobs/$ID/result.md/raw'   # alias
+
+# Per-job SLO (vs. the global /metrics/slo)
+curl http://localhost:8000/jobs/$ID/slo
+curl http://localhost:8000/jobs/$ID/slo.json   # alias
+
+# Per-source link breakdown (dom | ocr | both | other)
+curl http://localhost:8000/jobs/$ID/links | jq '.counts, .by_source | keys'
+
+# Single-shot event log dump
+curl http://localhost:8000/jobs/$ID/events.json | jq '.count, (.events | length)'
+
+# Artifact inventory (every file produced)
+curl http://localhost:8000/jobs/$ID/artifacts | jq '.files[] | .path'
+```
+
+### Batch / multi-job ops
+
+```bash
+# Poll N job ids in one call (N <= 500) — replaces N HTTP round-trips for dashboards
+curl -X POST http://localhost:8000/jobs/batch/status -d '{"job_ids":["a","b","c"]}' -H 'Content-Type: application/json'
+
+# CLI equivalents
+mdwb tags $ID list
+mdwb tags $ID add high-priority
+mdwb tags $ID rm high-priority
+mdwb cancel $ID
+mdwb batch-status a b c
+mdwb events-json $ID --json > events.json
+mdwb links $ID --json | jq '.counts'
+mdwb artifacts $ID --json
+mdwb schema.json --out /tmp/schema.json   # offline reference
+```
+
 ## 14. Where to read next
 
 - `README.md` — vision + setup + quickstart

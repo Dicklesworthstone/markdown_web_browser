@@ -50,12 +50,19 @@ from app.schemas import (
     JobSearchRequest,
     JobSearchResponse,
     JobSnapshotResponse,
+    JobTagMultiRequest,
     ReplayRequest,
     SectionEmbeddingMatch,
     Slosummary,
     StructuredResult,
     JobTagRequest,
     JobTagResponse,
+    BatchStatusItem,
+    BatchStatusRequest,
+    BatchStatusResponse,
+    JobArtifactsResponse,
+    JobEventsJsonResponse,
+    JobLinksResponse,
     WebhookRegistrationRequest,
     WebhookSubscription,
     WebhookDeleteRequest,
@@ -1067,6 +1074,151 @@ async def job_add_tag(job_id: str, request: JobTagRequest) -> JobTagResponse:
     return JobTagResponse(job_id=job_id, tags=list(snap.get("tags") or []))
 
 
+@app.post("/jobs/{job_id}/tags", response_model=JobTagResponse)
+async def job_add_tags(job_id: str, request: JobTagMultiRequest) -> JobTagResponse:
+    """Append multiple tags to a job in one call.
+
+    Idempotent: existing tags are not duplicated. Returns the final tag set so
+    agents don't have to follow up with GET /jobs/{id}/tag.
+    """
+    tags = JOB_MANAGER.add_tags(job_id, list(request.tags))
+    return JobTagResponse(job_id=job_id, tags=tags)
+
+
+@app.delete("/jobs/{job_id}/tag/{tag}", response_model=JobTagResponse)
+async def job_remove_tag(job_id: str, tag: str) -> JobTagResponse:
+    """Remove a single tag by value.
+
+    Path-encoded so ``/`` in tag names is escaped as ``%2F`` (rare but supported).
+    """
+    tags = JOB_MANAGER.remove_tag(job_id, tag)
+    return JobTagResponse(job_id=job_id, tags=tags)
+
+
+@app.post("/jobs/{job_id}/cancel", response_model=JobSnapshotResponse)
+async def job_cancel(job_id: str, reason: str = "cancelled by user") -> JobSnapshotResponse:
+    """Cancel an in-flight job. Sets state to CANCELLED and broadcasts."""
+    JOB_MANAGER.cancel_job(job_id, reason=reason)
+    snapshot = JOB_MANAGER.get_snapshot(job_id)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return _snapshot_to_response(snapshot)
+
+
+@app.get("/jobs/{job_id}/slo.json", response_model=Slosummary)
+async def job_slo_json(job_id: str) -> Slosummary:
+    """Explicit .json alias for /jobs/{id}/slo (identical content)."""
+    return await job_slo(job_id)
+
+
+@app.get("/jobs/{job_id}/events.json", response_model=JobEventsJsonResponse)
+async def job_events_json(job_id: str, since: str | None = None) -> JobEventsJsonResponse:
+    """Single-shot JSON dump of the event log (vs. the streaming NDJSON at /events)."""
+    parsed = _parse_since(since)
+    events = JOB_MANAGER.get_events(job_id, since=parsed, min_sequence=0)
+    return {
+        "job_id": job_id,
+        "count": len(events),
+        "events": events,
+    }
+
+
+@app.get("/jobs/{job_id}/links", response_model=JobLinksResponse)
+async def job_links_structured(job_id: str) -> JobLinksResponse:
+    """Per-source breakdown of links (dom / ocr / both / unknown).
+
+    Agents use this to filter "trusted" links (dom only) vs "all" links.
+    """
+    try:
+        payload = store.read_links(job_id)
+    except Exception:
+        payload = None
+    if not isinstance(payload, dict):
+        return {"job_id": job_id, "by_source": {}, "total": 0, "anchors": []}
+    anchors = payload.get("anchors") or []
+    by_source: dict[str, list] = {"dom": [], "ocr": [], "both": [], "other": []}
+    for entry in anchors:
+        if not isinstance(entry, dict):
+            continue
+        src = str(entry.get("source") or "other")
+        if src not in by_source:
+            src = "other"
+        by_source[src].append(
+            {
+                "href": entry.get("href") or "",
+                "text": entry.get("text"),
+                "delta": entry.get("delta"),
+            }
+        )
+    return {
+        "job_id": job_id,
+        "by_source": {k: v for k, v in by_source.items() if v},
+        "counts": {k: len(v) for k, v in by_source.items()},
+        "total": len(anchors),
+        "anchors": anchors,
+    }
+
+
+@app.get("/jobs/{job_id}/artifacts", response_model=JobArtifactsResponse)
+async def job_artifacts(job_id: str) -> JobArtifactsResponse:
+    """Enumerate every artifact file produced for a capture.
+
+    Lists ``manifest.json``, ``out.md``, ``links.json``, ``dom_snapshot.html``,
+    ``result.json``, ``slo`` (synthetic), and any tile images. Exists so an
+    agent can decide what to download without guessing.
+    """
+    try:
+        manifest = store.read_manifest(job_id)
+    except Exception:
+        manifest = None
+    if not isinstance(manifest, dict):
+        raise HTTPException(status_code=404, detail="Manifest not available")
+    artifact_root = manifest.get("artifact_root") or manifest.get("cache_path") or ""
+    files: list[dict] = []
+    if artifact_root:
+        from pathlib import Path as _P
+        root = _P(artifact_root)
+        for p in sorted(root.rglob("*")) if root.exists() else []:
+            if p.is_file():
+                files.append(
+                    {
+                        "path": str(p.relative_to(root)),
+                        "absolute": str(p),
+                        "size": p.stat().st_size,
+                        "kind": "tile" if "tile" in p.parts else p.suffix.lstrip(".") or "file",
+                    }
+                )
+    return {
+        "job_id": job_id,
+        "artifact_root": artifact_root,
+        "file_count": len(files),
+        "total_bytes": sum(f["size"] for f in files),
+        "files": files,
+        "synthetic": {
+            "structured_result": f"/jobs/{job_id}/result.json",
+            "per_job_slo": f"/jobs/{job_id}/slo",
+            "raw_markdown": f"/jobs/{job_id}/result.md?raw=true",
+        },
+    }
+
+
+@app.post("/jobs/batch/status", response_model=BatchStatusResponse)
+async def jobs_batch_status(request: BatchStatusRequest) -> BatchStatusResponse:
+    """Return compact status for many jobs in one call.
+
+    Body: ``{"job_ids": ["abc", "def", ...]}``. Useful for dashboards that
+    want to refresh N tiles without N HTTP round-trips.
+    """
+    if not request.job_ids:
+        raise HTTPException(status_code=400, detail="job_ids must be a non-empty list")
+    statuses = JOB_MANAGER.batch_status([str(i) for i in request.job_ids])
+    return BatchStatusResponse(
+        count=len(statuses),
+        statuses=[BatchStatusItem(**s) for s in statuses],
+    )
+
+
+
 @app.get("/jobs/{job_id}/result.json", response_model=StructuredResult)
 async def job_result_json(job_id: str) -> StructuredResult:
     """Machine-friendly, parsed result for /jobs/{id}.
@@ -1083,14 +1235,29 @@ async def job_result_json(job_id: str) -> StructuredResult:
 
 
 @app.get("/jobs/{job_id}/result.md")
-async def job_markdown(job_id: str) -> PlainTextResponse:
+async def job_markdown(job_id: str, raw: bool = False) -> PlainTextResponse:
+    """Return the stitched Markdown.
+
+    With ``?raw=true`` we strip provenance comments
+    (``<!-- source: tile_i, y=..., sha256=..., scale=... -->``) so the agent
+    gets a clean input. The default keeps provenance for audit/UI.
+    """
     try:
         markdown = store.read_markdown(job_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Job not found") from exc
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Markdown not available yet") from None
+    if raw:
+        import re as _re
+        markdown = _re.sub(r"<!--[\s\S]*?-->\n?", "", markdown, flags=_re.DOTALL).strip()
     return PlainTextResponse(markdown, media_type="text/markdown")
+
+
+@app.get("/jobs/{job_id}/result.md/raw", response_class=PlainTextResponse)
+async def job_markdown_raw(job_id: str) -> PlainTextResponse:
+    """Convenience alias: GET /jobs/{id}/result.md/raw = result.md?raw=true."""
+    return await job_markdown(job_id, raw=True)
 
 
 @app.get("/jobs/{job_id}/artifact/highlight", response_class=HTMLResponse)

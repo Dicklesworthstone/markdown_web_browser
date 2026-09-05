@@ -1721,6 +1721,227 @@ def embed(
     console.print(f"  vector[:8]=[{head}, ...]")
 
 
+@cli.command(name="events-json")
+def events_json(
+    job_id: str = typer.Argument(..., help="Job identifier"),
+    api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
+    since: Optional[str] = typer.Option(None, "--since", help="ISO timestamp cursor"),
+    http2: bool = typer.Option(True, "--http2/--no-http2"),
+) -> None:
+    """Single-shot JSON dump of the event log (vs. the streaming NDJSON from `mdwb events`).
+
+    Hits GET /jobs/{id}/events.json.
+    """
+    api_root = _resolve_settings(api_base).base_url
+    params: dict = {}
+    if since:
+        params["since"] = since
+    with httpx.Client(http2=http2, timeout=30.0) as client:
+        response = client.get(f"{api_root}/jobs/{job_id}/events.json", params=params)
+        response.raise_for_status()
+        typer.echo(json.dumps(response.json(), indent=2))
+
+
+@cli.command(name="links")
+def links_cmd(
+    job_id: str = typer.Argument(..., help="Job identifier"),
+    api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
+    source: Optional[str] = typer.Option(
+        None, "--source",
+        help="Filter to a specific source: dom|ocr|both|other",
+    ),
+    json_output: bool = typer.Option(False, "--json"),
+    http2: bool = typer.Option(True, "--http2/--no-http2"),
+) -> None:
+    """Per-source link breakdown (GET /jobs/{id}/links)."""
+    api_root = _resolve_settings(api_base).base_url
+    with httpx.Client(http2=http2, timeout=15.0) as client:
+        response = client.get(f"{api_root}/jobs/{job_id}/links")
+        response.raise_for_status()
+        data = response.json()
+    if json_output:
+        typer.echo(json.dumps(data, indent=2))
+        return
+    counts = data.get("counts") or {}
+    console.print(f"[dim]{data['total']} anchors across sources:[/] {counts}")
+    for src, items in (data.get("by_source") or {}).items():
+        if source and src != source:
+            continue
+        console.print(f"  [bold]{src}[/] ({len(items)}):")
+        for item in items[:10]:
+            console.print(f"    - {item.get('text') or '<no text>'}  {item.get('href')}")
+        if len(items) > 10:
+            console.print(f"    ... ({len(items) - 10} more)")
+
+
+@cli.command(name="artifacts")
+def artifacts_cmd(
+    job_id: str = typer.Argument(..., help="Job identifier"),
+    api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
+    json_output: bool = typer.Option(False, "--json"),
+    http2: bool = typer.Option(True, "--http2/--no-http2"),
+) -> None:
+    """Enumerate every artifact file (GET /jobs/{id}/artifacts)."""
+    api_root = _resolve_settings(api_base).base_url
+    with httpx.Client(http2=http2, timeout=15.0) as client:
+        response = client.get(f"{api_root}/jobs/{job_id}/artifacts")
+        response.raise_for_status()
+        data = response.json()
+    if json_output:
+        typer.echo(json.dumps(data, indent=2))
+        return
+    console.print(f"[dim]artifact_root={data['artifact_root']}[/]")
+    console.print(f"  {data['file_count']} files, {data['total_bytes']} bytes total")
+    for f in data.get("files", []):
+        console.print(f"  - {f['path']:60s}  {f['size']:>10d}  ({f['kind']})")
+    if data.get("synthetic"):
+        console.print("[bold]synthetic endpoints (computed on demand):[/]")
+        for label, url in data["synthetic"].items():
+            console.print(f"  - {label:25s}  {url}")
+
+
+@cli.command()
+def cancel(
+    job_id: str = typer.Argument(..., help="Job to cancel"),
+    reason: str = typer.Option("cancelled by user", "--reason", help="Cancellation reason recorded on the job"),
+    api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
+    json_output: bool = typer.Option(False, "--json"),
+    http2: bool = typer.Option(True, "--http2/--no-http2"),
+) -> None:
+    """Cancel an in-flight job (POST /jobs/{id}/cancel)."""
+    api_root = _resolve_settings(api_base).base_url
+    with httpx.Client(http2=http2, timeout=15.0) as client:
+        response = client.post(
+            f"{api_root}/jobs/{job_id}/cancel",
+            params={"reason": reason},
+        )
+        response.raise_for_status()
+        data = response.json()
+    if json_output:
+        typer.echo(json.dumps(data, indent=2))
+    else:
+        console.print(f"[yellow]Cancelled {job_id}[/]: state={data.get('state')}")
+
+
+@cli.command(name="tags")
+def tags_cmd(
+    job_id: str = typer.Argument(..., help="Job identifier"),
+    action: str = typer.Argument("list", help="list|add|rm"),
+    tag: Optional[list[str]] = typer.Argument(
+        None, help="Tag value(s) (for add/rm); repeat for multiple"
+    ),
+    api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
+    json_output: bool = typer.Option(False, "--json"),
+    http2: bool = typer.Option(True, "--http2/--no-http2"),
+) -> None:
+    """Manage tags on a job (list/add/rm)."""
+    api_root = _resolve_settings(api_base).base_url
+    if action == "list":
+        # Use the existing single-tag GET to fetch the current set
+        with httpx.Client(http2=http2, timeout=15.0) as client:
+            # We added a /jobs/{id}/tags multi-add but no list endpoint;
+            # use the add endpoint's response shape by reading from /jobs/{id}
+            response = client.get(f"{api_root}/jobs/{job_id}")
+            response.raise_for_status()
+            data = response.json()
+        tags = data.get("tags") or []
+        if json_output:
+            typer.echo(json.dumps({"job_id": job_id, "tags": tags}, indent=2))
+        else:
+            if not tags:
+                console.print(f"  {job_id} has no tags")
+            else:
+                for t in tags:
+                    console.print(f"  - {t}")
+    elif action == "add":
+        if not tag:
+            raise typer.BadParameter("add requires at least one tag")
+        with httpx.Client(http2=http2, timeout=15.0) as client:
+            response = client.post(
+                f"{api_root}/jobs/{job_id}/tags",
+                json={"tags": list(tag)},
+            )
+            response.raise_for_status()
+            data = response.json()
+        if json_output:
+            typer.echo(json.dumps(data, indent=2))
+        else:
+            console.print(f"[green]Tags updated[/]: {data.get('tags')}")
+    elif action == "rm":
+        if not tag or len(tag) != 1:
+            raise typer.BadParameter("rm requires exactly one tag")
+        from urllib.parse import quote
+        with httpx.Client(http2=http2, timeout=15.0) as client:
+            response = client.delete(
+                f"{api_root}/jobs/{job_id}/tag/{quote(tag[0], safe='')}",
+            )
+            response.raise_for_status()
+            data = response.json()
+        if json_output:
+            typer.echo(json.dumps(data, indent=2))
+        else:
+            console.print(f"[green]Removed[/]: tags={data.get('tags')}")
+    else:
+        raise typer.BadParameter(f"Unknown action {action!r}; use list|add|rm")
+
+
+@cli.command(name="batch-status")
+def batch_status_cmd(
+    job_ids: Optional[list[str]] = typer.Argument(
+        None, help="Job ids (one or more); omit to read from stdin (one per line)."
+    ),
+    api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
+    json_output: bool = typer.Option(False, "--json"),
+    http2: bool = typer.Option(True, "--http2/--no-http2"),
+) -> None:
+    """Bulk-poll N job ids in one call (POST /jobs/batch/status)."""
+    api_root = _resolve_settings(api_base).base_url
+    ids: list[str] = list(job_ids or [])
+    if not ids:
+        # Read from stdin
+        stdin_data = sys.stdin.read()
+        ids = [line.strip() for line in stdin_data.splitlines() if line.strip()]
+    if not ids:
+        raise typer.BadParameter("Provide at least one job id (or pipe via stdin).")
+    with httpx.Client(http2=http2, timeout=30.0) as client:
+        response = client.post(
+            f"{api_root}/jobs/batch/status",
+            json={"job_ids": ids},
+        )
+        response.raise_for_status()
+        data = response.json()
+    if json_output:
+        typer.echo(json.dumps(data, indent=2))
+        return
+    for s in data.get("statuses", []):
+        marker = "[cyan]hit[/]" if s.get("cache_hit") else " "
+        console.print(
+            f"  {s['job_id'][:8]:8s} [{s['state']:>9s}] {marker} {s.get('url', '')[:60]}"
+        )
+
+
+@cli.command(name="schema.json")
+def schema_json_cmd(
+    out: Optional[Path] = typer.Option(
+        None, "--out", help="Write JSON to file (default: stdout pretty-print)"
+    ),
+    api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
+    http2: bool = typer.Option(True, "--http2/--no-http2"),
+) -> None:
+    """Print or save the live /schema.json payload for offline reference."""
+    api_root = _resolve_settings(api_base).base_url
+    with httpx.Client(http2=http2, timeout=15.0) as client:
+        response = client.get(f"{api_root}/schema.json")
+        response.raise_for_status()
+        data = response.json()
+    payload = json.dumps(data, indent=2)
+    if out:
+        Path(out).write_text(payload, encoding="utf-8")
+        console.print(f"[green]Wrote {out}[/] ({len(payload)} bytes)")
+    else:
+        typer.echo(payload)
+
+
 @cli.command()
 def batch(
     urls: Optional[str] = typer.Argument(

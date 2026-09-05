@@ -66,13 +66,14 @@ class JobState(str, Enum):
     STITCHING = "STITCHING"
     DONE = "DONE"
     FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
 
 
 class JobSnapshot(TypedDict, total=False):
     """Serialized view of a job for API responses and SSE events."""
 
     id: str
-    state: JobState
+    state: str  # JobState value name; enum coerced on read
     url: str
     progress: dict[str, int]
     manifest_path: str
@@ -162,6 +163,7 @@ class JobManager:
         self._pending_webhooks: Dict[str, List[dict[str, Any]]] = {}
         self._webhook_sender = webhook_sender or _default_webhook_sender
         self._cache_keys: Dict[str, str | None] = {}
+        self._job_timeout_seconds = int(job_timeout_seconds)
         self._job_tags: Dict[str, list[str]] = {}
         self._watchdog_task: asyncio.Task[None] | None = None
         self._shutdown = False
@@ -285,19 +287,86 @@ class JobManager:
 
     def add_tag(self, job_id: str, tag: str) -> None:
         """Append a tag to the in-memory + persisted run record."""
-        current = self._job_tags.get(job_id, [])
-        if tag in current:
-            return
-        current.append(tag)
+        for t in self.add_tags(job_id, [tag]):
+            del t  # consume generator for side-effects
+
+    def add_tags(self, job_id: str, tags: list[str]) -> list[str]:
+        """Append a batch of tags. Returns the deduped + sorted final tag set."""
+        current = list(self._job_tags.get(job_id, []))
+        changed = False
+        for tag in tags:
+            tag = str(tag).strip()
+            if not tag or tag in current:
+                continue
+            current.append(tag)
+            changed = True
+        if not changed:
+            return current
+        self._job_tags[job_id] = current
+        # Persist each new tag individually (store API is per-tag)
+        for tag in tags:
+            try:
+                self.store.add_tag(job_id=job_id, tag=tag)
+            except Exception:  # pragma: no cover - persistence is best-effort
+                pass
+        snapshot = self._snapshots.get(job_id)
+        if snapshot is not None:
+            snapshot["tags"] = list(current)
+            self._broadcast(job_id)
+        return current
+
+    def remove_tag(self, job_id: str, tag: str) -> list[str]:
+        """Remove a tag. Returns the new (deduped) tag set.
+
+        No-op if the tag isn't present. Persists via store.set_tags.
+        """
+        current = list(self._job_tags.get(job_id, []))
+        if tag not in current:
+            return current
+        current = [t for t in current if t != tag]
         self._job_tags[job_id] = current
         try:
-            self.store.add_tag(job_id=job_id, tag=tag)
-        except Exception:  # pragma: no cover - persistence is best-effort
+            self.store.set_tags(job_id=job_id, tags=current)
+        except Exception:  # pragma: no cover
             pass
         snapshot = self._snapshots.get(job_id)
         if snapshot is not None:
             snapshot["tags"] = list(current)
             self._broadcast(job_id)
+        return current
+
+    def cancel_job(self, job_id: str, *, reason: str = "cancelled by user") -> bool:
+        """Cancel an in-flight job. Returns True if a task was cancelled."""
+        task = self._tasks.get(job_id)
+        cancelled = False
+        if task is not None and not task.done():
+            task.cancel()
+            cancelled = True
+        # Always mark the state so the snapshot reflects intent
+        self._set_state(job_id, JobState.CANCELLED)
+        self._set_error(job_id, reason)
+        snapshot = self._snapshots.get(job_id)
+        if snapshot is not None:
+            self._broadcast(job_id)
+        return cancelled
+
+    def batch_status(self, job_ids: list[str]) -> list[dict[str, Any]]:
+        """Return a compact status record for each id (avoids N HTTP round-trips)."""
+        out: list[dict[str, Any]] = []
+        for jid in job_ids:
+            snap = self.get_snapshot(jid) or {}
+            out.append(
+                {
+                    "job_id": jid,
+                    "state": str(snap.get("state", "UNKNOWN")),
+                    "cache_hit": bool(snap.get("cache_hit")),
+                    "url": str(snap.get("url") or ""),
+                    "progress": snap.get("progress"),
+                    "error": snap.get("error"),
+                    "tags": list(snap.get("tags") or []),
+                }
+            )
+        return out
 
     def list_jobs(
         self,

@@ -824,3 +824,85 @@ class Slosummary(BaseModel):
     budget_breaches: int = 0
     status: str = "unknown"
     count: int = 0
+
+
+class JobTagMultiRequest(BaseModel):
+    """Request to append multiple tags to a job in one call."""
+
+    tags: list[str] = Field(
+        ...,
+        min_length=1,
+        max_length=200,
+        description="Tags to append (deduplicated + sorted on persist).",
+    )
+
+
+class JobTagDeleteResponse(BaseModel):
+    """Response for DELETE /jobs/{id}/tag/{tag}."""
+
+    job_id: str
+    removed: bool
+    tags: list[str] = Field(default_factory=list)
+
+
+class BatchStatusRequest(BaseModel):
+    """Request for POST /jobs/batch/status."""
+
+    job_ids: list[str] = Field(..., min_length=1, max_length=500)
+
+
+class BatchStatusItem(BaseModel):
+    """Compact status record for a single job in a batch status query."""
+
+    job_id: str
+    state: str
+    cache_hit: bool = False
+    url: str = ""
+    progress: dict[str, int] | None = None
+    error: str | None = None
+    tags: list[str] = Field(default_factory=list)
+
+
+class BatchStatusResponse(BaseModel):
+    """Response for POST /jobs/batch/status."""
+
+    count: int
+    statuses: list[BatchStatusItem]
+
+
+class JobArtifactsFile(BaseModel):
+    """Single file inside /jobs/{id}/artifacts."""
+
+    path: str
+    absolute: str
+    size: int
+    kind: str
+
+
+class JobArtifactsResponse(BaseModel):
+    """Response for GET /jobs/{id}/artifacts."""
+
+    job_id: str
+    artifact_root: str
+    file_count: int
+    total_bytes: int
+    files: list[JobArtifactsFile]
+    synthetic: dict[str, str]
+
+
+class JobLinksResponse(BaseModel):
+    """Per-source link breakdown for GET /jobs/{id}/links."""
+
+    job_id: str
+    by_source: dict[str, list[dict]] = Field(default_factory=dict)
+    counts: dict[str, int] = Field(default_factory=dict)
+    total: int
+    anchors: list[dict] = Field(default_factory=list)
+
+
+class JobEventsJsonResponse(BaseModel):
+    """Single-shot JSON dump of the event log."""
+
+    job_id: str
+    count: int
+    events: list[dict] = Field(default_factory=list)
