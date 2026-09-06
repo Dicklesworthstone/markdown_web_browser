@@ -58,6 +58,10 @@ from app.schemas import (
     JobTagRequest,
     JobSharePublicResponse,
     JobShareResponse,
+    JobTocResponse, TocEntry, JobSummaryResponse,
+    JobSearchTextRequest, EmbeddingBatchRequest, EmbeddingBatchItem, EmbeddingBatchResponse,
+    JobCountsResponse, EmbedderStatsResponse,
+    JobReplayRequest, JobReplayResponse, JobDeleteResponse,
     JobTagResponse,
     EmbeddingStoreRequest,
     EmbeddingStoreResponse,
@@ -1290,6 +1294,257 @@ async def job_raw_events(job_id: str) -> dict:
     """JSON array of the entire event log (single-shot, vs. the streaming NDJSON at /events)."""
     events = JOB_MANAGER.get_events(job_id, since=None, min_sequence=0)
     return {"job_id": job_id, "count": len(events), "events": events}
+@app.get("/jobs/{job_id}/toc", response_model=JobTocResponse)
+async def job_toc(job_id: str, max_links: int = 50) -> JobTocResponse:
+    """Text-only table of contents: headings + a bounded outbound link list.
+
+    Designed for agents that want a quick overview of a captured page without
+    fetching the full Markdown. Sections are derived from ``/jobs/{id}/result.json``;
+    outbound links from ``/jobs/{id}/links.json``.
+    """
+    try:
+        structured = JOB_MANAGER.get_structured_result(job_id)
+    except Exception:
+        structured = {"sections": [], "url": ""}
+    try:
+        links_payload = store.read_links(job_id) or {}
+    except Exception:
+        links_payload = {}
+    anchors = (links_payload.get("anchors") or []) if isinstance(links_payload, dict) else []
+    outbound = sorted(
+        {
+            a.get("href")
+            for a in anchors
+            if isinstance(a, dict) and a.get("href", "").startswith(("http://", "https://"))
+        }
+    )
+    return JobTocResponse(
+        job_id=job_id,
+        url=structured.get("url", ""),
+        sections=[
+            TocEntry(
+                level=s.get("level", 1),
+                heading=s.get("heading", ""),
+                anchor=s.get("anchor"),
+                body_chars=len(s.get("body") or ""),
+            )
+            for s in structured.get("sections", [])
+        ],
+        outbound_links=outbound[:max_links],
+    )
+
+
+@app.get("/jobs/{job_id}/summary", response_model=JobSummaryResponse)
+async def job_summary(job_id: str) -> JobSummaryResponse:
+    """Compact natural-language summary of a captured page."""
+    from datetime import datetime, timezone
+
+    try:
+        structured = JOB_MANAGER.get_structured_result(job_id)
+    except Exception:
+        structured = {"sections": [], "url": ""}
+    sections = structured.get("sections", []) or []
+    try:
+        manifest = store.read_manifest(job_id) or {}
+    except Exception:
+        manifest = {}
+    try:
+        links_payload = store.read_links(job_id) or {}
+    except Exception:
+        links_payload = {}
+    link_count = len((links_payload.get("anchors") or []) if isinstance(links_payload, dict) else [])
+    headings = [s.get("heading", "") for s in sections if s.get("heading")]
+    summary_parts = []
+    url = structured.get("url") or (manifest.get("url") if isinstance(manifest, dict) else "")
+    if url:
+        summary_parts.append(f"Captured page at {url}.")
+    if headings:
+        first_three = headings[:3]
+        summary_parts.append("Sections: " + ", ".join(first_three) + ".")
+    if link_count:
+        summary_parts.append(f"Found {link_count} outbound link{'s' if link_count != 1 else ''}.")
+    if not summary_parts:
+        summary_parts.append("(no summary available)")
+    summary = " ".join(summary_parts)
+    return JobSummaryResponse(
+        job_id=job_id,
+        url=url or "",
+        summary=summary,
+        section_count=len(sections),
+        char_count=sum(len(s.get("body") or "") for s in sections),
+        outbound_link_count=link_count,
+        embedding_model=(manifest.get("embedding_model") if isinstance(manifest, dict) else None),
+        generated_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+
+@app.post("/jobs/search/text", response_model=JobSearchResponse)
+async def search_jobs_text(request: JobSearchTextRequest) -> JobSearchResponse:
+    """Alias of POST /jobs/search kept for text-search UX clarity."""
+    from app.schemas import JobSearchRequest
+    inner = JobSearchRequest(**request.model_dump())
+    return await search_jobs(inner)
+
+
+@app.post("/embeddings/text/batch", response_model=EmbeddingBatchResponse)
+async def embed_text_batch(request: EmbeddingBatchRequest) -> EmbeddingBatchResponse:
+    """Compute embeddings for N texts in one call."""
+    from app.embedders import get_embedder, list_embedders
+
+    if request.model not in list_embedders():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown embedder {request.model!r}; known: {list_embedders()}",
+        )
+    try:
+        embedder = get_embedder(request.model)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"embedder unavailable: {exc}") from exc
+
+    vectors: list = []
+    for text in request.texts:
+        try:
+            v = embedder.embed(text)
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail=f"embedder {request.model} failed: {exc}") from exc
+        vectors.append(EmbeddingBatchItem(text=text, dim=len(v), vector=v))
+    return EmbeddingBatchResponse(
+        model=request.model,
+        dim=embedder.dim,
+        count=len(vectors),
+        vectors=vectors,
+    )
+
+
+@app.get("/metrics/job-counts", response_model=JobCountsResponse)
+async def metrics_job_counts() -> JobCountsResponse:
+    """Per-state + per-day counts for dashboards / alerts."""
+    from datetime import datetime, timedelta, timezone
+
+    rows, total = JOB_MANAGER.list_jobs(limit=10_000)
+    by_state: dict = {}
+    for r in rows:
+        st = r.get("state") or "UNKNOWN"
+        by_state[st] = by_state.get(st, 0) + 1
+
+    by_day: dict = {}
+    today = datetime.now(timezone.utc).date()
+    cutoff = today - timedelta(days=30)
+    for r in rows:
+        ts = r.get("created_at")
+        if not ts:
+            continue
+        try:
+            d = datetime.fromisoformat(ts.replace("Z", "+00:00")).date()
+        except Exception:
+            continue
+        if d < cutoff:
+            continue
+        by_day[d.isoformat()] = by_day.get(d.isoformat(), 0) + 1
+
+    return JobCountsResponse(
+        total=total,
+        by_state=by_state,
+        by_issue={},
+        by_day=by_day,
+        generated_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+
+@app.get("/metrics/embedders", response_model=EmbedderStatsResponse)
+async def metrics_embedders() -> EmbedderStatsResponse:
+    """Counts per embedder based on what captures have persisted."""
+    from app.embedders import list_embedders
+
+    rows, _ = JOB_MANAGER.list_jobs(limit=10_000)
+    counts: dict = {}
+    for r in rows:
+        m = r.get("embedding_model")
+        if m:
+            counts[m] = counts.get(m, 0) + 1
+    return EmbedderStatsResponse(
+        available=list_embedders(),
+        default="hash-bucket-v1",
+        counts=counts,
+    )
+
+
+@app.post("/jobs/{job_id}/replay", response_model=JobReplayResponse, status_code=status.HTTP_202_ACCEPTED)
+async def job_replay(job_id: str, request: JobReplayRequest) -> JobReplayResponse:
+    """Re-emit the same job as a fresh run with the same URL + profile + tags."""
+    snap = JOB_MANAGER.get_snapshot(job_id)
+    if snap is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    url = str(snap.get("url") or "")
+    if not url:
+        raise HTTPException(status_code=400, detail="Original job has no URL; cannot replay")
+    profile_id = request.profile_id or snap.get("profile_id")
+    tags = list(snap.get("tags") or [])
+    new_request = JobCreateRequest(
+        url=url,
+        profile_id=profile_id,
+        reuse_cache=request.reuse_cache,
+        ocr_policy=request.ocr_policy,
+    )
+    new_snapshot = await JOB_MANAGER.create_job(new_request, tags=tags)
+    return JobReplayResponse(
+        original_job_id=job_id,
+        new_job_id=str(new_snapshot.get("job_id") or new_snapshot.get("id") or ""),
+        url=url,
+    )
+
+
+@app.delete("/jobs/{job_id}", response_model=JobDeleteResponse)
+async def job_delete(job_id: str) -> JobDeleteResponse:
+    """Purge a job's artifacts and run record from storage."""
+    from pathlib import Path as _P
+    import shutil
+
+    paths: list = []
+    bytes_freed = 0
+    try:
+        record = store.fetch_run(job_id)
+    except Exception:
+        record = None
+    if record is not None:
+        try:
+            artifact_root = _P(record.artifact_root)
+            if artifact_root.exists():
+                for p in artifact_root.rglob("*"):
+                    if p.is_file():
+                        try:
+                            bytes_freed += p.stat().st_size
+                        except OSError:
+                            pass
+                shutil.rmtree(artifact_root, ignore_errors=True)
+                paths.append(artifact_root)
+        except Exception:
+            pass
+    try:
+        store.delete_run(job_id)
+    except Exception:
+        pass
+    return JobDeleteResponse(
+        job_id=job_id,
+        deleted=bool(paths),
+        artifacts_removed=len(paths),
+        bytes_freed=bytes_freed,
+    )
+
+
+@app.get("/health/live", tags=["health"])
+async def health_live() -> dict:
+    """Liveness probe: 200 as long as the process is alive."""
+    return {"status": "ok"}
+
+
+@app.get("/health/ready", tags=["health"])
+async def health_ready() -> dict:
+    """Readiness probe: 200 only if the JobManager watchdog is running."""
+    if JOB_MANAGER._watchdog_task is None or JOB_MANAGER._watchdog_task.done():
+        raise HTTPException(status_code=503, detail="watchdog not running")
+    return {"status": "ok", "watchdog": "running"}
+
 
 
 

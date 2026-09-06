@@ -266,6 +266,79 @@ mdwb artifacts $ID --json
 mdwb schema.json --out /tmp/schema.json   # offline reference
 ```
 
+## 17. Round-6 surfaces (TOC + summary + observability + ops polish)
+
+### Text-only table of contents (for agents that just want structure)
+
+```bash
+# Compact headings + a bounded outbound link list
+curl http://localhost:8000/jobs/$ID/toc | jq '.sections[].heading, .outbound_links | .'
+# CLI: mdwb jobs toc <id>
+```
+
+### One-paragraph natural-language summary
+
+```bash
+curl http://localhost:8000/jobs/$ID/summary
+# { "summary": "Captured page at https://x.com. Sections: A, B, C. Found 12 outbound links." }
+# CLI: mdwb jobs summary <id>
+```
+
+### Embed N texts in one call
+
+```bash
+curl -X POST http://localhost:8000/embeddings/text/batch   -d '{"texts":["a","b","c"], "model":"hash-bucket-v1"}' -H 'Content-Type: application/json'
+# Returns {model, dim, count, vectors:[{text, dim, vector}, ...]}
+```
+
+### Dashboard-friendly metrics
+
+```bash
+# Per-state + per-day counts (last 30 days)
+curl http://localhost:8000/metrics/job-counts | jq '.total, .by_state, .by_day'
+
+# Per-embedder usage counts
+curl http://localhost:8000/metrics/embedders | jq '.counts'
+
+# CLI: mdwb metrics  (combines both)
+```
+
+### k8s-style health probes
+
+```bash
+# Liveness: 200 as long as the process is alive
+curl http://localhost:8000/health/live
+
+# Readiness: 200 only if the watchdog is running; 503 otherwise
+curl http://localhost:8000/health/ready
+
+# CLI: mdwb health [--ready]
+```
+
+### Replay vs Rerun (subtle distinction)
+
+- `mdwb jobs retry <id>`  → POST /jobs/{id}/replay   (honors request body, returns 202)
+- `mdwb jobs rerun <id>`  → POST /jobs/{id}/rerun    (uses query params, returns 202)
+- Both re-emit the same URL + profile + tags; differ only in the API contract.
+
+### Delete (irreversible)
+
+```bash
+# CLI confirms unless --yes
+mdwb jobs delete <id>
+mdwb jobs delete <id> --yes     # skip the prompt
+
+# Underlying route: DELETE /jobs/{id}
+# Returns {deleted, artifacts_removed, bytes_freed}
+```
+
+### Search alias
+
+```bash
+# POST /jobs/search/text is an alias for POST /jobs/search (UX clarity)
+curl -X POST http://localhost:8000/jobs/search/text   -d '{"query":"pricing", "tag":"dataset:2026-q1"}' -H 'Content-Type: application/json'
+```
+
 ## 14. Where to read next
 
 - `README.md` — vision + setup + quickstart

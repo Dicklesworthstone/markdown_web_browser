@@ -2053,6 +2053,53 @@ def schema_json_cmd(
 
 
 @cli.command()
+def health(
+    api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
+    ready: bool = typer.Option(False, "--ready", help="Hit /health/ready (503 if watchdog down)"),
+    json_output: bool = typer.Option(False, "--json"),
+    http2: bool = typer.Option(True, "--http2/--no-http2"),
+) -> None:
+    """Hit /health/live (or /health/ready with --ready) and print the response."""
+    api_root = _resolve_settings(api_base).base_url
+    path = "/health/ready" if ready else "/health/live"
+    with httpx.Client(http2=http2, timeout=10.0) as client:
+        response = client.get(f"{api_root}{path}")
+        body = response.json() if response.headers.get("content-type", "").startswith("application/json") else {}
+        if response.status_code != 200:
+            console.print(f"[red]{path} returned {response.status_code}[/]  body={body}")
+            raise typer.Exit(code=1)
+    if json_output:
+        typer.echo(json.dumps({"status_code": response.status_code, "body": body}, indent=2))
+        return
+    console.print(f"[green]{path}[/]: status={response.status_code}  body={body}")
+
+
+@cli.command()
+def metrics(
+    api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
+    json_output: bool = typer.Option(False, "--json"),
+    http2: bool = typer.Option(True, "--http2/--no-http2"),
+) -> None:
+    """Pretty-print /metrics/job-counts + /metrics/embedders (one HTTP call each)."""
+    api_root = _resolve_settings(api_base).base_url
+    with httpx.Client(http2=http2, timeout=15.0) as client:
+        counts = client.get(f"{api_root}/metrics/job-counts").json()
+        embedders = client.get(f"{api_root}/metrics/embedders").json()
+    if json_output:
+        typer.echo(json.dumps({"counts": counts, "embedders": embedders}, indent=2))
+        return
+    console.print(f"[bold]total jobs[/] {counts.get('total', 0)}")
+    for state, n in sorted((counts.get("by_state") or {}).items(), key=lambda x: -x[1]):
+        console.print(f"  {state:>12s}  {n}")
+    by_day = counts.get("by_day") or {}
+    if by_day:
+        console.print(f"[dim]  last 30 days: {len(by_day)} active days[/]")
+    console.print(f"[bold]embedder usage[/] {embedders.get('default')} (default)")
+    for name, n in sorted((embedders.get("counts") or {}).items(), key=lambda x: -x[1]):
+        console.print(f"  {name:>20s}  {n}")
+
+
+@cli.command()
 def batch(
     urls: Optional[str] = typer.Argument(
         None, help="Path to a file with one URL per line, or `-` for stdin. Omit to read stdin."
@@ -3619,6 +3666,62 @@ def jobs_compare(
         console.print(f"  {marker} {s['heading']}  (a={s['a_chars']}c, b={s['b_chars']}c)")
 
 
+@jobs_cli.command("toc")
+def jobs_toc(
+    job_id: str = typer.Argument(..., help="Job identifier"),
+    api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
+    max_links: int = typer.Option(50, "--max-links", help="Cap outbound link list"),
+    json_output: bool = typer.Option(False, "--json"),
+    http2: bool = typer.Option(True, "--http2/--no-http2"),
+) -> None:
+    """Print the text-only table of contents (GET /jobs/{id}/toc)."""
+    api_root = _resolve_settings(api_base).base_url
+    with httpx.Client(http2=http2, timeout=15.0) as client:
+        response = client.get(
+            f"{api_root}/jobs/{job_id}/toc",
+            params={"max_links": max_links},
+        )
+        response.raise_for_status()
+        data = response.json()
+    if json_output:
+        typer.echo(json.dumps(data, indent=2))
+        return
+    console.print(f"[dim]{data.get('url', '')}[/]")
+    for s in data.get("sections", []):
+        indent = "  " * (max(1, s.get("level", 1)) - 1)
+        console.print(f"{indent}- [bold]{s.get('heading')}[/]  ({s.get('body_chars', 0)} chars)")
+    outbound = data.get("outbound_links") or []
+    if outbound:
+        console.print(f"  [dim]{len(outbound)} outbound link{'s' if len(outbound) != 1 else ''} (showing first 5)[/]")
+        for href in outbound[:5]:
+            console.print(f"    - {href}")
+
+
+@jobs_cli.command("summary")
+def jobs_summary(
+    job_id: str = typer.Argument(..., help="Job identifier"),
+    api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
+    json_output: bool = typer.Option(False, "--json"),
+    http2: bool = typer.Option(True, "--http2/--no-http2"),
+) -> None:
+    """Print a 1-paragraph natural-language summary (GET /jobs/{id}/summary)."""
+    api_root = _resolve_settings(api_base).base_url
+    with httpx.Client(http2=http2, timeout=15.0) as client:
+        response = client.get(f"{api_root}/jobs/{job_id}/summary")
+        response.raise_for_status()
+        data = response.json()
+    if json_output:
+        typer.echo(json.dumps(data, indent=2))
+        return
+    console.print(f"[dim]{data.get('url', '')}[/]")
+    console.print(f"  {data.get('summary', '')}")
+    console.print(
+        f"  [dim]sections={data.get('section_count', 0)}  "
+        f"chars={data.get('char_count', 0)}  "
+        f"outbound_links={data.get('outbound_link_count', 0)}[/]"
+    )
+
+
 @jobs_cli.command("tree")
 def jobs_tree(
     job_id: str = typer.Argument(..., help="Job identifier"),
@@ -3647,6 +3750,66 @@ def jobs_tree(
         indent = "  " * (lvl - 1)
         body_chars = len((s.get("body") or "").strip())
         console.print(f"{indent}- [bold]{s.get('heading')}[/]  ({body_chars} chars)")
+
+
+@jobs_cli.command("retry")
+def jobs_retry(
+    job_id: str = typer.Argument(..., help="Job to replay"),
+    reuse_cache: bool = typer.Option(True, "--reuse-cache/--no-cache"),
+    profile: Optional[str] = typer.Option(None, "--profile"),
+    ocr_policy: Optional[str] = typer.Option(None, "--ocr-policy"),
+    api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
+    watch: bool = typer.Option(True, "--watch/--no-watch"),
+    json_output: bool = typer.Option(False, "--json"),
+    http2: bool = typer.Option(True, "--http2/--no-http2"),
+) -> None:
+    """Re-emit a job as a fresh run (POST /jobs/{id}/replay)."""
+    api_root = _resolve_settings(api_base).base_url
+    body: dict = {"reuse_cache": reuse_cache}
+    if profile:
+        body["profile_id"] = profile
+    if ocr_policy:
+        body["ocr_policy"] = ocr_policy
+    with httpx.Client(http2=http2, timeout=30.0) as client:
+        response = client.post(f"{api_root}/jobs/{job_id}/replay", json=body)
+        response.raise_for_status()
+        data = response.json()
+    if json_output:
+        typer.echo(json.dumps(data, indent=2))
+    else:
+        console.print(
+            f"[green]Replay submitted[/]: original={data['original_job_id']} "
+            f"new={data['new_job_id']}"
+        )
+    if watch and data.get("new_job_id"):
+        _watch_jobs_blocking([data["new_job_id"]], api_root)
+
+
+@jobs_cli.command("delete")
+def jobs_delete(
+    job_id: str = typer.Argument(..., help="Job to delete (irreversible)"),
+    api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
+    yes: bool = typer.Option(False, "--yes", help="Skip the confirmation prompt"),
+    http2: bool = typer.Option(True, "--http2/--no-http2"),
+) -> None:
+    """Purge a job (DELETE /jobs/{id}; irreversible)."""
+    if not yes:
+        confirmed = typer.confirm(f"Delete job {job_id}? This is irreversible.", default=False)
+        if not confirmed:
+            raise typer.Abort()
+    api_root = _resolve_settings(api_base).base_url
+    with httpx.Client(http2=http2, timeout=30.0) as client:
+        response = client.delete(f"{api_root}/jobs/{job_id}")
+        response.raise_for_status()
+        data = response.json()
+    if data.get("deleted"):
+        console.print(
+            f"[green]Deleted[/] {job_id}: "
+            f"{data.get('artifacts_removed', 0)} artifacts, "
+            f"{data.get('bytes_freed', 0)} bytes freed"
+        )
+    else:
+        console.print(f"[yellow]{job_id} not found (no-op)[/]")
 
 
 @jobs_cli.command("ocr-metrics")

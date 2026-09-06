@@ -964,3 +964,115 @@ class EmbeddingStoreResponse(BaseModel):
     stored: int
     replaced: int
     dim: int
+
+
+class JobTocResponse(BaseModel):
+    """Response for GET /jobs/{id}/toc — text-only table of contents."""
+
+    job_id: str
+    url: str
+    sections: list["TocEntry"] = Field(default_factory=list)
+    outbound_links: list[str] = Field(default_factory=list, max_length=200)
+
+
+class TocEntry(BaseModel):
+    """Single heading in a TOC."""
+
+    level: int = Field(ge=1, le=6)
+    heading: str
+    anchor: str | None = None
+    body_chars: int = 0
+
+
+class JobSummaryResponse(BaseModel):
+    """Response for GET /jobs/{id}/summary — 1-paragraph natural-language summary."""
+
+    job_id: str
+    url: str
+    summary: str
+    section_count: int
+    char_count: int
+    outbound_link_count: int
+    embedding_model: str | None = None
+    generated_at: str
+
+
+class JobSearchTextRequest(BaseModel):
+    """Alias of JobSearchRequest — kept for /jobs/search/text clarity."""
+
+    query: str = Field(..., min_length=1, max_length=512)
+    state: str | None = Field(default=None)
+    limit: int = Field(default=25, ge=1, le=200)
+    url_contains: str | None = None
+    tag: str | None = None
+    context_chars: int = Field(default=80, ge=0, le=400)
+
+
+class EmbeddingBatchRequest(BaseModel):
+    """Request for POST /embeddings/text/batch."""
+
+    texts: list[str] = Field(..., min_length=1, max_length=200)
+    model: str = Field(default="hash-bucket-v1")
+
+
+class EmbeddingBatchItem(BaseModel):
+    """Single embedding result."""
+
+    text: str
+    dim: int
+    vector: list[float]
+
+
+class EmbeddingBatchResponse(BaseModel):
+    """Response for POST /embeddings/text/batch."""
+
+    model: str
+    dim: int
+    count: int
+    vectors: list[EmbeddingBatchItem]
+
+
+class JobCountsResponse(BaseModel):
+    """Response for GET /metrics/job-counts."""
+
+    total: int
+    by_state: dict[str, int]
+    by_issue: dict[str, int]
+    by_day: dict[str, int]  # ISO date -> count (last 30 days)
+    generated_at: str
+
+
+class EmbedderStatsResponse(BaseModel):
+    """Response for GET /metrics/embedders."""
+
+    available: list[str]
+    default: str
+    counts: dict[str, int] = Field(
+        default_factory=dict,
+        description="Per-model usage count (looked up from the manifest.embedding_model field).",
+    )
+
+
+class JobReplayRequest(BaseModel):
+    """Request for POST /jobs/{id}/replay — re-emit as a fresh run."""
+
+    reuse_cache: bool = True
+    profile_id: str | None = None
+    ocr_policy: str | None = None
+
+
+class JobReplayResponse(BaseModel):
+    """Response for POST /jobs/{id}/replay."""
+
+    original_job_id: str
+    new_job_id: str
+    url: str
+
+
+class JobDeleteResponse(BaseModel):
+    """Response for DELETE /jobs/{id}."""
+
+    job_id: str
+    deleted: bool
+    artifacts_removed: int
+    bytes_freed: int

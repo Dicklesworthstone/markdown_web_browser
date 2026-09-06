@@ -704,6 +704,29 @@ class Store:
             session.commit()
 
     def fetch_run(self, job_id: str) -> RunRecord | None:
+        return self._fetch_run(job_id)
+
+    def _fetch_run(self, job_id: str) -> RunRecord | None:
+        with self.session() as session:
+            return session.get(RunRecord, job_id)
+
+    def delete_run(self, job_id: str) -> bool:
+        """Delete the RunRecord (and any related rows) for a job.
+
+        Returns True if a row was deleted, False if there was nothing to delete.
+        Cached artifacts on disk are NOT removed by this method (the route
+        does that); this only handles the SQLite row.
+        """
+        from sqlalchemy import delete as _delete
+        with self.session() as session:
+            row = session.get(RunRecord, job_id)
+            if row is None:
+                return False
+            session.execute(_delete(RunRecord).where(RunRecord.id == job_id))
+            session.commit()
+            return True
+
+
         with self.session() as session:
             return session.get(RunRecord, job_id)
 
