@@ -68,6 +68,9 @@ jobs_cli.add_typer(jobs_webhooks_cli, name="webhooks")
 warnings_cli = typer.Typer(help="Warning/blocklist log helpers.")
 cli.add_typer(warnings_cli, name="warnings")
 
+admin_cli = typer.Typer(help="Operational/admin actions: stats, prune, cache-clear.")
+cli.add_typer(admin_cli, name="admin")
+
 beads_cli = typer.Typer(help="Bead (issue) helpers: health snapshots, weekly reports.")
 cli.add_typer(beads_cli, name="beads")
 
@@ -2074,6 +2077,87 @@ def health(
     console.print(f"[green]{path}[/]: status={response.status_code}  body={body}")
 
 
+@admin_cli.command("stats")
+def admin_stats(
+    api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
+    json_output: bool = typer.Option(False, "--json"),
+    http2: bool = typer.Option(True, "--http2/--no-http2"),
+) -> None:
+    """Per-day counts (last 90 days) + per-state + per-embedder (GET /admin/stats)."""
+    api_root = _resolve_settings(api_base).base_url
+    with httpx.Client(http2=http2, timeout=15.0) as client:
+        response = client.get(f"{api_root}/admin/stats")
+        response.raise_for_status()
+        data = response.json()
+    if json_output:
+        typer.echo(json.dumps(data, indent=2))
+        return
+    console.print(f"[bold]total jobs[/] {data.get('total', 0)}  cache_hits={data.get('cache_hits', 0)}")
+    by_state = data.get("by_state", {})
+    for st, n in sorted(by_state.items(), key=lambda x: -x[1]):
+        console.print(f"  {st:>12s}  {n}")
+    by_day = data.get("by_day", {})
+    if by_day:
+        console.print(f"[dim]  last 90 days: {len(by_day)} active days[/]")
+    embedder_counts = data.get("embedder_counts", {})
+    if embedder_counts:
+        console.print("[bold]embedder usage[/]")
+        for name, n in sorted(embedder_counts.items(), key=lambda x: -x[1]):
+            console.print(f"  {name:>20s}  {n}")
+
+
+@admin_cli.command("prune")
+def admin_prune(
+    older_than_days: int = typer.Option(..., "--older-than-days", help="Delete DONE/FAILED jobs older than N days"),
+    state: Optional[str] = typer.Option(None, "--state", help="Restrict to a given state"),
+    yes: bool = typer.Option(False, "--yes", help="Skip the dry-run confirmation"),
+    api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
+    json_output: bool = typer.Option(False, "--json"),
+    http2: bool = typer.Option(True, "--http2/--no-http2"),
+) -> None:
+    """Bulk-delete jobs older than N days (POST /admin/jobs/prune)."""
+    if not yes:
+        confirmed = typer.confirm(
+            f"Delete jobs older than {older_than_days} days? Start with --dry-run via no --yes to preview.",
+            default=False,
+        )
+        if not confirmed:
+            raise typer.Abort()
+    api_root = _resolve_settings(api_base).base_url
+    body: dict = {"older_than_days": older_than_days, "dry_run": not yes}
+    if state:
+        body["state"] = state
+    with httpx.Client(http2=http2, timeout=120.0) as client:
+        response = client.post(f"{api_root}/admin/jobs/prune", json=body)
+        response.raise_for_status()
+        data = response.json()
+    if json_output:
+        typer.echo(json.dumps(data, indent=2))
+        return
+    if data.get("dry_run"):
+        console.print(f"[yellow]dry-run[/]: {data.get('candidates', 0)} candidates  cutoff={data.get('cutoff')}")
+    else:
+        console.print(f"[green]Pruned[/]: {data.get('deleted', 0)}/{data.get('candidates', 0)} jobs")
+
+
+@admin_cli.command("cache-clear")
+def admin_cache_clear(
+    api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
+    http2: bool = typer.Option(True, "--http2/--no-http2"),
+) -> None:
+    """Clear the in-process cache (POST /admin/cache/clear)."""
+    api_root = _resolve_settings(api_base).base_url
+    with httpx.Client(http2=http2, timeout=15.0) as client:
+        response = client.post(f"{api_root}/admin/cache/clear")
+        response.raise_for_status()
+        data = response.json()
+    console.print(
+        f"[green]Cache cleared[/]: {data.get('cache_name')} "
+        f"cleared_entries={data.get('cleared_entries')} "
+        f"at={data.get('cleared_at')}"
+    )
+
+
 @cli.command()
 def metrics(
     api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
@@ -3720,6 +3804,67 @@ def jobs_summary(
         f"chars={data.get('char_count', 0)}  "
         f"outbound_links={data.get('outbound_link_count', 0)}[/]"
     )
+
+
+@jobs_cli.command("sections")
+def jobs_sections(
+    job_id: str = typer.Argument(..., help="Job identifier"),
+    api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
+    max_depth: int = typer.Option(6, "--max-depth", help="Max heading level to render (1-6)"),
+    json_output: bool = typer.Option(False, "--json"),
+    http2: bool = typer.Option(True, "--http2/--no-http2"),
+) -> None:
+    """Print flat list of sections (GET /jobs/{id}/sections)."""
+    api_root = _resolve_settings(api_base).base_url
+    with httpx.Client(http2=http2, timeout=15.0) as client:
+        response = client.get(f"{api_root}/jobs/{job_id}/sections")
+        response.raise_for_status()
+        data = response.json()
+    if json_output:
+        typer.echo(json.dumps(data, indent=2))
+        return
+    console.print(f"[dim]{data.get('url', '')}[/]  [bold]{len(data.get('sections', []))} sections, {data.get('total_chars', 0)} chars[/]")
+    for s in data.get("sections", []):
+        if s.get("level", 1) > max_depth:
+            continue
+        indent = "  " * (max(1, s.get("level", 1)) - 1)
+        console.print(f"{indent}- [bold]{s.get('heading')}[/]  (#{s.get('anchor') or '?'}, {s.get('body_chars', 0)} chars)")
+
+
+@jobs_cli.command("extract")
+def jobs_extract(
+    job_id: str = typer.Argument(..., help="Job identifier"),
+    api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
+    only: Optional[str] = typer.Option(None, "--only", help="Restrict to: links|tables|code"),
+    json_output: bool = typer.Option(False, "--json"),
+    http2: bool = typer.Option(True, "--http2/--no-http2"),
+) -> None:
+    """Extract structured data (links, tables, code blocks) from a job (GET /jobs/{id}/extract)."""
+    api_root = _resolve_settings(api_base).base_url
+    with httpx.Client(http2=http2, timeout=15.0) as client:
+        response = client.get(f"{api_root}/jobs/{job_id}/extract")
+        response.raise_for_status()
+        data = response.json()
+    if json_output:
+        typer.echo(json.dumps(data, indent=2))
+        return
+    if not only or only == "links":
+        links = data.get("links", [])
+        console.print(f"[bold]{len(links)} outbound links[/]")
+        for link in links[:20]:
+            console.print(f"  - {link.get('text') or '<no text>'}  {link.get('href')}")
+        if len(links) > 20:
+            console.print(f"  ... ({len(links) - 20} more)")
+    if not only or only == "tables":
+        tables = data.get("tables", [])
+        if tables:
+            console.print(f"[bold]{len(tables)} tables[/]")
+            for i, t in enumerate(tables[:3], start=1):
+                console.print(f"  Table {i}: {len(t.get('headers', []))} cols x {len(t.get('rows', []))} rows")
+    if not only or only == "code":
+        codes = data.get("code_blocks", [])
+        if codes:
+            console.print(f"[bold]{len(codes)} code blocks[/]")
 
 
 @jobs_cli.command("tree")

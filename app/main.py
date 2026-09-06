@@ -62,6 +62,9 @@ from app.schemas import (
     JobSearchTextRequest, EmbeddingBatchRequest, EmbeddingBatchItem, EmbeddingBatchResponse,
     JobCountsResponse, EmbedderStatsResponse,
     JobReplayRequest, JobReplayResponse, JobDeleteResponse,
+    JobSectionsResponse, ExtractedLink, ExtractedTable, ExtractedCodeBlock,
+    ExtractResponse, LinkLookupResponse,
+    AdminStatsResponse, AdminPruneRequest, AdminPruneResponse, AdminCacheClearResponse,
     JobTagResponse,
     EmbeddingStoreRequest,
     EmbeddingStoreResponse,
@@ -1294,6 +1297,294 @@ async def job_raw_events(job_id: str) -> dict:
     """JSON array of the entire event log (single-shot, vs. the streaming NDJSON at /events)."""
     events = JOB_MANAGER.get_events(job_id, since=None, min_sequence=0)
     return {"job_id": job_id, "count": len(events), "events": events}
+@app.get("/jobs/{job_id}/sections", response_model=JobSectionsResponse)
+async def job_sections(job_id: str) -> JobSectionsResponse:
+    """Flat list of sections for fast TOC + jump-to-anchor navigation.
+
+    Cheaper than /jobs/{id}/toc because it doesn't include outbound links.
+    Agents can pair this with /jobs/{id}/links/{query} to drill down.
+    """
+    try:
+        structured = JOB_MANAGER.get_structured_result(job_id)
+    except Exception:
+        structured = {"sections": [], "url": ""}
+    sections = structured.get("sections", []) or []
+    return JobSectionsResponse(
+        job_id=job_id,
+        url=structured.get("url", ""),
+        sections=[
+            TocEntry(
+                level=s.get("level", 1),
+                heading=s.get("heading", ""),
+                anchor=s.get("anchor"),
+                body_chars=len(s.get("body") or ""),
+            )
+            for s in sections
+        ],
+        total_chars=sum(len(s.get("body") or "") for s in sections),
+    )
+
+
+@app.get("/jobs/{job_id}/extract", response_model=ExtractResponse)
+async def job_extract(job_id: str) -> ExtractResponse:
+    """Extract structured data: links, tables, code blocks.
+
+    Aggregates from multiple sources so an agent can answer "what tables are
+    on this page" / "what external links does it have" / "what code is shown"
+    with one call.
+    """
+    import re as _re
+
+    try:
+        links_payload = store.read_links(job_id) or {}
+    except Exception:
+        links_payload = {}
+    anchors = (links_payload.get("anchors") or []) if isinstance(links_payload, dict) else []
+    links = [
+        ExtractedLink(
+            href=a.get("href") or "",
+            text=a.get("text"),
+            title=a.get("title"),
+            source=a.get("source"),
+        )
+        for a in anchors
+        if isinstance(a, dict) and a.get("href")
+    ]
+
+    try:
+        md = store.read_markdown(job_id) or ""
+    except Exception:
+        md = ""
+    tables: list = []
+    code_blocks: list = []
+    if md:
+        in_table = False
+        current_table_lines: list = []
+        current_table_start: int | None = None
+        for line_no, line in enumerate(md.splitlines(), start=1):
+            stripped = line.strip()
+            if stripped.startswith("|") and stripped.endswith("|") and len(stripped) > 2:
+                if not in_table:
+                    in_table = True
+                    current_table_start = line_no
+                    current_table_lines = []
+                current_table_lines.append(stripped)
+            else:
+                if in_table:
+                    in_table = False
+                    if len(current_table_lines) >= 2:
+                        header = [c.strip() for c in current_table_lines[0].strip("|").split("|")]
+                        rows = [
+                            [c.strip() for c in row.strip("|").split("|")]
+                            for row in current_table_lines[2:]
+                        ]
+                        tables.append(
+                            ExtractedTable(
+                                headers=header,
+                                rows=rows,
+                                source_line=current_table_start,
+                            )
+                        )
+                    current_table_lines = []
+        if in_table and current_table_lines:
+            header = [c.strip() for c in current_table_lines[0].strip("|").split("|")]
+            tables.append(ExtractedTable(headers=header, rows=[], source_line=current_table_start))
+
+        for m in _re.finditer(r"```(\w*)\n(.*?)```", md, flags=_re.DOTALL):
+            lang, content = m.group(1) or None, m.group(2)
+            code_blocks.append(
+                ExtractedCodeBlock(
+                    language=lang,
+                    content=content[:2000],
+                    source_line=md[: m.start()].count("\n") + 1,
+                )
+            )
+
+    try:
+        structured = JOB_MANAGER.get_structured_result(job_id)
+    except Exception:
+        structured = {"url": ""}
+
+    return ExtractResponse(
+        job_id=job_id,
+        url=structured.get("url", ""),
+        links=links[:200],
+        tables=tables[:50],
+        code_blocks=code_blocks[:50],
+    )
+
+
+@app.get("/jobs/{job_id}/links/{query:path}", response_model=LinkLookupResponse)
+async def job_links_lookup(job_id: str, query: str) -> LinkLookupResponse:
+    """Fuzzy link lookup by text or anchor substring.
+
+    Useful for agents that need to resolve "what URL is behind this heading?"
+    without re-parsing the full links.json.
+    """
+    try:
+        payload = store.read_links(job_id) or {}
+    except Exception:
+        payload = {}
+    anchors = (payload.get("anchors") or []) if isinstance(payload, dict) else []
+    q = query.lower()
+    matches: list = []
+    for a in anchors:
+        if not isinstance(a, dict):
+            continue
+        text = (a.get("text") or "").lower()
+        href = a.get("href") or ""
+        if q in text or q in href.lower():
+            matches.append(
+                ExtractedLink(
+                    href=href,
+                    text=a.get("text"),
+                    title=a.get("title"),
+                    source=a.get("source"),
+                )
+            )
+        if len(matches) >= 50:
+            break
+    return LinkLookupResponse(job_id=job_id, query=query, matches=matches)
+
+
+@app.get("/jobs/stream")
+async def jobs_global_stream(request: Request) -> StreamingResponse:
+    """SSE stream of ALL job state changes across the system."""
+    import asyncio
+    import json as _json
+
+    queue: asyncio.Queue = asyncio.Queue()
+
+    sub_id = id(queue)
+    subscribers: dict = getattr(JOB_MANAGER, "_subscribers", {})
+    subscribers.setdefault(sub_id, []).append(queue)
+
+    async def event_generator() -> AsyncIterator[str]:
+        try:
+            yield f"data: {_json.dumps({'event': 'subscribed', 'subscriber_id': sub_id})}\n\n"
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    snap = await asyncio.wait_for(queue.get(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    yield ": heartbeat\n\n"
+                    continue
+                yield f"data: {_json.dumps(snap, default=str)}\n\n"
+        finally:
+            subs = subscribers.get(sub_id, [])
+            if queue in subs:
+                subs.remove(queue)
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+@app.get("/admin/stats", response_model=AdminStatsResponse)
+async def admin_stats() -> AdminStatsResponse:
+    """Per-day counts (last 90 days) + per-state + per-embedder.
+
+    Walks up to 50k jobs in memory. Intended for ops dashboards.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    rows, _ = JOB_MANAGER.list_jobs(limit=50_000)
+    by_state: dict = {}
+    by_day: dict = {}
+    today = datetime.now(timezone.utc).date()
+    cutoff = today - timedelta(days=90)
+    cache_hits = 0
+    embedder_counts: dict = {}
+    for r in rows:
+        st = r.get("state") or "UNKNOWN"
+        by_state[st] = by_state.get(st, 0) + 1
+        if r.get("cache_hit"):
+            cache_hits += 1
+        em = r.get("embedding_model")
+        if em:
+            embedder_counts[em] = embedder_counts.get(em, 0) + 1
+        ts = r.get("created_at")
+        if not ts:
+            continue
+        try:
+            d = datetime.fromisoformat(ts.replace("Z", "+00:00")).date()
+        except Exception:
+            continue
+        if d < cutoff:
+            continue
+        by_day[d.isoformat()] = by_day.get(d.isoformat(), 0) + 1
+    return AdminStatsResponse(
+        total=len(rows),
+        by_state=by_state,
+        by_day=by_day,
+        embedder_default="hash-bucket-v1",
+        embedder_counts=embedder_counts,
+        cache_hits=cache_hits,
+        generated_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+
+@app.post("/admin/jobs/prune", response_model=AdminPruneResponse)
+async def admin_jobs_prune(request: AdminPruneRequest) -> AdminPruneResponse:
+    """Bulk-delete jobs older than N days (DONE/FAILED states only)."""
+    from datetime import datetime, timedelta, timezone
+
+    cutoff_ts = datetime.now(timezone.utc) - timedelta(days=request.older_than_days)
+    cutoff_iso = cutoff_ts.isoformat()
+
+    rows, _ = JOB_MANAGER.list_jobs(limit=50_000, state=request.state)
+    candidates: list = []
+    for r in rows:
+        if r.get("state") not in ("DONE", "FAILED", "CANCELLED"):
+            continue
+        ts = r.get("finished_at") or r.get("created_at")
+        if not ts:
+            continue
+        try:
+            d = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if d >= cutoff_ts:
+            continue
+        candidates.append(r["id"])
+
+    deleted = 0
+    if not request.dry_run:
+        for jid in candidates:
+            try:
+                from app.main import job_delete as _jd
+                fake_resp = _jd(jid)
+                if fake_resp.deleted:
+                    deleted += 1
+            except Exception:
+                pass
+
+    return AdminPruneResponse(
+        candidates=len(candidates),
+        deleted=deleted,
+        dry_run=request.dry_run,
+        cutoff=cutoff_iso,
+    )
+
+
+@app.post("/admin/cache/clear", response_model=AdminCacheClearResponse)
+async def admin_cache_clear() -> AdminCacheClearResponse:
+    """Clear the in-process cache (best-effort)."""
+    from datetime import datetime, timezone
+
+    cleared = 0
+    try:
+        if hasattr(store, "clear_cache"):
+            store.clear_cache()
+            cleared = 1
+    except Exception:
+        pass
+    return AdminCacheClearResponse(
+        cache_name="capture",
+        cleared_entries=cleared,
+        cleared_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+
 @app.get("/jobs/{job_id}/toc", response_model=JobTocResponse)
 async def job_toc(job_id: str, max_links: int = 50) -> JobTocResponse:
     """Text-only table of contents: headings + a bounded outbound link list.

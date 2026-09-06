@@ -1076,3 +1076,92 @@ class JobDeleteResponse(BaseModel):
     deleted: bool
     artifacts_removed: int
     bytes_freed: int
+
+
+class JobSectionsResponse(BaseModel):
+    """Response for GET /jobs/{id}/sections — flat list of headings + anchors."""
+
+    job_id: str
+    url: str
+    sections: list["TocEntry"] = Field(default_factory=list)
+    total_chars: int
+
+
+class ExtractedLink(BaseModel):
+    """One outbound link from /jobs/{id}/extract."""
+
+    href: str
+    text: str | None = None
+    title: str | None = None
+    source: str | None = None
+
+
+class ExtractedTable(BaseModel):
+    """One table block from /jobs/{id}/extract."""
+
+    headers: list[str] = Field(default_factory=list)
+    rows: list[list[str]] = Field(default_factory=list)
+    source_line: int | None = None
+
+
+class ExtractedCodeBlock(BaseModel):
+    """One code block from /jobs/{id}/extract."""
+
+    language: str | None = None
+    content: str
+    source_line: int | None = None
+
+
+class ExtractResponse(BaseModel):
+    """Response for GET /jobs/{id}/extract."""
+
+    job_id: str
+    url: str
+    links: list[ExtractedLink] = Field(default_factory=list)
+    tables: list[ExtractedTable] = Field(default_factory=list)
+    code_blocks: list[ExtractedCodeBlock] = Field(default_factory=list)
+
+
+class LinkLookupResponse(BaseModel):
+    """Response for GET /jobs/{id}/links/{query} — fuzzy lookup by text/anchor."""
+
+    job_id: str
+    query: str
+    matches: list[ExtractedLink] = Field(default_factory=list)
+
+
+class AdminStatsResponse(BaseModel):
+    """Response for GET /admin/stats — per-day time series (last 90 days)."""
+
+    total: int
+    by_state: dict[str, int]
+    by_day: dict[str, int]  # ISO date -> count
+    embedder_default: str
+    embedder_counts: dict[str, int]
+    cache_hits: int
+    generated_at: str
+
+
+class AdminPruneRequest(BaseModel):
+    """Request for POST /admin/jobs/prune."""
+
+    older_than_days: int = Field(..., ge=1, le=365, description="Delete DONE/FAILED jobs older than N days")
+    state: str | None = Field(default=None, description="Restrict to a given state")
+    dry_run: bool = Field(default=True, description="If true, just count candidates without deleting")
+
+
+class AdminPruneResponse(BaseModel):
+    """Response for POST /admin/jobs/prune."""
+
+    candidates: int
+    deleted: int
+    dry_run: bool
+    cutoff: str
+
+
+class AdminCacheClearResponse(BaseModel):
+    """Response for POST /admin/cache/clear."""
+
+    cache_name: str
+    cleared_entries: int
+    cleared_at: str

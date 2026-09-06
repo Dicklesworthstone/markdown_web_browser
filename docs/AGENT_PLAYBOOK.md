@@ -339,6 +339,68 @@ mdwb jobs delete <id> --yes     # skip the prompt
 curl -X POST http://localhost:8000/jobs/search/text   -d '{"query":"pricing", "tag":"dataset:2026-q1"}' -H 'Content-Type: application/json'
 ```
 
+## 18. Round-7 surfaces (sections, extract, global stream, admin)
+
+### Lightweight TOC + extract
+
+```bash
+# Flat section list (cheaper than /toc; no outbound links)
+curl http://localhost:8000/jobs/$ID/sections | jq '.sections[].heading'
+# CLI: mdwb jobs sections <id>
+
+# Extract structured data: links, tables, code blocks
+curl http://localhost:8000/jobs/$ID/extract | jq '.tables, .code_blocks | length'
+# CLI: mdwb jobs extract <id> [--only links|tables|code]
+```
+
+### Resolve a link by text/anchor
+
+```bash
+# Fuzzy lookup: "docs" matches "Documentation" by text
+curl 'http://localhost:8000/jobs/$ID/links/docs' | jq '.matches'
+```
+
+### Global event stream (SSE)
+
+```bash
+# Subscribe to ALL job state changes in one persistent connection
+curl -N http://localhost:8000/jobs/stream
+# Each event: data: {"job_id": "...", "state": "DONE", "ts": "..."}
+# Heartbeats every 15s keep the connection open through proxies.
+```
+
+### Admin / ops
+
+```bash
+# Per-day + per-state + per-embedder counts
+curl http://localhost:8000/admin/stats | jq '.total, .by_state, .embedder_counts'
+# CLI: mdwb admin stats
+
+# Bulk-delete jobs older than N days (defaults to dry-run)
+curl -X POST http://localhost:8000/admin/jobs/prune   -d '{"older_than_days":30, "dry_run":true}' -H 'Content-Type: application/json'
+# CLI: mdwb admin prune --older-than-days 30        # dry-run by default
+# CLI: mdwb admin prune --older-than-days 30 --yes  # actually delete
+
+# Clear the in-process capture cache
+curl -X POST http://localhost:8000/admin/cache/clear
+# CLI: mdwb admin cache-clear
+```
+
+### Tip: agent loop pattern
+
+```bash
+# 1. List section headings for a job
+curl http://localhost:8000/jobs/$ID/sections | jq -r '.sections[].heading'
+
+# 2. Pick a heading you want to drill into
+# 3. Resolve the link behind it
+curl "http://localhost:8000/jobs/$ID/links/Pricing" | jq '.matches[0].href'
+# -> "https://example.com/pricing"
+
+# 4. Capture that URL as a new job
+mdwb fetch https://example.com/pricing --tag dataset:research
+```
+
 ## 14. Where to read next
 
 - `README.md` — vision + setup + quickstart
