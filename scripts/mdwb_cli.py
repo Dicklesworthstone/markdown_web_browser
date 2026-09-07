@@ -7,6 +7,7 @@ import csv
 import hashlib
 import io
 import json
+from urllib.parse import quote
 import math
 import os
 import shutil
@@ -1892,7 +1893,6 @@ def tags_cmd(
     elif action == "rm":
         if not tag or len(tag) != 1:
             raise typer.BadParameter("rm requires exactly one tag")
-        from urllib.parse import quote
         with httpx.Client(http2=http2, timeout=15.0) as client:
             response = client.delete(
                 f"{api_root}/jobs/{job_id}/tag/{quote(tag[0], safe='')}",
@@ -2138,6 +2138,24 @@ def admin_prune(
         console.print(f"[yellow]dry-run[/]: {data.get('candidates', 0)} candidates  cutoff={data.get('cutoff')}")
     else:
         console.print(f"[green]Pruned[/]: {data.get('deleted', 0)}/{data.get('candidates', 0)} jobs")
+
+
+@admin_cli.command("cache-invalidate")
+def admin_cache_invalidate(
+    url: str = typer.Argument(..., help="URL to evict from the capture cache"),
+    api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
+    http2: bool = typer.Option(True, "--http2/--no-http2"),
+) -> None:
+    """Drop a specific URL from the capture cache (POST /admin/cache/invalidate)."""
+    api_root = _resolve_settings(api_base).base_url
+    with httpx.Client(http2=http2, timeout=15.0) as client:
+        response = client.post(f"{api_root}/admin/cache/invalidate", params={"url": url})
+        response.raise_for_status()
+        data = response.json()
+    if data.get("removed"):
+        console.print(f"[green]Invalidated[/]: {url}")
+    else:
+        console.print(f"[yellow]Not in cache:[/] {url}")
 
 
 @admin_cli.command("cache-clear")
@@ -3804,6 +3822,95 @@ def jobs_summary(
         f"chars={data.get('char_count', 0)}  "
         f"outbound_links={data.get('outbound_link_count', 0)}[/]"
     )
+
+
+@jobs_cli.command("headings")
+def jobs_headings(
+    job_id: str = typer.Argument(..., help="Job identifier"),
+    heading: str = typer.Argument(..., help="Heading text to fetch"),
+    api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
+    json_output: bool = typer.Option(False, "--json"),
+    http2: bool = typer.Option(True, "--http2/--no-http2"),
+) -> None:
+    """Get the body + sub-sections for a specific heading (GET /jobs/{id}/headings/{heading})."""
+    api_root = _resolve_settings(api_base).base_url
+    with httpx.Client(http2=http2, timeout=15.0) as client:
+        response = client.get(
+            f"{api_root}/jobs/{job_id}/headings/{quote(heading, safe='')}"
+        )
+        response.raise_for_status()
+        data = response.json()
+    if json_output:
+        typer.echo(json.dumps(data, indent=2))
+        return
+    console.print(f"[bold]{data.get('heading')}[/]  ({data.get('body_chars', 0)} chars)")
+    body = (data.get("body") or "").strip()
+    if body:
+        for line in body.splitlines()[:30]:
+            console.print(f"  {line}")
+        if len(body.splitlines()) > 30:
+            console.print("  ... (truncated)")
+    subs = data.get("subsections", [])
+    if subs:
+        console.print(f"[dim]  subsections: {len(subs)}[/]")
+
+
+@jobs_cli.command("follow")
+def jobs_follow(
+    job_id: str = typer.Argument(..., help="Job identifier"),
+    anchor: str = typer.Argument(..., help="Anchor (e.g. 'section-1' or 'pricing')"),
+    api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
+    json_output: bool = typer.Option(False, "--json"),
+    http2: bool = typer.Option(True, "--http2/--no-http2"),
+) -> None:
+    """Resolve an in-page anchor to its link target (GET /jobs/{id}/follow?anchor=…)."""
+    api_root = _resolve_settings(api_base).base_url
+    with httpx.Client(http2=http2, timeout=15.0) as client:
+        response = client.get(
+            f"{api_root}/jobs/{job_id}/follow", params={"anchor": anchor}
+        )
+        response.raise_for_status()
+        data = response.json()
+    if json_output:
+        typer.echo(json.dumps(data, indent=2))
+        return
+    if data.get("resolved_href"):
+        console.print(
+            f"[green]{anchor}[/] -> [bold]{data.get('resolved_text') or '?'}[/]  {data.get('resolved_href')}"
+        )
+    else:
+        console.print(f"[yellow]No link found for anchor {anchor!r}[/]")
+        candidates = data.get("candidates") or []
+        if candidates:
+            console.print(f"  candidates: {candidates[:3]}")
+
+
+@jobs_cli.command("export")
+def jobs_export(
+    job_id: str = typer.Argument(..., help="Job identifier"),
+    out: Optional[Path] = typer.Option(None, "--out", help="Write Markdown to this file"),
+    max_chars: Optional[int] = typer.Option(None, "--max-chars", help="Cap output length"),
+    keep_provenance: bool = typer.Option(False, "--keep-provenance/--strip-provenance"),
+    api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
+    http2: bool = typer.Option(True, "--http2/--no-http2"),
+) -> None:
+    """Export cleaned Markdown (GET /jobs/{id}/export.md)."""
+    api_root = _resolve_settings(api_base).base_url
+    params: dict = {"strip_provenance": not keep_provenance}
+    if max_chars:
+        params["max_chars"] = max_chars
+    with httpx.Client(http2=http2, timeout=15.0) as client:
+        response = client.get(f"{api_root}/jobs/{job_id}/export.md", params=params)
+        response.raise_for_status()
+        data = response.json()
+    md = data.get("markdown", "")
+    if out:
+        out.write_text(md, encoding="utf-8")
+        console.print(f"[green]Wrote {len(md)} chars to {out}[/]")
+    else:
+        typer.echo(md)
+    if data.get("truncated"):
+        console.print(f"[yellow]Truncated at {data.get('char_count')} chars[/]")
 
 
 @jobs_cli.command("sections")

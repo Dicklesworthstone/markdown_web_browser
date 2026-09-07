@@ -401,6 +401,73 @@ curl "http://localhost:8000/jobs/$ID/links/Pricing" | jq '.matches[0].href'
 mdwb fetch https://example.com/pricing --tag dataset:research
 ```
 
+## 19. Round-8 surfaces (headings, follow, export, batch queries)
+
+### Drill into a specific heading
+
+```bash
+# GET body + sub-sections for a single heading (case-insensitive)
+curl http://localhost:8000/jobs/$ID/headings/Pricing | jq '.body, .subsections'
+# CLI: mdwb jobs headings <id> Pricing
+```
+
+### Resolve an in-page anchor to a link
+
+```bash
+# Given an anchor like #pricing-table, find the link that uses it
+curl "http://localhost:8000/jobs/$ID/follow?anchor=pricing-table" | jq '.resolved_href'
+# CLI: mdwb jobs follow <id> pricing-table
+```
+
+### Export cleaned Markdown
+
+```bash
+# Single-shot JSON export (provenance comments stripped)
+curl http://localhost:8000/jobs/$ID/export.md | jq -r '.markdown'
+# CLI: mdwb jobs export <id> [--out FILE] [--max-chars N] [--keep-provenance]
+```
+
+### Batch queries (avoid N round-trips)
+
+```bash
+# Fetch sections + links + summary + toc in one call
+curl -X POST http://localhost:8000/jobs/$ID/queries \
+  -d '{"queries":["sections","links","summary","toc"]}' -H 'Content-Type: application/json'
+# Returns {results: {sections: [...], links: [...], summary: {...}, toc: {...}}}
+```
+
+### Cache + queue metrics (for ops dashboards)
+
+```bash
+curl http://localhost:8000/metrics/cache | jq '.entries, .hit_rate, .ttl_seconds'
+curl http://localhost:8000/metrics/queue | jq '.by_state, .in_flight, .watchdog_running'
+```
+
+### Invalidate a specific cache entry
+
+```bash
+# POST /admin/cache/invalidate?url=...
+curl -X POST 'http://localhost:8000/admin/cache/invalidate?url=https%3A%2F%2Fexample.com%2Fpage'
+# CLI: mdwb admin cache-invalidate <url>
+```
+
+### Tip: the agent "follow the TOC" pattern
+
+```bash
+# 1. Get section headings
+curl http://localhost:8000/jobs/$ID/sections | jq -r '.sections[].heading'
+
+# 2. Drill into one section
+curl http://localhost:8000/jobs/$ID/headings/Pricing | jq '.body'
+
+# 3. Follow any anchor within that section
+curl "http://localhost:8000/jobs/$ID/follow?anchor=pricing-table" | jq '.resolved_href'
+
+# 4. Batch-fetch whatever else you need
+curl -X POST http://localhost:8000/jobs/$ID/queries \
+  -d '{"queries":["summary","links"]}' -H 'Content-Type: application/json'
+```
+
 ## 14. Where to read next
 
 - `README.md` — vision + setup + quickstart

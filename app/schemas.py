@@ -1165,3 +1165,86 @@ class AdminCacheClearResponse(BaseModel):
     cache_name: str
     cleared_entries: int
     cleared_at: str
+
+
+class HeadingBodyResponse(BaseModel):
+    """Response for GET /jobs/{id}/headings/{heading} — full body + sub-sections for a heading."""
+
+    job_id: str
+    url: str
+    heading: str
+    anchor: str | None = None
+    body: str
+    body_chars: int
+    subsections: list["TocEntry"] = Field(default_factory=list)
+    outbound_links: list[str] = Field(default_factory=list, max_length=200)
+
+
+class FollowResponse(BaseModel):
+    """Response for GET /jobs/{id}/follow?anchor=… — resolve an in-page anchor to its link target."""
+
+    job_id: str
+    anchor: str
+    resolved_href: str | None = None
+    resolved_text: str | None = None
+    candidates: list[str] = Field(default_factory=list, description="Other in-page anchors that may match")
+
+
+class ExportMdQuery(BaseModel):
+    """Query for /jobs/{id}/export.md — controls streaming behavior."""
+
+    max_chars: int | None = Field(default=None, ge=1, le=2_000_000)
+    strip_provenance: bool = Field(default=True, description="Remove '<!-- source: ... -->' comments")
+
+
+class ExportMdResponse(BaseModel):
+    """Single-shot response for /jobs/{id}/export.md (non-streaming variant)."""
+
+    job_id: str
+    char_count: int
+    truncated: bool
+    markdown: str
+
+
+class BatchQueryRequest(BaseModel):
+    """Request for POST /jobs/{id}/queries — answer multiple queries in one call."""
+
+    queries: list[str] = Field(
+        ...,
+        min_length=1,
+        max_length=50,
+        description="Each query is one of: 'sections' | 'links' | 'headings' | 'summary' | 'toc'",
+    )
+
+
+class BatchQueryResponse(BaseModel):
+    """Response for POST /jobs/{id}/queries."""
+
+    job_id: str
+    results: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Map of query name -> answer payload (each answer is a typed Pydantic model).",
+    )
+
+
+class CacheMetricsResponse(BaseModel):
+    """Response for GET /metrics/cache."""
+
+    cache_name: str
+    entries: int
+    hit_rate: float = Field(ge=0.0, le=1.0, description="Hits / (Hits + Misses)")
+    hits: int
+    misses: int
+    ttl_seconds: int | None = None
+    enabled: bool
+
+
+class QueueMetricsResponse(BaseModel):
+    """Response for GET /metrics/queue."""
+
+    by_state: dict[str, int]
+    watchdog_running: bool
+    watchdog_uptime_seconds: float | None = None
+    last_run_at: str | None = None
+    in_flight: int
+    total_completed: int

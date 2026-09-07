@@ -1,7 +1,6 @@
 """R7 tests: sections, extract, links lookup, global stream, admin."""
 from __future__ import annotations
 
-import json
 import pathlib
 
 import pytest

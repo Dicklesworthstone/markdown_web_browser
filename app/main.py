@@ -73,6 +73,8 @@ from app.schemas import (
     BatchStatusResponse,
     JobArtifactsResponse,
     JobEventsJsonResponse,
+    HeadingBodyResponse, FollowResponse, ExportMdResponse,
+    BatchQueryRequest, BatchQueryResponse, CacheMetricsResponse, QueueMetricsResponse,
     JobLinksResponse,
     WebhookRegistrationRequest,
     WebhookSubscription,
@@ -1297,6 +1299,305 @@ async def job_raw_events(job_id: str) -> dict:
     """JSON array of the entire event log (single-shot, vs. the streaming NDJSON at /events)."""
     events = JOB_MANAGER.get_events(job_id, since=None, min_sequence=0)
     return {"job_id": job_id, "count": len(events), "events": events}
+@app.get("/jobs/{job_id}/headings/{heading:path}", response_model=HeadingBodyResponse)
+async def job_heading(job_id: str, heading: str) -> HeadingBodyResponse:
+    """Get the body + sub-sections for a specific heading.
+
+    Resolves the heading by exact text match (case-insensitive); 404 if not found.
+    Agents use this to drill into "give me the body of the Pricing section".
+    """
+    try:
+        structured = JOB_MANAGER.get_structured_result(job_id)
+    except Exception:
+        structured = {"sections": [], "url": ""}
+    sections = structured.get("sections", []) or []
+    target_lower = heading.lower()
+    match_idx = None
+    for i, s in enumerate(sections):
+        if str(s.get("heading", "")).lower() == target_lower:
+            match_idx = i
+            break
+    if match_idx is None:
+        raise HTTPException(status_code=404, detail=f"Heading {heading!r} not found")
+    matched = sections[match_idx]
+    body = matched.get("body", "") or ""
+    matched_level = matched.get("level", 1)
+    subsections: list = []
+    for s in sections[match_idx + 1:]:
+        if s.get("level", 1) <= matched_level:
+            break
+        subsections.append(
+            TocEntry(
+                level=s.get("level", 1),
+                heading=s.get("heading", ""),
+                anchor=s.get("anchor"),
+                body_chars=len(s.get("body") or ""),
+            )
+        )
+    # Gather links under the matched heading
+    outbound: list = []
+    try:
+        links_payload = store.read_links(job_id) or {}
+    except Exception:
+        links_payload = {}
+    for a in (links_payload.get("anchors") or []):
+        if isinstance(a, dict) and a.get("href"):
+            outbound.append(a["href"])
+    return HeadingBodyResponse(
+        job_id=job_id,
+        url=structured.get("url", ""),
+        heading=matched.get("heading", ""),
+        anchor=matched.get("anchor"),
+        body=body,
+        body_chars=len(body),
+        subsections=subsections,
+        outbound_links=outbound[:200],
+    )
+
+
+@app.get("/jobs/{job_id}/follow", response_model=FollowResponse)
+async def job_follow(
+    job_id: str,
+    anchor: str,
+) -> FollowResponse:
+    """Resolve an in-page anchor (e.g. #section-1) to the link it points at.
+
+    Walks the Markdown looking for the corresponding ``[text](url#anchor)`` link.
+    """
+    try:
+        md = store.read_markdown(job_id) or ""
+    except Exception:
+        md = ""
+    import re as _re
+
+    candidates: list = []
+    resolved_href: str | None = None
+    resolved_text: str | None = None
+    if md:
+        # Find links whose URL ends with the anchor
+        for m in _re.finditer(r"\[([^\]]+)\]\(([^)]+)\)", md):
+            text, target = m.group(1), m.group(2)
+            if target.endswith(f"#{anchor}"):
+                if resolved_href is None:
+                    resolved_href = target
+                    resolved_text = text
+                else:
+                    candidates.append(target)
+            elif f"#{anchor}" in target:
+                candidates.append(target)
+    return FollowResponse(
+        job_id=job_id,
+        anchor=anchor,
+        resolved_href=resolved_href,
+        resolved_text=resolved_text,
+        candidates=candidates,
+    )
+
+
+@app.get("/jobs/{job_id}/export.md", response_model=ExportMdResponse)
+async def job_export_md(
+    job_id: str,
+    max_chars: int | None = None,
+    strip_provenance: bool = True,
+) -> ExportMdResponse:
+    """Single-shot JSON export of the (optionally cleaned) Markdown.
+
+    Stream-chunked variant lives at GET /jobs/{id}/export.md.stream (future work).
+    """
+    try:
+        md = store.read_markdown(job_id) or ""
+    except Exception:
+        md = ""
+    if not md:
+        raise HTTPException(status_code=404, detail="Markdown not available")
+    if strip_provenance:
+        import re as _re
+
+        md = _re.sub(r"<!--.*?-->\n?", "", md, flags=_re.DOTALL).strip()
+    truncated = False
+    if max_chars is not None and len(md) > max_chars:
+        md = md[:max_chars]
+        truncated = True
+    return ExportMdResponse(
+        job_id=job_id,
+        char_count=len(md),
+        truncated=truncated,
+        markdown=md,
+    )
+
+
+@app.post("/jobs/{job_id}/queries", response_model=BatchQueryResponse)
+async def batch_queries(
+    job_id: str, request: BatchQueryRequest
+) -> BatchQueryResponse:
+    """Answer multiple queries in one HTTP call.
+
+    Each query in ``request.queries`` is one of:
+    ``sections``, ``links``, ``headings``, ``summary``, ``toc``.
+    """
+    results: dict = {}
+    qset = {q.lower() for q in request.queries}
+    if "sections" in qset or "headings" in qset or "toc" in qset:
+        try:
+            structured = JOB_MANAGER.get_structured_result(job_id)
+        except Exception:
+            structured = {"sections": [], "url": ""}
+        secs = structured.get("sections", []) or []
+        if "sections" in qset or "headings" in qset:
+            results["sections"] = [
+                {"level": s.get("level", 1), "heading": s.get("heading"), "anchor": s.get("anchor"), "body_chars": len(s.get("body") or "")}
+                for s in secs
+            ]
+        if "toc" in qset:
+            try:
+                links_payload = store.read_links(job_id) or {}
+            except Exception:
+                links_payload = {}
+            anchors = (links_payload.get("anchors") or []) if isinstance(links_payload, dict) else []
+            outbound = sorted(
+                {a.get("href") for a in anchors if isinstance(a, dict) and a.get("href")}
+            )
+            results["toc"] = {
+                "sections": results.get("sections", []),
+                "outbound_links": outbound[:200],
+            }
+    if "links" in qset:
+        try:
+            links_payload = store.read_links(job_id) or {}
+        except Exception:
+            links_payload = {}
+        anchors = (links_payload.get("anchors") or []) if isinstance(links_payload, dict) else []
+        results["links"] = [
+            {"href": a.get("href"), "text": a.get("text"), "source": a.get("source")}
+            for a in anchors if isinstance(a, dict)
+        ][:200]
+    if "summary" in qset:
+        try:
+            structured = JOB_MANAGER.get_structured_result(job_id)
+        except Exception:
+            structured = {"sections": [], "url": ""}
+        sections = structured.get("sections", []) or []
+        headings = [s.get("heading") for s in sections if s.get("heading")]
+        url = structured.get("url", "")
+        parts = [f"Captured page at {url}."]
+        if headings:
+            parts.append("Sections: " + ", ".join(headings[:3]) + ".")
+        results["summary"] = {
+            "url": url,
+            "headings": headings,
+            "summary": " ".join(parts) if parts else "(no summary)",
+            "section_count": len(sections),
+        }
+    return BatchQueryResponse(job_id=job_id, results=results)
+
+
+@app.get("/metrics/cache", response_model=CacheMetricsResponse)
+async def metrics_cache() -> CacheMetricsResponse:
+    """Report cache hit rate, entry count, TTL config.
+
+    Best-effort: if the store doesn't expose a cache, returns the report
+    with ``enabled=False`` and zeroes.
+    """
+    entries = 0
+    hits = 0
+    misses = 0
+    enabled = False
+    ttl: int | None = None
+    try:
+        if hasattr(store, "cache_stats"):
+            stats = store.cache_stats()
+            entries = int(stats.get("entries", 0))
+            hits = int(stats.get("hits", 0))
+            misses = int(stats.get("misses", 0))
+            enabled = bool(stats.get("enabled", True))
+            ttl = stats.get("ttl_seconds")
+    except Exception:
+        pass
+    total = hits + misses
+    hit_rate = (hits / total) if total else 0.0
+    return CacheMetricsResponse(
+        cache_name="capture",
+        entries=entries,
+        hit_rate=hit_rate,
+        hits=hits,
+        misses=misses,
+        ttl_seconds=ttl,
+        enabled=enabled,
+    )
+
+
+@app.get("/metrics/queue", response_model=QueueMetricsResponse)
+async def metrics_queue() -> QueueMetricsResponse:
+    """Per-state queue depth + watchdog uptime + last run timestamp."""
+    from datetime import datetime, timezone
+
+    by_state: dict = {}
+    in_flight = 0
+    try:
+        for job_id, task in (JOB_MANAGER._tasks or {}).items():
+            if task and not task.done():
+                in_flight += 1
+                snap = JOB_MANAGER.get_snapshot(job_id) or {}
+                state = str(snap.get("state", "UNKNOWN"))
+                by_state[state] = by_state.get(state, 0) + 1
+    except Exception:
+        pass
+    watchdog_running = bool(
+        JOB_MANAGER._watchdog_task is not None
+        and not JOB_MANAGER._watchdog_task.done()
+    )
+    # Approximate watchdog uptime via the task's start time
+    uptime: float | None = None
+    try:
+        if JOB_MANAGER._watchdog_task is not None:
+            uptime = (datetime.now(timezone.utc) - JOB_MANAGER._started_at).total_seconds()
+    except Exception:
+        pass
+    last_run = None
+    try:
+        rows, _ = JOB_MANAGER.list_jobs(limit=1)
+        if rows:
+            last_run = str(rows[0].get("created_at"))
+    except Exception:
+        pass
+    total = 0
+    try:
+        _, total = JOB_MANAGER.list_jobs(limit=100_000)
+    except Exception:
+        pass
+    return QueueMetricsResponse(
+        by_state=by_state,
+        watchdog_running=watchdog_running,
+        watchdog_uptime_seconds=uptime,
+        last_run_at=last_run,
+        in_flight=in_flight,
+        total_completed=total,
+    )
+
+
+@app.post("/admin/cache/invalidate")
+async def admin_cache_invalidate(url: str) -> dict:
+    """Drop a specific URL from the capture cache (vs. clear-all).
+
+    Body: ``{"url": "https://example.com"}`` (or use the ``url`` query param).
+    """
+    from datetime import datetime, timezone
+
+    if not url:
+        raise HTTPException(status_code=400, detail="url is required")
+    removed = False
+    try:
+        if hasattr(store, "invalidate_cache_key"):
+            removed = bool(store.invalidate_cache_key(url))
+    except Exception:
+        pass
+    return {
+        "url": url,
+        "removed": removed,
+        "invalidated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 @app.get("/jobs/{job_id}/sections", response_model=JobSectionsResponse)
 async def job_sections(job_id: str) -> JobSectionsResponse:
     """Flat list of sections for fast TOC + jump-to-anchor navigation.
