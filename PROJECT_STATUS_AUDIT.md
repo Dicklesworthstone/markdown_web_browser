@@ -1,4 +1,351 @@
-# Project Status Audit - November 2024
+# Project reality check — 2026-10-13
+
+This assessment supersedes the historical November 2024 audit preserved below.
+It uses source revision `e6c884429dc841cfa897c63186f0009d46792802`, the live
+Beads JSONL, full baseline checks, actual browser probes, and one real hosted-OCR
+capture. The requested `reality-check-for-project` workflow included vision
+extraction, source investigation, gap analysis, bridge beads, ambition review,
+five refinement passes, and dependency validation. Planning is the deliverable;
+the repair and integration beads remain unfinished.
+
+## Verdict
+
+The original idea is implemented far enough to deliver useful output: a real URL
+can pass through Chrome, pyvips, hosted OCR, stitching, persistence, and cache
+reuse. This is substantial working machinery. The project does **not** yet meet
+its documented reliability, fidelity, security, determinism, performance, or
+production qualification promises. The Franken revamp is an additional vision
+with no integrated Rust implementation in this checkout.
+
+The earlier completion percentages and production-ready conclusions were based
+largely on file existence and line counts. They are not current qualification
+evidence. No defensible overall completion percentage follows from this audit.
+
+## What was inspected
+
+- Full repository `AGENTS.md` (1,104 lines), full `README.md` (560 lines), and
+  suite `/data/projects/AGENTS.md` (539 lines).
+- Original project plan, Franken plan and handoff, deduplication strategy,
+  browser implementation document, original vision prompt, architecture,
+  API/config/model/blocklist/DOM-assist documentation, agent playbook,
+  integration guide, OCR guides, ops/release/deployment material, and gallery.
+- Actual routing and request schemas; capture, tiling, OCR policy/client/local
+  lifecycle, stitching, jobs, Store, embedding implementations, crawler,
+  authentication/rate limiting, both web clients, installer/container/worker/CI
+  wiring, representative tests and production evidence pointers.
+- Live tracker before changes: **121 closed issues, one tombstone, zero open or
+  in-progress issues**. `br` recovered its schema-0 database from JSONL; historical
+  issues and recovery data were retained. No historical issue was closed or had
+  its acceptance criteria rewritten by this audit.
+
+The repository instructions refer to suite sections named “Named Reward-Hacking
+Patterns” and “Work-Graph Discipline”; neither heading exists in the current
+suite file. The substantive prohibitions stated in this repository's Rule 0.5
+were still applied. The older Franken plan also contains instructions conflicting
+with current governance, including deleting placeholder files and committing
+`beads.db`. Current AGENTS rules take precedence.
+
+## Fresh verification
+
+Checks used an isolated uv environment at
+`/tmp/mdwb-reality-20261013/env`, Python **3.13.0**, with locked dependencies.
+Playwright was **1.57.0**, pyvips **3.1.1**, SQLModel **0.0.31**, and pytest
+**9.1.1**. The default unpinned uv interpreter selected 3.14.2 initially; all
+reported verification below uses the explicitly selected 3.13 environment.
+
+| Check | Observed result | Meaning |
+|---|---|---|
+| `uv sync --locked --python 3.13` in the isolated environment | Passed | Dependency setup works on this host |
+| `uv run --no-sync --python 3.13 ruff check .` | Passed | Current Ruff lint rules pass |
+| `uv run --no-sync --python 3.13 ruff format --check .` | Failed: 25 files would be reformatted | CI formatting gate is red |
+| `uvx --python 3.13 ty check --python /tmp/mdwb-reality-20261013/env/bin/python` | Failed: 157 diagnostics | Full correctly configured type gate is red |
+| `uv run --no-sync --python 3.13 pytest tests/ -x --tb=short` | 170 passed, 1 failed, 2 skipped | Stops at a real capture test's nonexistent `artifact_root` field |
+| `uv run --no-sync --python 3.13 pytest tests/ --tb=short` | **537 passed, 1 failed, 2 skipped**, 191.72 s | Broad baseline has the same failure; a focused pass does not waive it |
+| Required Python Playwright command | `error: unknown command 'test'` | Python CLI is not the Node test runner |
+| `npx --no-install playwright --version` | Missing package; command failed | No declared/installed Node smoke runner available here |
+| `show_latest_smoke.py check --root benchmarks/production --json` | `status: missing`, `weekly_summary` absent | Current production readiness is not established |
+| `br dep cycles --json` after bridge wiring | Empty | Work graph is acyclic |
+| `ubs --staged` on the audit/planning/JSONL changes | Exit 3: no supported source language, nothing scanned | Not a code-safety pass; source code was not changed |
+
+Final graph validation also checks **actionability**, not only cycles. Initial
+`--parent` containment edges made children wait for their own open epic in this
+installed tracker. Those new containment edges were removed via `br`; dotted IDs
+retain hierarchy and actual prerequisite edges remain. `br ready` now exposes
+eight foundations, including both P0 repairs. The epic still waits for both
+qualification gates. `br doctor` reports degraded recovery-artifact hygiene,
+while DB integrity and DB/JSONL record counts agree; recovery artifacts were
+preserved under the no-deletion rule, not represented as a clean doctor pass.
+
+The full-suite failure is
+`tests/test_live_capture.py::test_live_capture_of_example_com`, line 109:
+`CaptureManifest` has no `artifact_root`. The test also changes environment after
+cached settings have been loaded, catches capture exceptions as skips, and calls
+the capture-only helper while expecting persisted job artifacts. Fix the actual
+test/product boundary; removing the assertion or skipping the test is not proof.
+
+Generated E2E currently skips because its default `cases.json` is absent. Its
+implementation compares two existing Markdown files; it does not drive the
+browser/OCR/Store pipeline. `test_e2e_small.py`, `test_embeddings.py`, and
+`test_scroll_policy.py` contain `assert True` placeholders. Other meaningful
+embedding/capture tests do exist, but these placeholders establish no additional
+coverage. Browser helper tests returning `False` instead of asserting can also
+appear green under pytest when the operation failed.
+
+Raw logs remain under `/tmp/mdwb-reality-20261013/`: `pytest-first.log`,
+`pytest-full.log`, `ruff.log`, `ruff-format.log`, `ty-correct-env.log`,
+`live-pipeline.log`, `ui-probe.log`, `persistence-probe.log`,
+`embedding-probe.log`, `crawl-probe.log`, `smoke-readiness.log`, and
+`playwright-python-command.log`. The earlier `ty.log` used the wrong environment
+and is diagnostic history, not the basis of the 157-diagnostic verdict.
+
+## Real pipeline proof and its limits
+
+Job **`efc513b98d8648a5950f1a8f221f7a06`** captured a local HTTP page containing a
+known heading, paragraph, numeric table, and absolute link, using the production
+API/JobManager/Store pipeline and actual hosted OCR at `api.deepinfra.com`.
+No mocked OCR response or fake capture result supplied this outcome.
+
+| Field | Observed value |
+|---|---|
+| Terminal state | `DONE`; Markdown endpoint 200 |
+| Wall time | **41.936 s** |
+| Capture / OCR / stitch | **30,644 / 10,378 / 3 ms** |
+| Tiles | 4; one viewport sweep |
+| Actual browser build | **155.0.8059.39**, launched through the `chrome` alias |
+| Manifest CfT label/build | **Stable-1 / chrome-130.0.6723.69** — contradicts observed build |
+| Manifest transport | `cdp`, copied from configuration; actual selection is unverified |
+| Playwright | 1.57.0 |
+| Screenshot style hash | `dev-sweeps-v1` |
+| OCR policy/model setting | `olmOCR-2-7B-1025-FP8`; remote OpenAI-compatible path |
+| Sweep shrink/retry counts | 0 / 0 |
+| Hosted request IDs | `RguVBMTNZ7SBetjz3OJTk6Bb`, `RdTwpke2p7x540S5bTgYEO9F`, `RWalwWUg0lQIQ2mDwHIGiPhQ`, `RXDcIvM24tnqmiZDKY4RlwRS` |
+| Artifacts directory | `/tmp/mdwb-reality-20261013/live-cache/127.0.0.1/home-2b22a63d/cache/f2/f22b838584f2a3561dc67932a15ef4d000daadb40415629fed6328b714e2d134/2026-10-13_110029/` |
+
+The known paragraph and table values were recovered. A repeat request returned
+`DONE` with `cache_hit=true`. DOM links survived a fresh process. This proves
+bounded integration and genuine hosted inference, not 95% corpus accuracy,
+protected-site success, byte determinism, or production p95. The probe added
+only request User-Agent headers and an observed-browser logging wrapper.
+
+The probe submitted a documented nested `viewport` object. The actual request
+schema expects flat `viewport_width`, `viewport_height`, and
+`device_scale_factor`, so that object was ignored and defaults 1280×2000/DPR2
+were used. This is additional contract drift; the 41.936 s result is reported
+as observed, not normalized to a smaller viewport. One tiny-page run exceeds the
+8 s short-page target, but one sample cannot establish a percentile or a speedup.
+
+The output contained model YAML (`primary_language`, `is_table`, etc.), blank-page
+commentary, an OCR link `[Guide](Guide)`, and no Links Appendix. `links.json`
+contained the correct absolute `https://example.com/guide` link. Thus a `DONE`
+state does not imply the promised clean, self-contained Markdown.
+
+## Reproduced failures beyond the test suite
+
+1. **Authentication/rate limits are unattached.** With `REQUIRE_API_KEY=true`,
+   unauthenticated `/jobs`, `/admin/stats`, and capture submission succeeded.
+   Sixty-five admin requests all returned 200. `main.py` does not attach the auth
+   dependency or rate middleware. The modules' existence is not API enforcement.
+2. **Unsafe rendered links execute JavaScript.** An actual browser using the
+   shipped marked 11.0.0 renderer executed a local audit marker when clicking
+   `[probe](javascript:window.auditMarker=1)`. This was a controlled fixture;
+   it proves renderer behavior, not OCR quality. Converting HTML tokens to text
+   does not sanitize link schemes.
+3. **Refresh does not force backend recapture.** Actual browser interception
+   observed identical initial/refresh payloads `{url: "https://example.com"}`.
+   Clearing the JavaScript cache leaves the backend's default reuse enabled.
+4. **Profile path escape.** `_profile_storage_state_path(base, "..")` resolves
+   to a sibling of `profiles_root`, rather than inside it. This was a path-only
+   probe; no profile file was written.
+5. **Build/transport claims are configured labels.** Capture aliases `cft` to
+   `chrome`, does not enforce `CFT_VERSION`, does not exercise a configured BiDi
+   selector, and uses a hardcoded Chrome/130 UA. No actual CfT version guard,
+   IntersectionObserver stabilization, or `[aria-busy]` completion exists.
+6. **Tiling distorts geometry and provenance.** Width-only resize leaves height
+   unchanged while the code divides vertical offsets by the horizontal scale.
+   A patterned 2000×2800 image at a 1000 px limit reported offsets
+   `0, 1760, 3520, 3600` for crop cursors `0, 880, 1760, 1800`. The last reported
+   offsets exceed the source height. DPR/CSS/screenshot coordinate conventions
+   must also be reconciled. Whole-tile highlights are not sentence bounding boxes.
+7. **Missing/global job routes fail.** `/jobs/absent` and `/jobs/stream` return
+   500; the static stream is shadowed by `/jobs/{job_id}` and the snapshot handler
+   calls `.get()` on `None`. The global subscriber is not fed by `_broadcast`.
+8. **Job status does not survive process restart.** A new process sees the real
+   persisted RunRecord and serves its Markdown/links, but snapshot is `None` and
+   `/jobs/<completed-id>` returns 500. Default four-worker deployment compounds
+   this process-local state problem.
+9. **Artifact discovery is empty for a real completed job.** `/artifacts`
+   returns `artifact_root=""`, `file_count=0`, despite files on disk. Its handler
+   expects fields that CaptureManifest does not write, rather than using Store
+   paths. Delete/prune also assume a nonexistent record root and swallow errors;
+   no delete/prune operation was executed in this audit.
+10. **Cache operations and accounting are incomplete.** Invalidation/clear
+    call missing Store methods and return success-shaped no-ops. Metrics report
+    cache disabled; listing counts a fresh job as a hit merely because it has a
+    cache key. Cache seed omits semantic-post settings/profile-state revisions
+    and cannot identify an actually changed browser build.
+11. **Retrieval is incomplete and tied scores crash.** Captures do not
+    automatically embed sections. Manual re-embedding through the real API works.
+    Two identical stored vectors reproduce `TypeError: '<' not supported between
+    instances of 'EmbeddingMatch' and 'EmbeddingMatch'`. Fixed 1536-dimensional
+    storage conflicts with a 384-dimensional optional backend. The default
+    position-sensitive hash projection does not prove learned semantic retrieval.
+12. **Progress and workers are disconnected.** Real events were snapshots plus
+    post-completion OCR telemetry; JobManager remains CAPTURING until its runner
+    returns. `/jobs` does not use Arq. The worker calls nonexistent `_process_job`,
+    and its launcher awaits synchronous `arq.run_worker` inside an active loop.
+    Priority consumers and sorted-set queue metrics also require correction.
+13. **Policies are silently dropped.** The CLI's nested OCR object and several
+    batch/crawl/replay `ocr_policy` arguments are not declared by JobCreateRequest.
+    There is no runtime `docs/models.yaml` loader. Semantic/embedding configuration
+    bypasses the exclusive decouple settings contract.
+    The real `submit_and_wait_for_job` crawl bridge also reads
+    `snapshot["job_id"]`, while real JobManager snapshots return `id`. A controlled
+    real-JobManager probe with the capture runner deliberately blocked reproduced
+    `KeyError: 'job_id'` before capture. This proves the adapter mismatch, not a
+    successful crawl; the replacement runner performed no browser/OCR work.
+14. **Deployment/bootstrap is unqualified.** Docker creates a directory at the
+    default DB file path, installs bundled Chromium while capture asks for Chrome,
+    and omits runtime curl used by Compose healthchecks. K8s cache `emptyDir`
+    volumes are per-pod. The installer rewrites existing `.env` values. README's
+    `mdwb demo stream` is an API client, not a server launcher. These are source
+    findings; no external deployment or destructive installer run was performed.
+
+Playwright's official [browser launcher documentation](https://playwright.dev/python/docs/api/class-browsertype)
+separates browser launch from explicit CDP connection. The official
+[Arq worker source](https://arq-docs.helpmanual.io/_modules/arq/worker) confirms
+sorted-set queue handling. These references were checked to avoid treating
+configured protocol labels or an incorrect queue abstraction as implementation.
+
+## Vision coverage and bridge
+
+`PARTIAL` means real implementation exists with an identified missing/broken
+contract. `UNPROVEN` means the required qualification was not obtained.
+`NOT_STARTED` refers to integration in this repository, not whether another
+project's binary happens to be installed on the host. Every unresolved goal had
+**no active bead** at audit start, even where a historical closed issue named it.
+
+New epic: **`markdown_web_browser-7ru`**. Child numbers below are real issue IDs
+(`markdown_web_browser-7ru.<number>`), created exclusively with `br`.
+Every implementation issue embeds its background, exact scope, acceptance,
+meaningful tests, negative cases, logging expectations, and closure boundary.
+
+| Goal / measuring stick | Current status and evidence | Bridge children |
+|---|---|---|
+| 1. Real URL → screenshot → OCR → persisted Markdown | Working on the real local fixture; corpus fidelity incomplete | 6, 18 |
+| 2. CfT build pin, actual transport, Playwright ≥1.50, deterministic context | PARTIAL: version is falsely labeled; transport copied | 3, 18 |
+| 3. Complete lazy/SPA/virtualized capture, bounded shrink retries | PARTIAL: fixed settle, no observer/busy guard; duplicate retries possible | 4, 18 |
+| 4. ≤1288 px, aspect-preserving tiles and accurate DPR/offsets | PARTIAL: capped size but distorted geometry and wrong offsets | 5, 18 |
+| 5. Clean Markdown, safe tables/code/math seams, computed SSIM | PARTIAL: text/hash dedup exists; no actual SSIM; provider scaffolding leaks | 6, 18 |
+| 6. Per-block provenance and usable highlights | PARTIAL: whole-tile hashes/links exist; geometry incorrect; no sentence boxes | 5, 6, 30 |
+| 7. DOM anchors/forms/headings/meta/landmarks and Links Appendix/deltas | PARTIAL: persisted links work; Markdown appendix missing | 6, 18 |
+| 8. Declared OCR policies, real local/remote failover, quotas | PARTIAL: genuine adapters/autotune exist; options/YAML drift; local live parity unproven | 7, 18, 21 |
+| 9. Real partial progress, SSE/NDJSON/global feeds and webhooks | PARTIAL: per-job feeds exist; global route broken; intermediate progress absent | 8, 17, 19 |
+| 10. Cancellation, timeouts, shutdown, retry and bounded admission | PARTIAL: local watchdog exists; durable cancellation/crash proof missing | 8, 9, 19 |
+| 11. Durable queue, worker priorities, restart and multi-replica access | PARTIAL: Arq module exists but API bypasses it | 9, 19 |
+| 12. Effective-input cache, freshness, forced refresh, invalidation and metrics | PARTIAL: live repeat hit works; controls/accounting incomplete | 2, 10, 19 |
+| 13. Real artifact inventory, bundles, replay and safe retention | PARTIAL: files work; inventory wrong; replay restores only limited options | 7, 11, 19 |
+| 14. Authenticated API, rate limits, ownership/profile privacy | PARTIAL: modules unattached; profile path escape | 1, 17 |
+| 15. Async task-owned storage and responsive expensive work | PARTIAL: sync DB/HTTP/file operations remain in async handlers | 15, 19 |
+| 16. Automatic useful section retrieval and jump-to-source | PARTIAL: manual upload/search exists; no automatic indexing; tie crash | 12, 20 |
+| 17. Browser navigation/raw/rendered/cache/auth UX | PARTIAL: implemented UI; unsafe links and false refresh | 2, 17 |
+| 18. Complete discoverable CLI/API/batch/crawl/agent workflows | PARTIAL: broad surfaces exist and tests pass; real-contract omissions remain | 7, 8, 16, 20, 30 |
+| 19. Optional semantic editing that preserves support/provenance | PARTIAL: real HTTP adapter exists; configuration/quality/replay proof incomplete | 6, 7, 10, 20 |
+| 20. Clean installation, locked Python3.13, runnable container/worker topology | PARTIAL: uv environment works; bootstrap/deployment defects remain | 13, 14 |
+| 21. Strict full tests and genuinely generated fresh E2E | UNPROVEN/red: 537 pass, one fail; type/format red; generated skipped | 13, 17–20 |
+| 22. Production p95 8/25/45 s, weekly SLOs, real48h smoke and quota<80% | UNPROVEN: stale/empty pointers; no weekly summary; single fixture41.936s | 21, 22 |
+| 23. 95%+ OCR accuracy, protected sites, repeat determinism, throughput claims | UNPROVEN: no independent representative qualification | 16, 18, 21 |
+| 24. Shipped service, gallery, licensed25-site dataset and hands-on sandbox | UNPROVEN: templates/docs are not current deployment/corpus proof | 16, 21 |
+| 25. Verified Franken capabilities, pinned versions and real doctor | NOT_STARTED in this integration | 23 |
+| 26. Asupersync runtime/IPC/cancellation tree and streaming event bus | NOT_STARTED: no Rust workspace or child bridge | 24, 31 |
+| 27. focr batch adapter, measured quality and paired speed evidence | NOT_STARTED: no adapter | 25, 31 |
+| 28. FrankenSQLite migration/concurrent writers/index.fdb | NOT_STARTED: current store is stdSQLite | 26, 31 |
+| 29. Frankensearch hybrid/global search/search.idx | NOT_STARTED: current retrieval is Python scans | 27, 31 |
+| 30. fmd HTML/PDF exports and safe Browser preview | NOT_STARTED: no fmd integration | 28, 31 |
+| 31. FrankenTUI Jobs/Tiles/Search/Events/OCR and headless actions | NOT_STARTED | 29, 31 |
+| 32. Canonical agent envelope/capture/search/summarize/todos/extract/cite/watch/doctor | PARTIAL: existing helpers; umbrella/envelope/span grounding absent | 30, 31 |
+| 33. Franken tiles.manifest.jsonl/index.fdb/search.idx/export bundle parity | NOT_STARTED | 24–28, 31 |
+| 34. Optional bookmarks/tabs/offline/dark/reading/TOC/find/print/adblock/OTel | Largely NOT_STARTED; deliberately separate from required core repair | 32, deferred |
+
+Before this audit, implementing every open/in-progress bead would have changed
+nothing: there were none. The 32 IDs listed in `HANDOFF_FRANKEN_REVAMP.md` are
+absent from the live graph. Historical closed beads `t5j`, `t82`, `to1`, `tkq`,
+`hki`, and `esu` name relevant intentions but their closure notes do not establish
+the current acceptance outcomes. The new graph covers the mandatory gaps and
+retains optional work explicitly; completing code tasks without their proof and
+qualification gates would still leave the project short of the vision.
+
+## Work order and acceptance boundaries
+
+1. **Immediate product blockers:** `.1` auth/rates/profile isolation and `.2`
+   rendering/refresh. Independently ready `.3` actual browser identity, `.5`
+   geometry, `.7` policies, `.8` lifecycle and `.13` verification foundation can
+   proceed on narrowly reserved files.
+2. **Complete the core pipeline:** `.4` stabilization → `.6` output fidelity;
+   `.8` lifecycle + `.7` policy → `.9` durable queue; `.3` browser + `.7` policy →
+   `.10` cache → `.11` artifacts; `.7` + `.5` → `.12` retrieval; `.8` → `.15`
+   async storage. `.14` deployment follows real queue/browser behavior.
+3. **Prove public use:** `.17` security/UI, `.18` capture/fidelity, `.19`
+   restart/cache/artifacts, and `.20` retrieval/CLI are companion proof beads.
+   Their scenarios use the real Store and public routes, independently chosen
+   oracles, and discriminating negative controls. Tests also ship with repairs.
+4. **Qualify original vision:** `.21` real rolling production/corpus evidence,
+   `.16` truthful executable documentation, and `.13` strict checks gate `.22`.
+   This requires the original four readiness conditions and explicit per-goal
+   verdicts; synthetic data, skipped guards and a one-page probe do not qualify.
+5. **Deliver additional Franken vision:** `.23` verifies actual APIs before
+   `.24` runtime, `.25` focr, `.26` storage, `.27` search, `.28` rendering,
+   `.29` TUI, and `.30` agent contracts. `.31` requires their real integration,
+   artifacts/verbs, same-invocation incumbent comparisons and live rollout proof.
+   Python-only success does not establish this gate.
+
+The epic depends on both `.22` and `.31`. Optional `.32` remains deferred and
+must not compete with P0/P1 repairs. No issue in this bridge was marked complete.
+
+### Ambition and refinement record
+
+Two ambition reviews expanded the first repair-only outline. The first added
+independent public E2E proofs and measured corpus/deployment qualification. The
+second retained all Franken goals, replaced assumptions about upstream APIs with
+real capability probes, and required coherent storage/index/event identities,
+bounded cancellation and same-invocation quality/performance comparisons. These
+are concrete acceptance requirements in the beads, not claimed results.
+
+The exact frozen bead-generation and refinement prompts from the skill are
+embedded in `markdown_web_browser-7ru`. Five subsequent review passes cover
+completeness, dependency/order optimality, test/oracle discrimination, effective
+configuration/data identity, and final coherence. A sixth fresh review checks
+convergence after the crawl-bridge contract refinement. The corrections and
+validation are recorded in the epic's comments. Any still-red product gate stays
+red; plan refinement does not count as implementing it.
+
+## Readiness and next decision
+
+The four required capture/OCR readiness checks are currently **not satisfied**:
+48-hour real green smoke is not evidenced; weekly budgets cannot be evaluated
+without the missing summary; genuine generated E2E is skipped/unimplemented;
+hosted usage below80% is unknown (`ocr_quota.limit/used` were null in the live run).
+Actual current deployment revision and a real hosted sandbox were not verified.
+
+Read-only GitHub checks also found no published GitHub releases. The latest
+listed [full CI run](https://github.com/Dicklesworthstone/markdown_web_browser/actions/runs/28560714218)
+failed on 2026-07-02, and the latest listed
+[nightly smoke](https://github.com/Dicklesworthstone/markdown_web_browser/actions/runs/32328124583)
+failed on 2026-08-20. Both refer to older SHA
+`01b01feac6da4330626645804b22bbc1202a8ce0`, not this audit's source SHA. Recent
+successful dependency-update workflows are not current full-CI or real-smoke
+qualification. These observations do not establish whether an unlisted external
+service or container deployment exists.
+
+The highest-value next work is to fix auth/rendering and truthful capture
+geometry/build identity, then wire durable/public contracts and prove fidelity.
+More surface commands or a wholesale Rust rewrite cannot substitute for those
+repairs. The Franken integrations can be built against verified boundaries while
+core qualification remains explicit. Release readiness requires the named gates,
+not the number of closed tasks.
+
+---
+
+# Historical Project Status Audit - November 2024
 
 ## Executive Summary
 

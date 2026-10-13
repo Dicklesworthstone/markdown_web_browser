@@ -1,5 +1,14 @@
 # HANDOFF — Markdown Web Browser Franken Revamp
 
+> **Current correction (2026-10-13):** The handoff below is historical. Its 32
+> mapped Franken bead IDs are absent from the current tracker, and the checkout
+> has no integrated Rust runtime, focr, FrankenSQLite, Frankensearch, fmd, or TUI.
+> The current reality check and bridge are in `PROJECT_STATUS_AUDIT.md` and live
+> epic `markdown_web_browser-7ru`. Children `.23`–`.31` track the Franken work;
+> `.1`–`.22` track core repairs and qualification. Core Python success does not
+> establish the additional Franken vision. None of the new implementation or
+> qualification beads is complete.
+
 > **Status (2026-08-29):** Plan written, 32 beads created and wired, 0
 > cycles. Foundation bead `markdown_web_browser-mtg` is the top
 > `bv --robot-triage` pick. Implementation can begin.
