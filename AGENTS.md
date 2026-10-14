@@ -161,9 +161,14 @@ If you see errors, **carefully understand and resolve each issue**. Read suffici
 
 After capture-facing changes, also run:
 ```bash
-uv run playwright test tests/smoke_capture.spec.ts
+uv run --python 3.13 pytest tests/test_full_capture.py tests/test_scroll_policy.py tests/test_browser_ui.py -x
 ```
-This confirms Playwright 1.50+ screenshot APIs still freeze animations under the pinned CfT label/build and whichever transport (CDP/BiDi) was exercised.
+These tests execute native Python Playwright and pyvips to verify animation freezing,
+viewport sweeps, masks, and safe viewer behavior. Record the observed browser build.
+They do not establish CfT pin or BiDi qualification; those require the separate
+browser-build/transport acceptance probes. The Python Playwright CLI has no `test`
+subcommand. `scripts/run_checks.sh` includes these tests in the full Python suite
+and fails if its required browser or libvips preflight fails.
 
 ---
 

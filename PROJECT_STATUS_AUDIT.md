@@ -416,6 +416,29 @@ qualified; do not create a competing plan.
   - [ ] Prove configured backend execution, failover identity and every remaining
     policy/cache/config acceptance condition. Keep disabled adapters disabled.
 - `.8` lifecycle:
+  - [x] Add an append-only SQLite event journal with atomic job/owner sequence
+    allocation and durable owner namespaces. Runtime publishes after commit,
+    with1024 pending entries,128 per-subscriber slots and500 replay entries.
+  - [x] Restore identical per-job/global suffixes in fresh managers and two cold
+    TCP API processes; observe another process's committed update by idle polling.
+    This is real API/SQLite proof with fixture capture text, not OCR quality.
+  - [x] Refuse foreign/future/expired cursors; retain cancellation across the
+    terminal run/event crash window and append one explicitly labeled current
+    terminal observation when its run write outlived the missing event commit.
+    Concurrent recovery does not duplicate the observation or earlier stages.
+  - [x] Gate publication on actual commit; reject bounded pending overflow,
+    preserve missing/purged result refusal and return typed503 for journal read
+    or admission failures. Four competing writers allocate48 dense sequences.
+  - [x] Keep all five job/event routes404 in anonymous operator mode; fix the
+    previously unhandled KeyError on `/jobs/{id}/raw`.
+  - [ ] Complete final strict/native/scanner checks and losing mutants for this
+    journal continuation. Current focused checkpoint:156 passes plus8 new
+    recovery/fault/cold-process cases and one anonymous-route check, with source
+    changes between these scoped runs; a frozen full wrapper is now running.
+  - [ ] Keep failover progress, durable job admission/requeue/worker recovery,
+    wider storage migration and exact-revision independent qualification open.
+    Event replay does not restart interrupted capture work. Historical journal
+    storage/purge policy remains `.11`; active replay remains500 entries.
   - [x] Report real capture/OCR/stitch/persistence stages and batch progress;
     connect owner-filtered bounded global and per-job subscriptions.
   - [x] Persist cancellation after allocation, prevent late success, clean tasks
@@ -455,7 +478,7 @@ qualified; do not create a competing plan.
     Keep CANCELLED even when that writer subsequently fails; its failure is
     retained as the cancellation cause. Four real SQLite/filesystem barrier
     cases pass, and inline-write/old-cancellation-error mutants fail.
-  - [ ] Complete failover progress and persistent restart replay, then bind
+  - [ ] Complete failover progress and qualify persistent restart replay, then bind
     all original lifecycle criteria to fresh revision-bound evidence. Thread
     writes cannot be forcibly stopped; a shutdown deadline reports pending work
     honestly. Durable queue remains `.9`; wider storage/embedder offloading and
@@ -726,6 +749,15 @@ SHA256 `04e06833bd1d45810a00018b316dfc64a7a33255f81e864c9a36c3780ab822f2`).
 Missing executable, mismatched build and BiDi-only configurations were rejected.
 
 ### Root anti-ceremony inventory — implementation window 2026-10-13
+
+Current journal continuation integrity control: the operator and `.8` acceptance
+review consume the minimal source input receipt; it gates citing full checks for
+the actual uncommitted bytes. Prior scoped checks preceded later recovery/error
+changes, so stale proof subject is an observed risk. Retire its active role after
+committed/reviewed qualification, retaining historical evidence. HEAD alone and
+tracked-only diffs miss these inputs;148 path/digest pairs are the smallest
+existing reliable control. The journal/cursor tables themselves are FEATURE:
+API/UI runtime branches on committed rows. No new process framework is needed.
 
 **Later lifecycle continuation (UTC2026-10-14):** bounded to the six runtime/test
 inputs changed since the preceding148-input receipt, the actual commands below

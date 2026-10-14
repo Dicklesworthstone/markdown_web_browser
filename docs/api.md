@@ -53,6 +53,60 @@ Retry-After: 30
 
 ## Endpoints
 
+### Job event cursors
+
+`GET /jobs/{id}/events` streams NDJSON entries with a per-job `sequence`.
+Reconnect with `?after=<last sequence received>` to resume strictly after that
+entry. `?after=-1` requests history from the first entry. `?since=<ISO timestamp>`
+is a timestamp filter; use the sequence cursor for exact reconnection.
+`GET /jobs/{id}/events.json` returns the same retained entries in one response.
+Unknown jobs return 404. Invalid cursors return 400/422; expired or future cursors
+return 409 with `code: event-history-gap`, the available sequence range and the
+job snapshot URL to reload.
+
+History retains 500 events and each subscription queues at most 128. The stream
+replays a subscriber's missed entries while they remain in history. If they have
+expired, it emits an `event: gap` NDJSON entry and closes, so clients can reload
+the snapshot instead of silently losing progress. Canonical entries and both
+cursor sequences are stored atomically in SQLite before publication. Reopening
+the API preserves the same IDs and replays the same retained suffix. The active
+replay window remains500 entries; older journal rows are retained as storage,
+with retention/purge policy still pending. No history is regenerated for results
+created before journaling. SSE can display their current stored result without
+issuing a fabricated sequence ID.
+
+`GET /jobs/{id}/stream` uses the same event history and replay rules. Supply
+`?after=<sequence>` or the native EventSource `Last-Event-ID` header (the header
+takes precedence on reconnect). Each entry sends its HTML progress and, for
+DONE, Markdown first; the final `job-event` frame carries the canonical JSON
+entry and `id: <sequence>`. A disconnect before this final frame replays the
+entire update. Heartbeats do not advance the cursor. Expiration returns 409
+before streaming, or an SSE `gap` event followed by closure during streaming.
+
+`GET /jobs/stream` streams canonical JSON entries across this owner's jobs.
+Its SSE ID is an opaque owner-scoped cursor; supply it unchanged as
+`Last-Event-ID` or `?after=<cursor>`. A new subscription starts at the current
+tail, then receives live events; reconnect replays strictly after the ID.
+Each owner retains up to 500 entries, independently of other owners' traffic.
+Cursors from another owner, expired history or a future position return409;
+malformed cursors return400. A valid cursor survives process restart. A bounded subscriber recovers drops from retained history
+or receives an explicit `gap`. Reload `/jobs` after a gap. The dashboard event
+panel also reconnects NDJSON by sequence rather than timestamp.
+
+Both transports poll committed history every second while idle, so another
+process writing to the same database is observed without needing a reconnect.
+The writer admits at most1024 pending events; each subscriber queues at most128.
+Storage failure returns503 with `code: event-journal-unavailable` before a feed
+opens, or an `error` entry followed by closure after streaming has started.
+Uncommitted events never advance a client cursor.
+
+A crash after a terminal run write but before its event commit is reconciled
+under the same SQLite write lock. The journal records one new current snapshot
+with `data.reason: terminal-record-recovery`; it does not invent missing earlier
+stages. An already acknowledged cancellation/failure reconciles the run's
+terminal status without duplicating its event. Durable job admission, requeueing
+interrupted captures and worker recovery remain separate unfinished queue work.
+
 ### Health Check
 
 ```http

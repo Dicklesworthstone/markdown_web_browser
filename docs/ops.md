@@ -13,16 +13,14 @@ uv run python scripts/run_smoke.py \
   --http2 \
   --poll-interval 1.0 \
   --timeout 900 \
-  --seed 0 \
   --category docs_articles \
   --category dashboards_apps
 ```
 
-- Add `--dry-run` when you want to exercise the pipeline without hitting `/jobs`
-  (useful before the API is live or when secrets are unavailable). Pair it with
-  `--seed <int>` (defaults to 0) so synthetic manifests remain deterministic.
-  Dry runs still write manifests, summary markdown, and weekly stats so downstream
-  tooling can be tested.
+- Add `--dry-run` to preview the selected URLs and latency budgets. It makes no
+  API calls and writes no manifests, history, pointers or weekly statistics.
+  Historical synthetic captures are retained on disk and excluded from real
+  production aggregation. A preview does not establish smoke readiness.
 - Use `--category <name>` (repeatable) to scope the run to specific categories from
   `benchmarks/production_set.json`. This is useful when a particular slice is flaky
   and you want to rerun it without exercising the entire set.
@@ -64,7 +62,7 @@ uv run python scripts/run_smoke.py \
 - For production-style tests or deployments, disable reload and bump workers: `SERVER_IMPL=granian UVICORN_RELOAD=false HOST=0.0.0.0 PORT=8000 scripts/dev_run.sh --workers 4 --granian-runtime-threads 2`. The manifest’s `environment.server_runtime` and the SQLite `runs` table will reflect the choice so cache hits/logs clearly show which runtime handled each job.
 
 ### Verification Checklist
-1. `scripts/run_checks.sh` (ruff → ty → targeted pytest suite → Playwright smoke) passes before the smoke run. The script accepts `PLAYWRIGHT_BIN=/path/to/runner` when you need to invoke the Node-based Playwright test harness; otherwise it prefers `npx playwright test --config=playwright.config.mjs` and falls back to `uv run playwright test`. When libvips isn’t installed, set `SKIP_LIBVIPS_CHECK=1` to bypass the preflight until the dependency can be installed. The bundled pytest step now covers the CLI suites, `scripts/show_latest_smoke.py` (env-root + pointer/weekly variants), `scripts/update_smoke_pointers.py` (weekly-source guard), the store/manifest persistence tests (`tests/test_store_manifest.py`, `tests/test_manifest_contract.py`), and the Prometheus CLI health checks (`tests/test_check_metrics.py`) so regressions surface before captures run. Each run writes `tmp/pytest_report.xml` (`PYTEST_JUNIT_PATH`) and `tmp/pytest_summary.json` (`PYTEST_SUMMARY_PATH`) so ops/CI can read the failing test list without re-running pytest.
+1. `scripts/run_checks.sh` passes before the smoke run. It runs Ruff lint/format checks, ty against the Python 3.13 project environment, mandatory browser/libvips preflight, and all of `tests/`, including native Playwright capture and viewer tests. Missing browsers or libvips fail the run. The Python Playwright CLI has no `test` subcommand; the old fallback did not execute smoke coverage. Each run writes `tmp/pytest_report.xml` (`PYTEST_JUNIT_PATH`) and `tmp/pytest_summary.json` (`PYTEST_SUMMARY_PATH`). Browser pin/transport qualification and fresh generated-output quality remain separate acceptance gates; a fixture or skipped generated suite does not establish either.
 2. Playwright CLI runs inherit the same Chrome for Testing defaults as the capture stack. Leave `PLAYWRIGHT_CHANNEL` at `cft` (or omit it entirely) so local smoke runs match production; only set `PLAYWRIGHT_CHANNEL=chromium` when CfT binaries are unavailable on the host. You can specify a comma-separated preference (e.g., `PLAYWRIGHT_CHANNEL="cft,chromium"`) to document the fallback order. The transport behaves the same way: keep `PLAYWRIGHT_TRANSPORT=cdp` unless you opt into WebDriver BiDi (`PLAYWRIGHT_TRANSPORT="bidi,cdp"`).
 2. Each category report stays below its p95 latency budget (see `manifest_index.json`).
 3. Failures must be triaged immediately; rerun `scripts/olmocr_cli.py run` on the
