@@ -56,7 +56,7 @@ jobs:
           cft_archive="$RUNNER_TEMP/chrome-for-testing-$cft_build-linux64.zip"
           cft_dir="$HOME/.cache/mdwb/cft/$cft_build"
           curl --fail --location --retry 3 \
-            --user-agent "OpenAI File Downloader, XaiImageApiFetch/1.0" \
+            --user-agent "mdwb (+https://github.com/Dicklesworthstone/markdown_web_browser)" \
             "https://storage.googleapis.com/chrome-for-testing-public/$cft_build/linux64/chrome-linux64.zip" \
             --output "$cft_archive"
           printf '%s  %s\n' \
