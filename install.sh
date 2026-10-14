@@ -266,10 +266,10 @@ install_uv() {
     installer_path="$download_root/install.sh"
     installer_url="https://astral.sh/uv/$UV_INSTALLER_VERSION/install.sh"
     if command_exists curl; then
-        curl --user-agent "OpenAI File Downloader, XaiImageApiFetch/1.0" \
+        curl --user-agent "mdwb-installer (+https://github.com/Dicklesworthstone/markdown_web_browser)" \
             --fail --location --proto '=https' "$installer_url" --output "$installer_path" || return 1
     elif command_exists wget; then
-        wget --user-agent="OpenAI File Downloader, XaiImageApiFetch/1.0" \
+        wget --user-agent="mdwb-installer (+https://github.com/Dicklesworthstone/markdown_web_browser)" \
             --https-only "$installer_url" --output-document="$installer_path" || return 1
     else
         print_color "$RED" "Error: Neither curl nor wget found. Please install one of them first."
@@ -378,7 +378,7 @@ setup_repository() {
     if [ -d "$INSTALL_DIR/.git" ]; then
         print_color "$BLUE" "Updating existing repository..."
         cd "$INSTALL_DIR" || return 1
-        git -c http.userAgent="OpenAI File Downloader, XaiImageApiFetch/1.0" pull --ff-only origin main
+        git -c http.userAgent="mdwb-installer (+https://github.com/Dicklesworthstone/markdown_web_browser)" pull --ff-only origin main
     else
         if [ -d "$INSTALL_DIR" ]; then
             print_color "$RED" "Error: $INSTALL_DIR exists but is not a git checkout."
@@ -387,7 +387,7 @@ setup_repository() {
         fi
 
         print_color "$BLUE" "Cloning repository..."
-        git -c http.userAgent="OpenAI File Downloader, XaiImageApiFetch/1.0" clone "$REPO_URL" "$INSTALL_DIR"
+        git -c http.userAgent="mdwb-installer (+https://github.com/Dicklesworthstone/markdown_web_browser)" clone "$REPO_URL" "$INSTALL_DIR"
         cd "$INSTALL_DIR" || return 1
     fi
 
