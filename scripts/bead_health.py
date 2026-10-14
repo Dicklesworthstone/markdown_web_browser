@@ -6,6 +6,7 @@ distribution (oldest, median, p95 days), and bead-issue-type breakdown.
 
 This is the file the ``/health/beads`` endpoint reads.
 """
+
 from __future__ import annotations
 
 import json
