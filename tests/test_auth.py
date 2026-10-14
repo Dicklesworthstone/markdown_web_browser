@@ -327,7 +327,7 @@ uvicorn.Server(uvicorn.Config(main.app, log_level='warning', lifespan='on')).run
     }
     headers = {
         "X-Research-Key": alice,
-        "User-Agent": "OpenAI File Downloader, XaiImageApiFetch/1.0",
+        "User-Agent": "mdwb (+https://github.com/Dicklesworthstone/markdown_web_browser)",
     }
     cursor = original[1]["sequence"]
     expected = original[2:]

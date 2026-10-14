@@ -513,7 +513,7 @@ def test_metrics_key_uses_custom_header_only_for_api(monkeypatch):
     assert requests[0].headers["X-Research-Key"] == "fixture-secret"
     assert "X-Research-Key" not in requests[1].headers
     assert all(
-        request.headers["User-Agent"] == "OpenAI File Downloader, XaiImageApiFetch/1.0"
+        request.headers["User-Agent"] == "mdwb (+https://github.com/Dicklesworthstone/markdown_web_browser)"
         for request in requests
     )
     assert "fixture-secret" not in result.output

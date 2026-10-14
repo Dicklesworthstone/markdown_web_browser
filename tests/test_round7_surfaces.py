@@ -523,7 +523,7 @@ def test_cli_credentials_not_sent_outside_api_origin_or_mount(tmp_path: pathlib.
             assert client.timeout.read == 3.0
             inside = client.get("/inside")
             assert inside.json()["authorization"] == "Bearer fixture-key"
-            assert inside.json()["user_agent"] == "OpenAI File Downloader, XaiImageApiFetch/1.0"
+            assert inside.json()["user_agent"] == "mdwb (+https://github.com/Dicklesworthstone/markdown_web_browser)"
             assert client.get(first + "/elsewhere").json()["authorization"] is None
             assert client.get(outside).json()["authorization"] is None
             assert client.get("/redirect", follow_redirects=True).json()["authorization"] is None

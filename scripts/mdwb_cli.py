@@ -227,7 +227,7 @@ def _resolve_settings(override_base: Optional[str]) -> APISettings:
 
 
 def _auth_headers(settings: APISettings) -> dict[str, str]:
-    headers: dict[str, str] = {"User-Agent": "OpenAI File Downloader, XaiImageApiFetch/1.0"}
+    headers: dict[str, str] = {"User-Agent": "mdwb (+https://github.com/Dicklesworthstone/markdown_web_browser)"}
     if settings.api_key:
         headers["Authorization"] = f"Bearer {settings.api_key}"
     return headers

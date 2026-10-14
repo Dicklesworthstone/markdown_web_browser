@@ -164,9 +164,7 @@ async def browser_page(ui_server):
     base, _ = ui_server
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(channel="chrome", headless=True)
-        context = await browser.new_context(
-            user_agent="OpenAI File Downloader, XaiImageApiFetch/1.0"
-        )
+        context = await browser.new_context()
         page = await context.new_page()
         errors = []
         page.on("pageerror", lambda error: errors.append(str(error)))
@@ -407,9 +405,7 @@ async def test_authenticated_browser_uses_real_api_cookie_and_private_cache(tmp_
         base = f"http://127.0.0.1:{port}"
         async with async_playwright() as playwright:
             browser = await playwright.chromium.launch(channel="chrome", headless=True)
-            context = await browser.new_context(
-                user_agent="OpenAI File Downloader, XaiImageApiFetch/1.0"
-            )
+            context = await browser.new_context()
             page = await context.new_page()
 
             async def local_only(route):
@@ -503,7 +499,6 @@ async def test_authenticated_browser_uses_real_api_cookie_and_private_cache(tmp_
                     == 0
                 )
                 other = await browser.new_context(
-                    user_agent="OpenAI File Downloader, XaiImageApiFetch/1.0",
                     extra_http_headers={settings.API_KEY_HEADER: bob},
                 )
                 try:

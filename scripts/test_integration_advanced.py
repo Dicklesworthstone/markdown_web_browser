@@ -160,7 +160,7 @@ class AdvancedIntegrationTester:
         self.console = Console(width=160, record=True)
         self.settings = get_settings()
         cfg = load_config(self.settings.env_path)
-        self.headers = {"User-Agent": "OpenAI File Downloader, XaiImageApiFetch/1.0"}
+        self.headers = {"User-Agent": "mdwb (+https://github.com/Dicklesworthstone/markdown_web_browser)"}
         api_key = cfg("MDWB_API_KEY", default="")
         if api_key:
             self.headers[self.settings.API_KEY_HEADER] = api_key

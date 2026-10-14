@@ -627,7 +627,7 @@ def test_fixture_listener_serves_actual_bytes_and_stops():
         with httpx.Client(
             trust_env=False,
             timeout=2,
-            headers={"User-Agent": "OpenAI File Downloader, XaiImageApiFetch/1.0"},
+            headers={"User-Agent": "mdwb (+https://github.com/Dicklesworthstone/markdown_web_browser)"},
         ) as client:
             response = client.get(url)
             assert response.status_code == 200 and response.content == data

@@ -256,7 +256,7 @@ async def test_full_integration_artifact_gate(
     def handle(request: httpx.Request) -> httpx.Response:
         requested.append(request.url.path)
         assert request.headers["X-Research-Key"] == "fixture-secret"
-        assert request.headers["User-Agent"] == "OpenAI File Downloader, XaiImageApiFetch/1.0"
+        assert request.headers["User-Agent"] == "mdwb (+https://github.com/Dicklesworthstone/markdown_web_browser)"
         name = request.url.path.rsplit("/", 1)[-1]
         if name == missing:
             return httpx.Response(404)

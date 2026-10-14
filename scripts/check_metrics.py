@@ -57,7 +57,7 @@ def _default_exporter_port(cfg: DecoupleConfig) -> int:
 
 def _probe(metrics_url: str, timeout: float, *, headers: Mapping[str, str] | None = None) -> float:
     start = time.perf_counter()
-    request_headers = {"User-Agent": "OpenAI File Downloader, XaiImageApiFetch/1.0"}
+    request_headers = {"User-Agent": "mdwb (+https://github.com/Dicklesworthstone/markdown_web_browser)"}
     if headers:
         request_headers.update(headers)
     with httpx.Client(timeout=timeout, headers=request_headers) as client:

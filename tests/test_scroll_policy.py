@@ -31,7 +31,6 @@ async def browser_context(record_property) -> AsyncIterator[BrowserContext]:
             device_scale_factor=1,
             color_scheme="light",
             reduced_motion="reduce",
-            user_agent="OpenAI File Downloader, XaiImageApiFetch/1.0",
         )
         try:
             yield context
@@ -89,7 +88,7 @@ async def test_real_viewport_sweeps_reach_content_and_obey_budget(
     assert hits == {}
     assert failures == []
     assert dom is not None and b"band-0" in dom
-    assert user_agent == "OpenAI File Downloader, XaiImageApiFetch/1.0"
+    assert "Chrome/" in user_agent  # the browser reports its own User-Agent
     assert {(marker["tile_index"], marker["position"]) for marker in markers} == {
         *((index, "bottom") for index in range(len(tiles))),
         *((index, "top") for index in range(1, len(tiles))),

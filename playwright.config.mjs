@@ -96,7 +96,6 @@ const sharedUse = {
   viewport: { width: viewportWidth, height: viewportHeight },
   deviceScaleFactor,
   colorScheme,
-  userAgent: 'OpenAI File Downloader, XaiImageApiFetch/1.0',
   launchOptions,
   actionTimeout,
   navigationTimeout,
