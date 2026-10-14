@@ -1,149 +1,140 @@
 #!/usr/bin/env python3
-"""
-Test script to verify browser capture functionality.
-This tests whether the core browser automation works.
-"""
+"""Local native browser/capture smoke; excludes hosted OCR and CfT qualification."""
 
-import asyncio
-import sys
+import hashlib
+from dataclasses import replace
+from importlib import metadata
 from pathlib import Path
 
-# Add app directory to path
-sys.path.insert(0, str(Path(__file__).parent))
+import pyvips
+import pytest
+from playwright.async_api import async_playwright
 
+import app.capture as capture_module
 from app.capture import CaptureConfig, capture_tiles
+from app.tiler import TileSlice
 
 
-async def test_basic_capture():
-    """Test basic browser capture with a simple URL."""
-    print("Testing browser capture functionality...")
+COLORS = ((230, 20, 30), (20, 210, 40), (20, 80, 220))
 
-    # Create a simple capture config
-    config = CaptureConfig(
-        url="https://example.com",
-        viewport_width=1280,
-        viewport_height=800,  # Smaller for testing
-        device_scale_factor=1,  # Simpler for testing
+
+def _assert_tile_coverage(tiles: list[TileSlice], scroll_height: int) -> None:
+    assert tiles, "Capture tiles missing"
+    assert tiles[0].source_y_offset == 0, "Capture must include the page top"
+    previous_end = 0.0
+    for index, tile in enumerate(tiles):
+        assert tile.index == index
+        assert tile.source_y_offset <= previous_end, "Capture left an uncaptured gap"
+        assert tile.sha256 == hashlib.sha256(tile.png_bytes).hexdigest(), "Tile checksum mismatch"
+        image = pyvips.Image.new_from_buffer(tile.png_bytes, "")
+        assert (image.width, image.height) == (320, 240)
+        assert (tile.width, tile.height) == (image.width, image.height)
+        assert tile.scale == 1.0
+        expected = COLORS[(int(tile.source_y_offset) + 20) // 240]
+        assert tuple(image.getpoint(10, 20)[:3]) == expected, "Known tile pixels absent"
+        previous_end = tile.source_y_offset + tile.height
+    assert previous_end == scroll_height, "Capture must include the page bottom"
+
+
+@pytest.mark.asyncio
+async def test_basic_capture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capture_fixture_url, operator_network_settings
+) -> None:
+    """The native capture pipeline returns complete known content and metadata."""
+    fixture = tmp_path / "capture.html"
+    fixture.write_text(
+        """<!doctype html><html><head><title>Capture smoke fixture</title><style>
+        body { margin: 0; } section { height: 240px; }
+        #top { background: rgb(230, 20, 30); }
+        #middle { background: rgb(20, 210, 40); }
+        #bottom { background: rgb(20, 80, 220); }
+        </style></head><body><section id="top">Top capture section</section>
+        <section id="middle">Middle capture section</section>
+        <section id="bottom">Bottom capture section</section></body></html>""",
+        encoding="utf-8",
     )
+    settings = operator_network_settings
+    capture_settings = replace(
+        settings,
+        browser=replace(
+            settings.browser,
+            playwright_channel="chromium",
+            viewport_overlap_px=60,
+            tile_overlap_px=40,
+            scroll_settle_ms=0,
+            max_viewport_sweeps=12,
+        ),
+    )
+    monkeypatch.setattr(capture_module, "get_settings", lambda: capture_settings)
+    stages: list[str] = []
 
-    try:
-        print(f"Attempting to capture: {config.url}")
-        print(f"Viewport: {config.viewport_width}x{config.viewport_height}")
+    def record_stage(stage: str, done: int | None, total: int | None) -> None:
+        stages.append(stage)
 
-        # Run the capture
-        result = await capture_tiles(config)
+    config = CaptureConfig(
+        url=capture_fixture_url(fixture.read_bytes()),
+        viewport_width=320,
+        viewport_height=240,
+        device_scale_factor=1,
+        long_side_px=320,
+        stage_callback=record_stage,
+    )
+    result = await capture_tiles(config)
 
-        print("✅ Capture successful!")
-        print(f"   - Tiles captured: {len(result.tiles)}")
-        print(f"   - User agent: {result.manifest.user_agent[:50]}...")
-        print(f"   - Capture time: {result.manifest.capture_ms}ms")
-        print(f"   - Total scroll height: {result.manifest.sweep_stats.total_scroll_height}px")
-        print(f"   - Sweep count: {result.manifest.sweep_stats.sweep_count}")
+    _assert_tile_coverage(result.tiles, scroll_height=720)
+    assert len(result.tiles) == 4
+    assert result.manifest.tiles_total == len(result.tiles)
+    assert result.manifest.viewport_width == 320
+    assert result.manifest.viewport_height == 240
+    assert result.manifest.device_scale_factor == 1
+    assert result.manifest.url == config.url
+    assert result.manifest.network_policy["mode"] == "public-plus-server-grants"
+    connections = result.manifest.network_policy["connections_opened"]
+    assert isinstance(connections, int) and connections >= 1
+    assert result.manifest.user_agent
+    assert result.manifest.capture_ms > 0
+    assert result.manifest.playwright_version == metadata.version("playwright")
+    assert result.manifest.playwright_channel == "chromium"
+    assert result.manifest.cft_label and result.manifest.cft_version
+    assert (
+        result.manifest.configured_screenshot_style_hash
+        == capture_settings.browser.screenshot_style_hash
+    )
+    assert len(result.manifest.screenshot_style_hash) == 64
+    assert result.manifest.browser_transport == capture_settings.browser.browser_transport
+    assert result.manifest.sweep_stats.sweep_count == 4
+    assert result.manifest.sweep_stats.total_scroll_height == 720
+    assert result.manifest.validation_failures == []
+    assert stages[0] == "BROWSER_STARTING"
+    assert stages.count("CAPTURING") == 4
+    assert stages.count("TILING") == 4
+    assert stages.count("SCROLLING") == 3
+    assert result.dom_snapshot is not None
+    for content in (b"Top capture section", b"Middle capture section", b"Bottom capture section"):
+        assert content in result.dom_snapshot
 
-        if result.tiles:
-            first_tile = result.tiles[0]
-            print(f"   - First tile: {first_tile.width}x{first_tile.height}px")
-            print(f"   - Tile data size: {len(first_tile.png_bytes)} bytes")
-
-        if result.dom_snapshot:
-            print(f"   - DOM snapshot size: {len(result.dom_snapshot)} bytes")
-
-        # Check for warnings
-        if result.manifest.warnings:
-            print(f"   - Warnings: {len(result.manifest.warnings)}")
-            for warning in result.manifest.warnings:
-                print(f"     - {warning.code}: {warning.message}")
-
-        return True
-
-    except Exception as e:
-        print(f"❌ Capture failed: {e}")
-        import traceback
-
-        traceback.print_exc()
-        return False
-
-
-async def _check_pyvips_available():
-    """Check if pyvips is available for image processing (not a pytest test)."""
-    print("\nTesting pyvips availability...")
-
-    try:
-        import pyvips
-
-        print(
-            f"pyvips is installed (version: {pyvips.version(0)}.{pyvips.version(1)}.{pyvips.version(2)})"
-        )
-        return True
-    except (ImportError, OSError) as e:
-        print(f"pyvips not available: {e}")
-        print("   Install with: sudo apt-get install libvips-dev && pip install pyvips")
-        return False
+    with pytest.raises(AssertionError, match="page bottom"):
+        _assert_tile_coverage(result.tiles[:-1], scroll_height=720)
+    corrupt_tile = replace(result.tiles[0], png_bytes=b"invalid PNG bytes")
+    with pytest.raises(AssertionError, match="Tile checksum mismatch"):
+        _assert_tile_coverage([corrupt_tile, *result.tiles[1:]], scroll_height=720)
 
 
-async def test_playwright_installed():
-    """Test if Playwright browsers are installed."""
-    print("\nTesting Playwright installation...")
-
-    try:
-        from playwright.async_api import async_playwright
-
-        async with async_playwright() as p:
-            # Try to launch browser
-            browser = await p.chromium.launch(headless=True)
-            version = browser.version
+@pytest.mark.asyncio
+async def test_playwright_installed() -> None:
+    """Launch the actual native channel and observe its reported browser build."""
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(channel="chromium", headless=True)
+        try:
+            version_parts = browser.version.split(".")
+            assert len(version_parts) == 4 and all(part.isdigit() for part in version_parts)
+            assert int(version_parts[0]) > 0
+            playwright_version = metadata.version("playwright")
+            assert tuple(int(part) for part in playwright_version.split(".")[:2]) >= (1, 50)
+            print(f"Native Chromium={browser.version}; Playwright={playwright_version}")
+            context = await browser.new_context(viewport={"width": 320, "height": 240})
+            page = await context.new_page()
+            await page.set_content("<h1>Native browser is running</h1>")
+            assert await page.locator("h1").inner_text() == "Native browser is running"
+        finally:
             await browser.close()
-            print(f"✅ Playwright Chromium is installed (version: {version})")
-            return True
-
-    except Exception as e:
-        print(f"❌ Playwright not properly installed: {e}")
-        print("   Install with: playwright install chromium")
-        return False
-
-
-async def main():
-    """Run all tests."""
-    print("=" * 60)
-    print("BROWSER CAPTURE FUNCTIONALITY TEST")
-    print("=" * 60)
-
-    # Check dependencies first
-    playwright_ok = await test_playwright_installed()
-
-    # Test pyvips separately to avoid import error
-    pyvips_ok = False
-    try:
-        pyvips_ok = await _check_pyvips_available()
-    except Exception as e:
-        print(f"\n❌ pyvips test failed: {e}")
-        print("   This means image tiling won't work, but browser capture might still function")
-
-    if not playwright_ok:
-        print("\n⚠️  Cannot test capture without Playwright installed")
-        return False
-
-    if not pyvips_ok:
-        print("\n⚠️  Warning: pyvips not available, tiling will fail")
-        print("   But we can still test the browser automation part")
-
-    # Test actual capture
-    print("\n" + "-" * 60)
-    capture_ok = await test_basic_capture()
-
-    print("\n" + "=" * 60)
-    print("TEST SUMMARY")
-    print("=" * 60)
-    print(f"Playwright: {'✅' if playwright_ok else '❌'}")
-    print(f"pyvips:     {'✅' if pyvips_ok else '❌'}")
-    print(f"Capture:    {'✅' if capture_ok else '❌'}")
-
-    all_ok = playwright_ok and capture_ok  # pyvips is optional for basic test
-    print(f"\nOverall:    {'✅ PASSED' if all_ok else '❌ FAILED'}")
-
-    return all_ok
-
-
-if __name__ == "__main__":
-    success = asyncio.run(main())
-    sys.exit(0 if success else 1)

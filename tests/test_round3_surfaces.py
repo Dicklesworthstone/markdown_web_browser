@@ -72,9 +72,7 @@ def test_embeddings_text_differs_for_different_text(client: TestClient) -> None:
 
 
 def test_embeddings_text_rejects_unknown_model(client: TestClient) -> None:
-    response = client.post(
-        "/embeddings/text", json={"text": "hi", "model": "openai-ada-002"}
-    )
+    response = client.post("/embeddings/text", json={"text": "hi", "model": "openai-ada-002"})
     assert response.status_code == 400
 
 
@@ -89,9 +87,7 @@ def test_embeddings_text_rejects_empty(client: TestClient) -> None:
 
 
 def test_rerun_404_for_missing_job(client: TestClient) -> None:
-    response = client.post(
-        "/jobs/does-not-exist/rerun", params={"reuse_cache": "false"}
-    )
+    response = client.post("/jobs/does-not-exist/rerun", params={"reuse_cache": "false"})
     assert response.status_code == 404
 
 
@@ -136,16 +132,12 @@ def test_rerun_uses_existing_job_config(
 
 
 def test_diff_404_for_missing_job_a(client: TestClient) -> None:
-    response = client.post(
-        "/jobs/does-not-exist/diff", json={"other_job_id": "x"}
-    )
+    response = client.post("/jobs/does-not-exist/diff", json={"other_job_id": "x"})
     assert response.status_code == 404
 
 
 def test_diff_404_for_missing_job_b(client: TestClient) -> None:
-    response = client.post(
-        "/jobs/abc/diff", json={"other_job_id": "does-not-exist"}
-    )
+    response = client.post("/jobs/abc/diff", json={"other_job_id": "does-not-exist"})
     assert response.status_code == 404
 
 
@@ -164,9 +156,7 @@ def test_diff_works_against_two_snapshots(
             "state": "DONE",
         },
     }
-    monkeypatch.setattr(
-        "app.main.JOB_MANAGER.get_snapshot", lambda jid: snapshots.get(jid)
-    )
+    monkeypatch.setattr("app.main.JOB_MANAGER.get_snapshot", lambda jid: snapshots.get(jid))
 
     md_a = "# Intro\n\nOld body\n## Pricing\n\n$5"
     md_b = "# Intro\n\nNew body\n## Pricing\n\n$5\n## New section\n\nAdded"
@@ -209,16 +199,13 @@ def test_search_returns_empty_for_whitespace_query(client: TestClient) -> None:
     assert body["matches"] == []
 
 
-def test_search_quoted_phrase_match(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_search_quoted_phrase_match(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
     rows = [
         {"id": "job1", "url": "https://x.com", "state": "DONE", "tags": []},
     ]
-    monkeypatch.setattr(
-        "app.main.JOB_MANAGER.list_jobs", lambda **_kwargs: (rows, 1)
-    )
+    monkeypatch.setattr("app.main.JOB_MANAGER.list_jobs", lambda **_kwargs: (rows, 1))
     import app.main
+
     monkeypatch.setattr(
         type(app.main.store), "read_markdown", lambda self, jid: "Hello world hello again"
     )
@@ -240,9 +227,7 @@ def test_search_filters_by_state_and_tag(
         return [], 0
 
     monkeypatch.setattr("app.main.JOB_MANAGER.list_jobs", _fake_list)
-    response = client.post(
-        "/jobs/search", json={"query": "alpha", "state": "DONE", "tag": "x"}
-    )
+    response = client.post("/jobs/search", json={"query": "alpha", "state": "DONE", "tag": "x"})
     assert response.status_code == 200
     assert captured.get("state") == "DONE"
     assert captured.get("tag") == "x"
@@ -283,6 +268,7 @@ def test_per_job_slo_with_known_timings(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import app.main
+
     monkeypatch.setattr(
         type(app.main.store),
         "read_manifest",
@@ -322,7 +308,7 @@ def test_round3_cli_subcommand_registered(cmd: str) -> None:
     assert result.exit_code == 0, f"{cmd} --help failed: {result.output}"
 
 
-def test_round3_cli_embed_passes_text_through() -> None:
+def test_round3_cli_embed_passes_text_through(monkeypatch: pytest.MonkeyPatch) -> None:
     from typer.testing import CliRunner
 
     from scripts import mdwb_cli
@@ -351,6 +337,7 @@ def test_round3_cli_embed_passes_text_through() -> None:
             return None
 
         def post(self, url, json=None):
+            assert json is not None
             captured["url"] = url
             captured["json"] = json
             # Build a real Response with a Request so raise_for_status works.
@@ -366,8 +353,8 @@ def test_round3_cli_embed_passes_text_through() -> None:
                 request=request,
             )
 
-    mdwb_cli.httpx.Client = _StubClient
-    mdwb_cli._resolve_settings = _fake_settings
+    monkeypatch.setattr(mdwb_cli.httpx, "Client", _StubClient)
+    monkeypatch.setattr(mdwb_cli, "_resolve_settings", _fake_settings)
 
     runner = CliRunner()
     result = runner.invoke(mdwb_cli.cli, ["embed", "hello agent", "--json"])

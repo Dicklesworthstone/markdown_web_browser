@@ -1,12 +1,5 @@
 import json
-import sys
-import types
-
-if "pyvips" not in sys.modules:
-    pyvips_stub = types.ModuleType("pyvips")
-    pyvips_stub.Image = object  # type: ignore[attr-defined]
-    sys.modules["pyvips"] = pyvips_stub
-
+from app.jobs import JobSnapshot
 from app.main import _demo_manifest_payload, _snapshot_events
 
 
@@ -25,7 +18,7 @@ def test_demo_manifest_contains_warnings_and_blocklist():
 
 
 def test_snapshot_events_include_manifest_breadcrumbs():
-    snapshot = {
+    snapshot: JobSnapshot = {
         "state": "DONE",
         "progress": {"done": 2, "total": 2},
         "manifest": {
@@ -46,7 +39,7 @@ def test_snapshot_events_include_manifest_breadcrumbs():
 
 
 def test_snapshot_events_surface_dom_assist_summary():
-    snapshot = {
+    snapshot: JobSnapshot = {
         "state": "DONE",
         "manifest": {
             "tiles_total": 4,
@@ -69,7 +62,7 @@ def test_snapshot_events_surface_dom_assist_summary():
 
 
 def test_snapshot_events_use_dom_assist_summary_field():
-    snapshot = {
+    snapshot: JobSnapshot = {
         "state": "DONE",
         "manifest": {
             "dom_assist_summary": {

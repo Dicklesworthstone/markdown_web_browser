@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import difflib
 import re
 from typing import Sequence
@@ -47,11 +47,7 @@ class StitchResult:
     markdown: str
     dom_assists: list[DomAssistEntry]
     seam_marker_events: list[SeamMarkerEvent]
-    dedup_events: list[DeduplicationResult] = None  # type: ignore[assignment]
-
-    def __post_init__(self) -> None:
-        if self.dedup_events is None:
-            object.__setattr__(self, "dedup_events", [])
+    dedup_events: list[DeduplicationResult] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -373,8 +369,15 @@ def _format_provenance(tile: TileSlice, *, job_id: str | None = None) -> str:
         f"tile_{tile.index:04d}",
         f"y={tile.source_y_offset}",
         f"height={tile.height}",
+        "height_coordinate_space=tile_pixels",
+        f"height_css={tile.height / ((tile.scale_y or tile.scale) * tile.device_scale_factor):.8g}",
         f"sha256={tile.sha256}",
         f"scale={tile.scale:.2f}",
+        f"scale_x={tile.scale_x or tile.scale:.8g}",
+        f"scale_y={tile.scale_y or tile.scale:.8g}",
+        f"dpr={tile.device_scale_factor}",
+        "coordinates=css_document",
+        f"source_rect={tile.source_rect}",
         f"viewport_y={tile.viewport_y_offset}",
         f"overlap_px={tile.overlap_px}",
         f"path={path}",

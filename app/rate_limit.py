@@ -4,13 +4,63 @@ from __future__ import annotations
 
 import threading
 import time
+import math
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 from fastapi import HTTPException, Request, Response, status
 from starlette.middleware.base import BaseHTTPMiddleware
+from sqlalchemy import text
+from sqlalchemy.engine import Engine
+from sqlmodel import Field, SQLModel
 
 from app.settings import Settings
+
+
+class RateLimitBucket(SQLModel, table=True):
+    """Shared token state; independent API workers consume the same bucket."""
+
+    key: str = Field(primary_key=True)
+    tokens: float
+    updated_at: float
+
+
+def consume_shared(engine: Engine, key: str, limit: int) -> tuple[bool, dict[str, int]]:
+    if limit <= 0:
+        raise ValueError("Rate limit must be positive")
+    with engine.begin() as conn:
+        # Serialize read/refill/consume across connections and processes.
+        conn.exec_driver_sql("BEGIN IMMEDIATE")
+        now = time.time()
+        row = conn.execute(
+            text("SELECT tokens, updated_at FROM ratelimitbucket WHERE key = :key"),
+            {"key": key},
+        ).first()
+        tokens = (
+            float(limit)
+            if row is None
+            else min(
+                float(limit),
+                row[0] + max(0, now - row[1]) * limit / 60.0,
+            )
+        )
+        allowed = tokens >= 1
+        if allowed:
+            tokens -= 1
+        conn.execute(
+            text(
+                "INSERT INTO ratelimitbucket (key, tokens, updated_at) "
+                "VALUES (:key, :tokens, :now) ON CONFLICT(key) DO UPDATE SET "
+                "tokens = excluded.tokens, updated_at = excluded.updated_at"
+            ),
+            {"key": key, "tokens": tokens, "now": now},
+        )
+        return allowed, {
+            "limit": limit,
+            "remaining": int(tokens),
+            "reset": math.ceil(now + (limit - tokens) * 60.0 / limit),
+            "retry_after": max(1, math.ceil((1 - tokens) * 60.0 / limit)),
+        }
 
 
 def extract_rate_limit_key(request: Request) -> str:
@@ -24,14 +74,8 @@ def extract_rate_limit_key(request: Request) -> str:
     Returns:
         Rate limit key string (api_key:*, api_key_id:*, or ip:*)
     """
-    # Try to get API key from header
-    api_key = request.headers.get("X-API-Key", None)
-    if api_key and api_key.startswith("mdwb_") and len(api_key) == 37:
-        # Valid API key format - use prefix for rate limiting
-        return f"api_key:{api_key[:12]}"
-
-    # Try to get from auth context (if auth middleware ran)
-    if hasattr(request.state, "auth_context"):
+    # Only verified identity may select a credential bucket.
+    if getattr(request.state, "auth_context", None) and request.state.auth_context.api_key_id:
         return f"api_key_id:{request.state.auth_context.api_key_id}"
 
     # Fall back to client IP

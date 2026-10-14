@@ -6,10 +6,9 @@ import pytest
 
 import app.capture as capture_module
 from app.blocklist import BlocklistConfig
-from app.capture import CaptureConfig, _perform_viewport_sweeps  # type: ignore[attr-defined]
+from app.capture import CaptureConfig, _perform_viewport_sweeps
 from app.capture_warnings import CaptureWarningEntry
 from app.settings import WarningSettings
-from app.tiler import TileSlice
 
 
 class _FakeLocator:
@@ -39,7 +38,9 @@ class _FakePage:
 
     async def screenshot(self, **kwargs: Any) -> bytes:  # noqa: ARG002
         self.screenshot_calls += 1
-        return b"fake-png"
+        import pyvips
+
+        return pyvips.Image.black(100, 800).pngsave_buffer()
 
     async def evaluate(self, script: str, *args: Any) -> Any:
         if script == "document.scrollingElement.scrollHeight":
@@ -95,30 +96,11 @@ async def _stub_collect_warnings(page, settings: WarningSettings) -> list[Captur
     ]
 
 
-async def _stub_tiles(image_bytes: bytes, **kwargs: Any) -> list[TileSlice]:  # noqa: ARG001
-    index = kwargs.get("tile_index_offset", 0)
-    y_offset = kwargs.get("viewport_y_offset", 0)
-    tile = TileSlice(
-        index=index,
-        png_bytes=b"tile",
-        sha256=f"sha{index}",
-        width=100,
-        height=100,
-        scale=1.0,
-        source_y_offset=int(y_offset),
-        viewport_y_offset=int(y_offset),
-        overlap_px=kwargs.get("overlap_px", 0),
-        top_overlap_sha256="hash",
-        bottom_overlap_sha256="hash",
-    )
-    return [tile]
-
-
 @pytest.mark.asyncio()
 async def test_perform_viewport_sweeps_handles_shrink_retry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    page = _FakePage(scroll_heights=[3000, 2500, 2500, 2500, 2500])
+    page = _FakePage(scroll_heights=[3000, 2500, 2500, 2500, 2500, 2500])
     context = cast(Any, _FakeContext(page))
     blocklist_config = BlocklistConfig(version="test", global_selectors=(), domain_selectors={})
     warning_settings = WarningSettings(
@@ -131,8 +113,6 @@ async def test_perform_viewport_sweeps_handles_shrink_retry(
     )
     monkeypatch.setattr(capture_module, "apply_blocklist", _stub_apply_blocklist)
     monkeypatch.setattr(capture_module, "collect_capture_warnings", _stub_collect_warnings)
-    monkeypatch.setattr(capture_module, "slice_into_tiles", _stub_tiles)
-    monkeypatch.setattr(capture_module, "validate_tiles", lambda tiles: None)
 
     (
         tiles,
@@ -145,7 +125,12 @@ async def test_perform_viewport_sweeps_handles_shrink_retry(
         sweep_events,
     ) = await _perform_viewport_sweeps(
         context=cast(capture_module.BrowserContext, context),
-        config=CaptureConfig(url="https://example.com"),
+        config=CaptureConfig(
+            url="https://example.com",
+            viewport_width=100,
+            viewport_height=800,
+            device_scale_factor=1,
+        ),
         viewport_overlap_px=200,
         tile_overlap_px=50,
         target_long_side_px=800,

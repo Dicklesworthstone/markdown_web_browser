@@ -7,8 +7,9 @@ from contextlib import asynccontextmanager
 import base64
 import logging
 import time
+from urllib.parse import urlparse
 from dataclasses import dataclass, field
-from typing import Any, Protocol, Sequence
+from typing import Any, Callable, Protocol, Sequence
 
 import httpx
 
@@ -52,6 +53,8 @@ GLM_DEFAULT_PROMPT = (
     "Recognize the text in the image and output in Markdown format. Preserve the original "
     "layout including headings, paragraphs, tables, and formulas."
 )
+
+
 @dataclass(slots=True, frozen=True)
 class OCRBackendRuntime:
     """Normalized OCR backend identity captured in manifests/telemetry."""
@@ -264,6 +267,8 @@ class OCRBatchTelemetry:
     request_id: str | None
     payload_bytes: int
     attempts: int
+    requested_model: str | None = None
+    served_model: str | None = None
 
 
 @dataclass(slots=True)
@@ -613,8 +618,8 @@ def resolve_ocr_backend(
             deduped_ids.append(candidate_id)
     policy_candidates: list[OCRBackendCandidate] = []
     for candidate_id in deduped_ids:
-        candidate_mode = backend_mode if candidate_id == backend_id else _mode_from_backend_id(
-            candidate_id
+        candidate_mode = (
+            backend_mode if candidate_id == backend_id else _mode_from_backend_id(candidate_id)
         )
         candidate_hardware = _hardware_path_for_candidate(
             candidate_id,
@@ -666,7 +671,8 @@ async def probe_ocr_backend(
         backend_mode=backend.backend_mode,
     )
     capabilities: dict[str, object] = {
-        "supports_submit": backend.backend_mode in {BACKEND_MODE_OPENAI_COMPATIBLE, BACKEND_MODE_MAAS},
+        "supports_submit": backend.backend_mode
+        in {BACKEND_MODE_OPENAI_COMPATIBLE, BACKEND_MODE_MAAS},
         "supports_probe": True,
         "supports_health": True,
         "max_batch_tiles": cfg.ocr.max_batch_tiles,
@@ -777,6 +783,7 @@ async def submit_tiles(
     requests: Sequence[OCRRequest],
     settings: Settings | None = None,
     client: httpx.AsyncClient | None = None,
+    on_progress: Callable[[int, int], None] | None = None,
 ) -> SubmitTilesResult:
     """Submit tiles to the configured olmOCR endpoint and return Markdown + telemetry."""
 
@@ -876,6 +883,7 @@ async def submit_tiles(
                 backend=candidate,
                 local_service=local_service,
                 client=client,
+                on_progress=on_progress,
             )
         except Exception as exc:
             circuit_opened, cooldown_s = _circuit_breaker.record_failure(candidate.backend_id)
@@ -919,8 +927,7 @@ async def submit_tiles(
     if last_error is None:
         last_error = RuntimeError("No OCR backend candidates available")
     raise RuntimeError(
-        "OCR failover exhausted all backend candidates: "
-        + ", ".join(chain)
+        "OCR failover exhausted all backend candidates: " + ", ".join(chain)
     ) from last_error
 
 
@@ -932,6 +939,7 @@ async def _submit_tiles_single_backend(
     backend: OCRBackendRuntime,
     local_service: dict[str, object] | None,
     client: httpx.AsyncClient | None,
+    on_progress: Callable[[int, int], None] | None = None,
 ) -> SubmitTilesResult:
     if backend.backend_mode not in {BACKEND_MODE_OPENAI_COMPATIBLE, BACKEND_MODE_MAAS}:
         raise NotImplementedError(
@@ -971,6 +979,7 @@ async def _submit_tiles_single_backend(
 
     telemetry: list[OCRBatchTelemetry] = []
     markdown_by_id: dict[str, str] = {req.tile_id: "" for req in requests}
+    completed: set[str] = set()
 
     async def _submit(group: list[_EncodedTile]) -> None:
         async with limiter.slot():
@@ -986,10 +995,19 @@ async def _submit_tiles_single_backend(
         telemetry.append(batch_result.telemetry)
         for tile_id, chunk in zip(batch_result.tile_ids, batch_result.markdown, strict=True):
             markdown_by_id[tile_id] = chunk
+            completed.add(tile_id)
+        if on_progress:
+            on_progress(len(completed), len(requests))
         await limiter.record(batch_result.telemetry)
 
+    tasks = [asyncio.create_task(_submit(group)) for group in batches]
     try:
-        await asyncio.gather(*(_submit(group) for group in batches))
+        await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
     finally:
         if owns_client:
             await http_client.aclose()
@@ -997,9 +1015,11 @@ async def _submit_tiles_single_backend(
     quota_status = _quota_tracker.record(
         len(requests), limit=settings.ocr.daily_quota_tiles, ratio=_QUOTA_WARNING_RATIO
     )
-    reevaluate_policy, reevaluation_reason_code, policy_state = _evaluate_runtime_policy_reevaluation(
-        backend=backend,
-        batches=telemetry,
+    reevaluate_policy, reevaluation_reason_code, policy_state = (
+        _evaluate_runtime_policy_reevaluation(
+            backend=backend,
+            batches=telemetry,
+        )
     )
     autotune_snapshot = limiter.snapshot()
     autotune_snapshot.reevaluate_policy = reevaluate_policy
@@ -1077,6 +1097,7 @@ async def _submit_batch(
             backend_mode=backend_mode,
             backend_id=backend_id,
             model_override=model_override,
+            endpoint=endpoint,
         )
         start = time.perf_counter()
         try:
@@ -1094,6 +1115,8 @@ async def _submit_batch(
                 request_id=request_id,
                 payload_bytes=payload_bytes,
                 attempts=attempts,
+                requested_model=payload.get("model"),
+                served_model=data.get("model") if isinstance(data.get("model"), str) else None,
             )
             return _BatchResult(tile_ids=tile_ids, markdown=markdown, telemetry=telemetry)
         except httpx.HTTPStatusError as exc:
@@ -1149,6 +1172,7 @@ def _build_payload(
     backend_mode: str,
     backend_id: str,
     model_override: str | None = None,
+    endpoint: str | None = None,
 ) -> dict:
     if not tiles:
         raise ValueError("Must provide at least one tile")
@@ -1167,6 +1191,8 @@ def _build_payload(
         raise ValueError("Model must be specified for OCR requests")
     if (
         backend_id.endswith("-remote-openai")
+        and endpoint is not None
+        and urlparse(endpoint).hostname == "api.deepinfra.com"
         and not model.startswith("allenai/")
         and "olmocr" in model.lower()
     ):

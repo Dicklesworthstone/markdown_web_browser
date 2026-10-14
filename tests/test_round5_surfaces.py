@@ -1,4 +1,5 @@
 """Tests for R5: embedders, share tokens, store-embeddings, raw events, bead health."""
+
 from __future__ import annotations
 
 import json
@@ -100,9 +101,7 @@ def test_embeddings_text_embedder_unavailable_returns_503(
 # ---------------------------------------------------------------------------
 
 
-def test_share_token_round_trip(
-    monkeypatch: pytest.MonkeyPatch, client: TestClient
-) -> None:
+def test_share_token_round_trip(monkeypatch: pytest.MonkeyPatch, client: TestClient) -> None:
     def _get_snap(job_id):
         return {
             "id": job_id,
@@ -166,9 +165,7 @@ def test_share_token_tampered_returns_404(
 
 
 def test_store_embeddings_unknown_model_returns_400(client: TestClient) -> None:
-    r = client.post(
-        "/jobs/abc/embeddings/store", json={"model": "bogus"}
-    )
+    r = client.post("/jobs/abc/embeddings/store", json={"model": "bogus"})
     assert r.status_code == 400
 
 
@@ -207,9 +204,7 @@ def test_store_embeddings_stores_sections(
     monkeypatch.setattr(main_mod.JOB_MANAGER, "get_structured_result", _structured)
     monkeypatch.setattr(type(main_mod.store), "upsert_embeddings", _upsert)
 
-    r = client.post(
-        "/jobs/abc/embeddings/store", json={"model": "hash-bucket-v1", "replace": True}
-    )
+    r = client.post("/jobs/abc/embeddings/store", json={"model": "hash-bucket-v1", "replace": True})
     assert r.status_code == 200
     body = r.json()
     assert body["stored"] == 2
@@ -306,7 +301,7 @@ def test_r5_cli_subcommands_registered(cmd) -> None:
     assert result.exit_code == 0, f"{' '.join(cmd)} --help failed: {result.output}"
 
 
-def test_r5_cli_share_invokes_endpoint() -> None:
+def test_r5_cli_share_invokes_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
     from typer.testing import CliRunner
 
     from scripts import mdwb_cli
@@ -346,8 +341,8 @@ def test_r5_cli_share_invokes_endpoint() -> None:
                 request=_hx.Request("POST", url),
             )
 
-    mdwb_cli.httpx.Client = _StubClient
-    mdwb_cli._resolve_settings = _fake_settings
+    monkeypatch.setattr(mdwb_cli.httpx, "Client", _StubClient)
+    monkeypatch.setattr(mdwb_cli, "_resolve_settings", _fake_settings)
 
     runner = CliRunner()
     result = runner.invoke(mdwb_cli.cli, ["share", "abc", "--json"])
@@ -357,7 +352,7 @@ def test_r5_cli_share_invokes_endpoint() -> None:
     assert "/jobs/abc/share" in captured["url"]
 
 
-def test_r5_cli_jobs_tree_prints_tree() -> None:
+def test_r5_cli_jobs_tree_prints_tree(monkeypatch: pytest.MonkeyPatch) -> None:
     """`mdwb jobs tree <id>` prints an ASCII TOC from /result.json sections."""
     from typer.testing import CliRunner
 
@@ -398,8 +393,8 @@ def test_r5_cli_jobs_tree_prints_tree() -> None:
                 request=_hx.Request("GET", url),
             )
 
-    mdwb_cli.httpx.Client = _StubClient
-    mdwb_cli._resolve_settings = _fake_settings
+    monkeypatch.setattr(mdwb_cli.httpx, "Client", _StubClient)
+    monkeypatch.setattr(mdwb_cli, "_resolve_settings", _fake_settings)
 
     runner = CliRunner()
     result = runner.invoke(mdwb_cli.cli, ["jobs", "tree", "abc"])

@@ -47,16 +47,22 @@ def upsert_embeddings(
     if not sections:
         return
 
+    for section in sections:
+        _validate_query_vector(section.vector)
+
     insert_sql = (
-        "INSERT OR REPLACE INTO section_embeddings "
+        "INSERT INTO section_embeddings "
         "(run_id, section_id, tile_start, tile_end, embedding) "
         "VALUES (:run_id, :section_id, :tile_start, :tile_end, :embedding)"
     )
     connection = session.connection()
     for section in sections:
-        if len(section.vector) != EMBEDDING_DIM:
-            msg = f"section embedding length must match EMBEDDING_DIM; got {len(section.vector)}"
-            raise ValueError(msg)
+        # vec0 has no unique (run_id, section_id) constraint. OR REPLACE alone
+        # silently accumulates duplicates; replace this identity explicitly.
+        connection.exec_driver_sql(
+            "DELETE FROM section_embeddings WHERE run_id = :run_id AND section_id = :section_id",
+            {"run_id": run_id, "section_id": section.section_id},
+        )
         payload = sqlite_vec.serialize_float32(list(section.vector))
         connection.exec_driver_sql(
             insert_sql,
@@ -91,14 +97,17 @@ def search_embeddings(
     """Return the most similar sections for the provided query vector."""
 
     _validate_query_vector(query_vector)
+    if top_k < 1:
+        raise ValueError("top_k must be positive")
     normalized_query = _normalize_vector(query_vector)
     cursor = session.connection().exec_driver_sql(
         "SELECT section_id, tile_start, tile_end, embedding "
-        "FROM section_embeddings WHERE run_id = :run_id",
+        "FROM section_embeddings WHERE run_id = :run_id "
+        "ORDER BY section_id, tile_start, tile_end",
         {"run_id": run_id},
     )
     total = 0
-    heap: list[tuple[float, EmbeddingMatch]] = []
+    heap: list[tuple[float, int, EmbeddingMatch]] = []
     for section_id, tile_start, tile_end, blob in cursor.fetchall():
         total += 1
         similarity = _cosine_similarity(normalized_query, blob)
@@ -110,17 +119,19 @@ def search_embeddings(
             distance=1.0 - similarity,
         )
         if len(heap) < top_k:
-            heapq.heappush(heap, (similarity, match))
+            heapq.heappush(heap, (similarity, -total, match))
         else:
-            heapq.heappushpop(heap, (similarity, match))
+            heapq.heappushpop(heap, (similarity, -total, match))
 
-    matches = [item[1] for item in heapq.nlargest(top_k, heap, key=lambda entry: entry[0])]
+    matches = [item[2] for item in heapq.nlargest(top_k, heap, key=lambda entry: entry[:2])]
     return total, matches
 
 
 def _validate_query_vector(vector: Sequence[float]) -> None:
     if len(vector) != EMBEDDING_DIM:
         raise ValueError(f"Expected embedding length {EMBEDDING_DIM}, received {len(vector)}")
+    if any(not math.isfinite(value) for value in vector):
+        raise ValueError("Embedding values must be finite")
 
 
 def _normalize_vector(vector: Sequence[float]) -> list[float]:

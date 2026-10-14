@@ -44,7 +44,9 @@ def _cpu_snapshot() -> HardwareCapabilitySnapshot:
     )
 
 
-def _mock_local_service_unhealthy(monkeypatch: pytest.MonkeyPatch, *, status_code: int = 503) -> None:
+def _mock_local_service_unhealthy(
+    monkeypatch: pytest.MonkeyPatch, *, status_code: int = 503
+) -> None:
     @dataclass(slots=True)
     class _Status:
         managed: bool

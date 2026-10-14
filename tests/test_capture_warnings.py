@@ -36,7 +36,7 @@ class _FakePage:
         self._result = result
         self.evaluate_calls: list[str] = []
 
-    async def evaluate(self, script: str):  # type: ignore[override]
+    async def evaluate(self, script: str) -> dict[str, int | str]:
         self.evaluate_calls.append(script)
         return self._result
 
@@ -45,7 +45,7 @@ class _FakePage:
 async def test_collect_warning_stats_coerces_counts() -> None:
     page = _FakePage({"canvas": "5", "video": 2, "sticky": 4, "dialog": 1})
 
-    stats = await collect_warning_stats(page)  # type: ignore[arg-type]
+    stats = await collect_warning_stats(page)
 
     assert stats.canvas_count == 5
     assert stats.video_count == 2
@@ -59,7 +59,7 @@ async def test_collect_capture_warnings_uses_dom_counts() -> None:
     page = _FakePage({"canvas": 3, "video": 2, "sticky": 3, "dialog": 1})
     settings = _settings(canvas=2, video=1, seam_pairs=1)
 
-    warnings = await collect_capture_warnings(page, settings=settings)  # type: ignore[arg-type]
+    warnings = await collect_capture_warnings(page, settings=settings)
 
     codes = {warning.code for warning in warnings}
     assert codes == {"canvas-heavy", "video-heavy", "sticky-chrome"}

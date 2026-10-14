@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import hashlib
+import json
+import os
+import sys
+from html import escape
 import time
+import re
 from dataclasses import dataclass, field
 from importlib import metadata
 from pathlib import Path
-import re
-from typing import Any, List, Optional, Sequence
+from typing import Any, Callable, List, Optional, Sequence
 
 from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 
@@ -18,10 +24,14 @@ from app.capture_warnings import (
     build_sweep_warning,
     collect_capture_warnings,
 )
-from app.settings import WarningSettings, get_settings
-from app.tiler import TileSlice, slice_into_tiles, validate_tiles
+from app.settings import BrowserSettings, WarningSettings, get_settings
+from app.auth import current_owner
+from app.egress import EgressDenied, EgressProxy, network_policy, validate_network_url
+from app.schemas import validate_profile_id
+from app.tiler import TileSlice, set_tile_overlap, slice_into_tiles, validate_tiles
 
 LOGGER = logging.getLogger(__name__)
+CAPTURE_PIPELINE_VERSION = "uniform-tiles-css-fonts-egress-v4"
 
 
 @dataclass(slots=True)
@@ -38,6 +48,13 @@ class CaptureConfig:
     long_side_px: int | None = None
     cache_seed: str | None = None
     cache_key: str | None = None
+    semantic_post_enabled: bool = False
+    semantic_post_max_chars: int | None = None
+    stage_callback: Callable[[str, int | None, int | None], None] | None = None
+
+    def report_stage(self, stage: str, done: int | None = None, total: int | None = None) -> None:
+        if self.stage_callback:
+            self.stage_callback(stage, done, total)
 
 
 @dataclass(slots=True)
@@ -100,6 +117,17 @@ class CaptureManifest:
     fallback_chain: list[str] = field(default_factory=list)
     hardware_capabilities: dict[str, object] | None = None
     ocr_ms: int | None = None
+    requested_ocr_policy: str | None = None
+    selected_ocr_model: str | None = None
+    served_ocr_models: list[str] = field(default_factory=list)
+    request_options: dict[str, object] = field(default_factory=dict)
+    capture_pipeline_version: str = CAPTURE_PIPELINE_VERSION
+    configured_cft_version: str | None = None
+    cft_pin_verified: bool = False
+    configured_screenshot_style_hash: str | None = None
+    requested_browser_transport: str | None = None
+    requested_browser_channels: str | None = None
+    fontconfig_sha256: str | None = None
     stitch_ms: int | None = None
     ocr_batches: list[dict[str, object]] = field(default_factory=list)
     ocr_quota: dict[str, object] | None = None
@@ -112,6 +140,7 @@ class CaptureManifest:
     seam_marker_events: list[dict[str, object]] = field(default_factory=list)
     semantic_post_summary: dict[str, object] | None = None
     semantic_post_ms: int | None = None
+    network_policy: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -127,19 +156,35 @@ async def capture_tiles(config: CaptureConfig) -> CaptureResult:
     """Run a deterministic viewport sweep and return OCR-ready tiles."""
 
     settings = get_settings()
+    validate_network_url(config.url)
     start = time.perf_counter()
 
     blocklist_cfg = cached_blocklist(str(settings.browser.blocklist_path))
     warning_cfg = settings.warnings
 
-    async with async_playwright() as playwright:
-        browser = await _launch_browser(playwright, settings.browser.playwright_channel)
-        context, storage_state_path = await _build_context(
-            browser,
-            config,
-            profiles_root=settings.storage.profiles_root,
+    async with (
+        EgressProxy(network_policy(settings, owner=current_owner())) as egress,
+        async_playwright() as playwright,
+    ):
+        config.report_stage("BROWSER_STARTING")
+        browser, actual_channel, actual_transport = await _launch_browser(
+            playwright,
+            settings.browser.playwright_channel,
+            expected_build=settings.browser.cft_version,
+            transport=settings.browser.browser_transport,
+            executable=settings.browser.cft_executable,
+            fontconfig_file=settings.browser.fontconfig_file,
+            proxy_url=egress.url,
         )
+        actual_build = browser.version
+        context = None
+        storage_state_path = None
         try:
+            context, storage_state_path = await _build_context(
+                browser,
+                config,
+                profiles_root=settings.storage.profiles_root,
+            )
             (
                 tiles,
                 sweep_stats,
@@ -163,22 +208,27 @@ async def capture_tiles(config: CaptureConfig) -> CaptureResult:
                 warning_settings=warning_cfg,
             )
         finally:
-            if storage_state_path is not None:
-                storage_state_path.parent.mkdir(parents=True, exist_ok=True)
-                await context.storage_state(path=str(storage_state_path))
-            await context.close()
-            await browser.close()
+            try:
+                if context is not None:
+                    try:
+                        if storage_state_path is not None:
+                            storage_state_path.parent.mkdir(parents=True, exist_ok=True)
+                            await context.storage_state(path=str(storage_state_path))
+                    finally:
+                        await context.close()
+            finally:
+                await browser.close()
 
     capture_ms = int((time.perf_counter() - start) * 1000)
 
     manifest_payload = CaptureManifest(
         url=config.url,
-        cft_label=settings.browser.cft_label,
-        cft_version=settings.browser.cft_version,
-        playwright_channel=settings.browser.playwright_channel,
+        cft_label=settings.browser.cft_label if actual_channel == "cft" else "unqualified-stock",
+        cft_version=f"chrome-{actual_build}",
+        playwright_channel=actual_channel,
         playwright_version=_playwright_version(),
-        browser_transport=settings.browser.browser_transport,
-        screenshot_style_hash=settings.browser.screenshot_style_hash,
+        browser_transport=actual_transport,
+        screenshot_style_hash=effective_screenshot_hash(config, settings.browser),
         viewport_width=config.viewport_width,
         viewport_height=config.viewport_height,
         device_scale_factor=config.device_scale_factor,
@@ -202,6 +252,13 @@ async def capture_tiles(config: CaptureConfig) -> CaptureResult:
         profile_id=config.profile_id,
         cache_seed=config.cache_seed,
         cache_key=config.cache_key,
+        configured_cft_version=settings.browser.cft_version,
+        cft_pin_verified=actual_channel == "cft",
+        configured_screenshot_style_hash=settings.browser.screenshot_style_hash,
+        requested_browser_transport=settings.browser.browser_transport,
+        requested_browser_channels=settings.browser.playwright_channel,
+        fontconfig_sha256=fontconfig_digest(settings.browser.fontconfig_file),
+        network_policy=egress.summary(),
     )
 
     manifest_payload.seam_markers = seam_markers
@@ -238,7 +295,10 @@ async def _perform_viewport_sweeps(
     # Use 'domcontentloaded' for fastest reliable page load
     # This fires when HTML is parsed, before all resources load
     # Works better with Cloudflare challenge pages that may have delayed resources
-    await page.goto(config.url, wait_until="domcontentloaded", timeout=30000)
+    config.report_stage("NAVIGATING")
+    response = await page.goto(config.url, wait_until="domcontentloaded", timeout=30000)
+    if response is not None and "x-mdwb-egress-denied" in response.headers:
+        raise EgressDenied("Capture navigation refused by the network policy")
     blocklist_hits = await apply_blocklist(page, url=config.url, config=blocklist_config)
     await _ensure_watermark_injected(page)
     warning_entries: list[CaptureWarningEntry] = await collect_capture_warnings(
@@ -272,6 +332,7 @@ async def _perform_viewport_sweeps(
             show_bottom=True,
         )
 
+        config.report_stage("CAPTURING")
         screenshot = await page.screenshot(
             type="png",
             full_page=False,
@@ -279,12 +340,14 @@ async def _perform_viewport_sweeps(
             caret="hide",
             mask=mask_locators if mask_locators else None,
         )
+        config.report_stage("TILING")
         new_tiles = await slice_into_tiles(
             screenshot,
             overlap_px=tile_overlap_px,
             tile_index_offset=tile_index,
             viewport_y_offset=y_offset,
             target_long_side_px=target_long_side_px,
+            device_scale_factor=config.device_scale_factor,
         )
         try:
             validate_tiles(new_tiles)
@@ -300,6 +363,7 @@ async def _perform_viewport_sweeps(
 
         for tile in new_tiles:
             if previous_tile:
+                await asyncio.to_thread(set_tile_overlap, previous_tile, tile)
                 match = _overlap_match(previous_tile, tile)
                 if match is not None:
                     overlap_pairs += 1
@@ -332,6 +396,7 @@ async def _perform_viewport_sweeps(
         if next_offset <= y_offset:
             break
 
+        config.report_stage("SCROLLING")
         await page.evaluate(f"window.scrollTo(0, {next_offset})")
         await page.wait_for_timeout(settle_ms)
         y_offset = next_offset
@@ -384,6 +449,63 @@ _WATERMARK_STYLE = """
 #mdwb-watermark-top { top: 0; }
 #mdwb-watermark-bottom { bottom: 0; }
 """
+
+
+def effective_screenshot_hash(config: CaptureConfig, browser: BrowserSettings) -> str:
+    """Bind effective viewport, mask selectors and actual injected style bytes."""
+    payload = {
+        "configured_style_hash": browser.screenshot_style_hash,
+        "watermark_css": _WATERMARK_STYLE,
+        "masks": list(browser.screenshot_mask_selectors),
+        "viewport": [config.viewport_width, config.viewport_height, config.device_scale_factor],
+        "color_scheme": config.color_scheme,
+        "reduced_motion": config.reduced_motion,
+        "animations": "disabled",
+        "caret": "hide",
+        "full_page": False,
+        "capture_pipeline_version": CAPTURE_PIPELINE_VERSION,
+        "fontconfig_sha256": fontconfig_digest(browser.fontconfig_file),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
+def _system_fontconfig_bytes() -> bytes:
+    cache = escape(str(Path.home() / ".cache/mdwb/fontcache"), quote=False)
+    return (
+        '<?xml version="1.0"?><!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">'
+        "<fontconfig><dir>/usr/share/fonts</dir><dir>/usr/local/share/fonts</dir>"
+        f"<cachedir>{cache}</cachedir></fontconfig>"
+    ).encode()
+
+
+def fontconfig_digest(path: Path | None) -> str | None:
+    if sys.platform != "linux":
+        if path is not None:
+            raise ValueError("Fontconfig overrides are supported only on Linux")
+        return None
+    content = path.read_bytes() if path else _system_fontconfig_bytes()
+    return hashlib.sha256(content).hexdigest()
+
+
+def _browser_font_environment(path: Path | None) -> dict[str, str] | None:
+    """Isolate Linux capture fonts from user aliases; preserve the host config."""
+    if sys.platform != "linux":
+        fontconfig_digest(path)
+        return None
+    if path is None:
+        content = _system_fontconfig_bytes()
+        digest = hashlib.sha256(content).hexdigest()
+        path = Path.home() / ".cache/mdwb/fonts" / f"{digest}.conf"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with path.open("xb") as stream:
+                stream.write(content)
+        except FileExistsError:
+            if path.read_bytes() != content:
+                raise ValueError("Generated browser font configuration has unexpected bytes")
+    if not path.is_file():
+        raise ValueError("Browser font configuration is unavailable")
+    return {**os.environ, "FONTCONFIG_FILE": str(path.resolve())}
 
 
 async def _ensure_watermark_injected(page: Page) -> None:
@@ -473,19 +595,50 @@ def _collect_seam_markers(tiles: Sequence[TileSlice]) -> list[dict[str, object]]
 
 
 _CHANNEL_ALIASES = {
-    "cft": "chrome",
-    "chrome-for-testing": "chrome",
+    "chrome-for-testing": "cft",
 }
 
 
-async def _launch_browser(playwright, channel: str) -> Browser:
-    normalized = _normalize_channel(channel)
-    if normalized != channel:
-        LOGGER.warning(
-            "Playwright channel '%s' is not supported; falling back to '%s'",
-            channel,
-            normalized,
-        )
+def resolve_browser_transport(transport: str) -> str:
+    preferences = [value.strip().lower() for value in transport.split(",") if value.strip()]
+    if not preferences or any(value not in {"cdp", "bidi"} for value in preferences):
+        raise ValueError("Browser transport must be cdp or a cdp/bidi preference list")
+    if "cdp" not in preferences:
+        raise ValueError("BiDi is unsupported by this Python capture adapter; select cdp")
+    return "cdp"
+
+
+async def _launch_browser(
+    playwright,
+    channel: str,
+    *,
+    expected_build: str | None = None,
+    transport: str = "cdp",
+    executable: Path | None = None,
+    fontconfig_file: Path | None = None,
+    proxy_url: str | None = None,
+) -> tuple[Browser, str, str]:
+    actual_transport = resolve_browser_transport(transport)
+    version = _playwright_version()
+    parts = re.match(r"^(\d+)\.(\d+)", version)
+    if parts is None or (int(parts[1]), int(parts[2])) < (1, 50):
+        raise ValueError(f"Playwright >=1.50 is required; found {version}")
+    preferences = [_normalize_channel(value) for value in channel.split(",") if value.strip()]
+    allowed = {
+        "cft",
+        "chromium",
+        "chrome",
+        "chrome-beta",
+        "chrome-dev",
+        "chrome-canary",
+        "msedge",
+        "msedge-beta",
+        "msedge-dev",
+        "msedge-canary",
+    }
+    if not preferences or any(value not in allowed for value in preferences):
+        raise ValueError("Unsupported browser channel or empty preference list")
+    browser_env = _browser_font_environment(fontconfig_file)
 
     # Use Chrome's new headless mode (--headless=new) which is virtually undetectable
     # Combined with automation masking to evade bot detection
@@ -497,13 +650,76 @@ async def _launch_browser(playwright, channel: str) -> Browser:
         "--disable-setuid-sandbox",
         "--window-size=1920,1080",
     ]
+    if proxy_url:
+        launch_args.extend(
+            [
+                "--disable-quic",
+                "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+            ]
+        )
+    proxy = {"server": proxy_url, "bypass": "<-loopback>"} if proxy_url else None
 
-    LOGGER.debug("launching chromium", extra={"channel": normalized, "args": launch_args})
-    return await playwright.chromium.launch(
-        channel=normalized,
-        headless=True,  # Keep this True, the --headless=new arg is what matters
-        args=launch_args,
-    )
+    failures = []
+    for selected in preferences:
+        browser: Browser | None = None
+        try:
+            if selected == "cft":
+                build = (expected_build or "").removeprefix("chrome-")
+                if not re.fullmatch(r"\d+\.\d+\.\d+\.\d+", build):
+                    raise ValueError("CFT_VERSION must name an exact four-part Chrome build")
+                path = (
+                    executable or Path.home() / ".cache/mdwb/cft" / build / "chrome-linux64/chrome"
+                )
+                if not path.is_file():
+                    raise ValueError(
+                        f"Pinned CfT executable is missing: {path}. Install that build or set CFT_EXECUTABLE."
+                    )
+                browser = await playwright.chromium.launch(
+                    executable_path=str(path),
+                    headless=True,
+                    args=launch_args,
+                    env=browser_env,
+                    proxy=proxy,
+                )
+                if browser.version != build:
+                    observed = browser.version
+                    raise ValueError(f"CfT pin mismatch: expected {build}, launched {observed}")
+            else:
+                browser = await playwright.chromium.launch(
+                    channel=selected,
+                    headless=True,
+                    args=launch_args,
+                    env=browser_env,
+                    proxy=proxy,
+                )
+            probe = await browser.new_page()
+            try:
+                width = await probe.evaluate("""() => {
+                    const context = document.createElement('canvas').getContext('2d');
+                    context.font = '16px sans-serif';
+                    return context.measureText('Capture text 7319').width;
+                }""")
+            finally:
+                await probe.close()
+            if not isinstance(width, (int, float)) or width <= 0:
+                raise ValueError(
+                    "Browser fonts cannot render text; configure PLAYWRIGHT_FONTCONFIG_FILE"
+                )
+            LOGGER.info(
+                "Launched browser build=%s channel=%s transport=%s",
+                browser.version,
+                selected,
+                actual_transport,
+            )
+            return browser, selected, actual_transport
+        except BaseException as exc:
+            if browser is not None:
+                await browser.close()
+            if not isinstance(exc, Exception):
+                raise
+            failures.append(f"{selected}: {exc}")
+            LOGGER.warning("Browser candidate failed: %s", failures[-1])
+    raise ValueError("Browser launch failed: " + "; ".join(failures))
 
 
 async def _build_context(
@@ -517,7 +733,7 @@ async def _build_context(
     user_agent = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/130.0.0.0 Safari/537.36"
+        f"Chrome/{browser.version} Safari/537.36"
     )
 
     options: dict[str, Any] = {
@@ -623,14 +839,15 @@ def _normalize_channel(channel: str) -> str:
     return _CHANNEL_ALIASES.get(lowered, lowered)
 
 
-_PROFILE_SAFE_PATTERN = re.compile(r"[^A-Za-z0-9._-]+")
-
-
 def _profile_storage_state_path(base: Path, profile_id: str) -> Path:
-    safe = _PROFILE_SAFE_PATTERN.sub("_", profile_id.strip())
-    if not safe:
-        safe = "default"
-    return base / safe / "storage_state.json"
+    safe = validate_profile_id(profile_id)
+    root = base.resolve()
+    owner = current_owner()
+    namespace = hashlib.sha256(owner.encode()).hexdigest() if owner else "anonymous"
+    target = (root / namespace / safe / "storage_state.json").resolve()
+    if not target.is_relative_to(root):
+        raise ValueError("Profile storage path escapes profiles root")
+    return target
 
 
 def _overlap_match(previous_tile: TileSlice, current_tile: TileSlice) -> Optional[bool]:

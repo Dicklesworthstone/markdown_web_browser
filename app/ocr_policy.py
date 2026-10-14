@@ -4,6 +4,87 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from enum import Enum
+from functools import lru_cache
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+import yaml
+from pydantic import BaseModel, ConfigDict, Field
+
+if TYPE_CHECKING:
+    from app.settings import Settings
+
+
+class OCRModelPolicy(BaseModel):
+    """Executable limits from the project's declared model inventory."""
+
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+    key: str
+    provider: str
+    display_name: str
+    long_side_px: int = Field(gt=0, le=16384)
+    fp8_preferred: bool
+    max_tiles_in_flight: int = Field(gt=0)
+    prompt_template: str
+    disabled: bool = False
+    notes: str = ""
+    refs: list[str] = Field(default_factory=list)
+    aliases: list[str] = Field(default_factory=list)
+
+
+@lru_cache(maxsize=4)
+def load_model_policies(
+    path: Path = Path(__file__).resolve().parents[1] / "docs/models.yaml",
+) -> tuple[OCRModelPolicy, ...]:
+    payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict) or not payload:
+        raise ValueError("Model policies must be a nonempty mapping")
+    policies = []
+    names: set[str] = set()
+    for key, values in payload.items():
+        if not isinstance(key, str) or not isinstance(values, dict):
+            raise ValueError("Each model policy must have a string key and object definition")
+        policy = OCRModelPolicy.model_validate({**values, "key": key})
+        for name in [key, *policy.aliases]:
+            if name.casefold() in names:
+                raise ValueError(f"Duplicate model policy name: {name}")
+            names.add(name.casefold())
+        policies.append(policy)
+    return tuple(policies)
+
+
+def resolve_model_policy(name: str) -> OCRModelPolicy:
+    for policy in load_model_policies():
+        if name.casefold() in {value.casefold() for value in [policy.key, *policy.aliases]}:
+            if policy.disabled:
+                raise ValueError(f"OCR policy {policy.key} is disabled")
+            if policy.prompt_template != "olmocr_v4":
+                raise ValueError(f"OCR prompt {policy.prompt_template} is not implemented")
+            return policy
+    raise ValueError(f"Unknown OCR policy: {name}")
+
+
+def validate_ocr_policy(name: str) -> str:
+    resolve_model_policy(name)
+    return name
+
+
+def settings_for_policy(settings: Settings, name: str | None) -> Settings:
+    if name is None:
+        return settings
+    policy = resolve_model_policy(name)
+    limit = min(settings.ocr.max_concurrency, policy.max_tiles_in_flight)
+    return replace(
+        settings,
+        ocr=replace(
+            settings.ocr,
+            model=policy.key,
+            use_fp8=policy.fp8_preferred,
+            min_concurrency=min(settings.ocr.min_concurrency, limit),
+            max_concurrency=limit,
+        ),
+    )
+
 
 BACKEND_MODE_OPENAI_COMPATIBLE = "openai-compatible"
 BACKEND_MODE_MAAS = "maas"
@@ -179,7 +260,9 @@ def should_reevaluate_policy(
         now_ts=context.now_ts,
         cooldown_seconds=hysteresis.cooldown_seconds,
     )
-    flap_limit_hit = hysteresis.flap_threshold > 0 and flap_window_count >= hysteresis.flap_threshold
+    flap_limit_hit = (
+        hysteresis.flap_threshold > 0 and flap_window_count >= hysteresis.flap_threshold
+    )
     if hard_failure:
         return OCRReevaluationDecision(
             True,

@@ -45,7 +45,7 @@ def client(monkeypatch, isolated_store) -> TestClient:
 
     monkeypatch.setattr(_main, "store", isolated_store)
     # Also rebind the JobManager's store reference so persistence goes there.
-    _main.JOB_MANAGER.store = isolated_store
+    monkeypatch.setattr(_main.JOB_MANAGER, "store", isolated_store)
     return TestClient(_main.app)
 
 
@@ -205,6 +205,7 @@ def test_jobs_batch_returns_per_url_outcomes(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """POST /jobs/batch should respond with one item per URL, never crash on a 404 lookup."""
+
     # Patch the snapshot lookup so we don't depend on real DB / state
     class _FakeSnapshot:
         def __init__(self, url: str) -> None:

@@ -1,4 +1,8 @@
-"""Test OCR client with REAL OCR API calls - no mocks."""
+"""OCR HTTP contracts and explicitly credentialed hosted probes.
+
+MockTransport cases test request/response contracts; only hosted probes count
+as live provider evidence.
+"""
 
 from __future__ import annotations
 
@@ -11,10 +15,13 @@ from typing import Iterator
 import httpx
 import pytest
 from PIL import Image, ImageDraw, ImageFont
-from playwright.async_api import async_playwright
 
 import app.ocr_client as ocr_client_module
-from app.hardware import GPUDeviceCapability, HardwareCapabilitySnapshot, reset_host_capabilities_cache
+from app.hardware import (
+    GPUDeviceCapability,
+    HardwareCapabilitySnapshot,
+    reset_host_capabilities_cache,
+)
 from app.ocr_client import (
     OCRRequest,
     build_glm_maas_payload,
@@ -194,6 +201,46 @@ def test_build_glm_openai_chat_payload_shapes_contract() -> None:
     assert content[1]["image_url"]["url"] == f"data:image/png;base64,{raw}"
 
 
+@pytest.mark.parametrize("model", ["olmOCR-2-7B-1025-FP8", "olmOCR-2-7B-1025"])
+async def test_custom_remote_preserves_policy_model_and_served_identity(model):
+    """Actual HTTP formatting contract; fixture responses do not prove model availability."""
+    settings = get_settings()
+    settings = replace(
+        settings,
+        ocr=replace(
+            settings.ocr,
+            server_url="https://ocr.example/v1",
+            local_url=None,
+            model=model,
+            min_concurrency=1,
+            max_concurrency=1,
+        ),
+    )
+    seen = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        seen.append(payload["model"])
+        return httpx.Response(
+            200,
+            json={
+                "model": "served-fixture-model",
+                "choices": [{"message": {"content": "# Actual response fixture"}}],
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+        result = await submit_tiles(
+            requests=[OCRRequest(tile_id="tile-model", tile_bytes=b"tile")],
+            settings=settings,
+            client=client,
+        )
+    assert seen == [model]
+    assert result.markdown_chunks == ["# Actual response fixture"]
+    assert result.batches[0].requested_model == model
+    assert result.batches[0].served_model == "served-fixture-model"
+
+
 def test_extract_glm_openai_markdown_from_string_content() -> None:
     response = {"choices": [{"message": {"content": "# Parsed"}}]}
     assert extract_glm_openai_markdown(response) == "# Parsed"
@@ -346,7 +393,9 @@ async def test_submit_tiles_glm_maas_contract_and_telemetry() -> None:
 
 
 @pytest.mark.asyncio
-async def test_submit_tiles_glm_maas_retries_5xx_then_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_submit_tiles_glm_maas_retries_5xx_then_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     settings = get_settings()
     maas_settings = replace(
         settings,
@@ -374,7 +423,9 @@ async def test_submit_tiles_glm_maas_retries_5xx_then_succeeds(monkeypatch: pyte
         attempt_count += 1
         if attempt_count == 1:
             return httpx.Response(503, json={"error": "busy"})
-        return httpx.Response(200, json={"task_id": "maas-ok", "data": {"result": {"content": "Recovered"}}})
+        return httpx.Response(
+            200, json={"task_id": "maas-ok", "data": {"result": {"content": "Recovered"}}}
+        )
 
     transport = httpx.MockTransport(_handler)
     async with httpx.AsyncClient(transport=transport) as client:
@@ -555,7 +606,9 @@ async def test_submit_tiles_openai_results_entry_accepts_text_key(
 
 
 @pytest.mark.asyncio
-async def test_probe_ocr_backend_local_gpu_exposes_adaptive_tuning(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_probe_ocr_backend_local_gpu_exposes_adaptive_tuning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     _mock_local_service_ready(monkeypatch)
     settings = get_settings()
     local_settings = replace(
@@ -773,7 +826,9 @@ async def test_submit_tiles_local_cpu_latency_uses_hysteresis_suppression(
     monkeypatch.setattr(ocr_client_module, "_submit_batch", _fake_submit_batch)
 
     request = OCRRequest(tile_id="tile-local-cpu-latency", tile_bytes=b"tile-local")
-    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda _: httpx.Response(200))) as client:
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(200))
+    ) as client:
         first = await submit_tiles(requests=[request], settings=local_settings, client=client)
         second = await submit_tiles(requests=[request], settings=local_settings, client=client)
 
@@ -1014,30 +1069,61 @@ async def test_real_ocr_api_multiple_images():
 
 @pytest.mark.asyncio
 @pytest.mark.skipif(not OLMOCR_API_KEY, reason="Requires real OCR API key")
-async def test_real_ocr_api_with_actual_webpage_screenshot():
+async def test_real_ocr_api_with_actual_webpage_screenshot(tmp_path, monkeypatch):
     """Test with a real screenshot from an actual website."""
     settings = get_settings()
 
-    # Use playwright to capture a real website with proper cleanup
-    browser = None
-    try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch()
-            page = await browser.new_page()
+    from dataclasses import asdict, replace
+    from bs4 import BeautifulSoup
+    from app import capture
 
-            # Navigate to a real website
-            await page.goto("https://example.com")
-
-            # Take a real screenshot
-            screenshot_bytes = await page.screenshot(full_page=True)
-    finally:
-        if browser:
-            await browser.close()
+    # Exercise the supported viewport-only capture path, with verified CfT,
+    # fonts and public-only connection enforcement. Retain its actual evidence.
+    active = replace(
+        settings,
+        NETWORK_PRIVATE_CIDRS=(),
+        NETWORK_TRUSTED_OWNERS=(),
+        NETWORK_TRUST_LOCAL_OPERATOR=False,
+    )
+    monkeypatch.setattr(capture, "get_settings", lambda: active)
+    captured = await capture.capture_tiles(
+        capture.CaptureConfig(url="https://example.com", viewport_height=900, device_scale_factor=1)
+    )
+    assert captured.tiles and captured.manifest.cft_pin_verified
+    assert captured.manifest.browser_transport == "cdp"
+    assert captured.dom_snapshot and b"Example Domain" in captured.dom_snapshot
+    # The current site's title is in <head>, while the viewport shows an icon
+    # and multilingual paragraphs. Bind the OCR oracle to visible body input,
+    # not to an obsolete assumption that the document title is a heading.
+    document = BeautifulSoup(captured.dom_snapshot, "html.parser")
+    paragraph = next(
+        (
+            node.get_text(" ", strip=True)
+            for node in document.select("body p")
+            if node.get_text(" ", strip=True).startswith("This domain is for use")
+        ),
+        None,
+    )
+    assert paragraph is not None
+    with (tmp_path / "capture-manifest.json").open("x") as handle:
+        json.dump(asdict(captured.manifest), handle, indent=2)
+    screenshot_bytes = captured.tiles[0].png_bytes
+    with (tmp_path / "ocr-input.png").open("xb") as handle:
+        handle.write(screenshot_bytes)
 
     # Submit real screenshot to OCR
     request = OCRRequest(tile_id="real_webpage_001", tile_bytes=screenshot_bytes)
 
     result = await submit_tiles(requests=[request], settings=settings)
+    with (tmp_path / "ocr-evidence.json").open("x") as handle:
+        json.dump(
+            {
+                "batches": [asdict(batch) for batch in result.batches],
+                "markdown": result.markdown_chunks,
+            },
+            handle,
+            indent=2,
+        )
 
     # Verify real response
     assert len(result.batches) == 1
@@ -1046,7 +1132,16 @@ async def test_real_ocr_api_with_actual_webpage_screenshot():
     # Real OCR should detect content from example.com
     markdown = result.markdown_chunks[0]
     assert len(markdown) > 0
-    # example.com has "Example Domain" text that should be detected
+    expected = " ".join(paragraph.casefold().split())
+    actual = " ".join(markdown.casefold().split())
+    assert expected in actual
+    for bad in (
+        "",
+        "# Example Domain",
+        actual.replace("documentation examples", "fabricated nonsense"),
+    ):
+        with pytest.raises(AssertionError):
+            assert expected in " ".join(bad.casefold().split())
 
 
 @pytest.mark.asyncio

@@ -372,7 +372,10 @@ class LocalOCRClient:
                             "text": prompt
                             or "Convert this image to markdown preserving structure and text.",
                         },
-                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{image_b64}"},
+                        },
                     ],
                 }
             ],

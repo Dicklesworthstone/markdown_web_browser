@@ -42,9 +42,11 @@ def test_crawl_request_schema_round_trip() -> None:
     assert str(again.url).startswith("https://example.com")
 
 
-def test_crawl_endpoint_returns_crawl_id(monkeypatch: pytest.MonkeyPatch, client: TestClient) -> None:
+def test_crawl_endpoint_returns_crawl_id(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
     """POST /jobs/crawl should return a crawl_id without actually launching."""
-    fake_state: dict[str[str, object]] = {}
+    fake_state: dict[str, object] = {}
 
     class _FakeOrchestrator:
         async def start_crawl(self, config, capture_fn=None):  # noqa: ANN001
@@ -110,7 +112,7 @@ def test_capture_manifest_exposes_semantic_post_fields() -> None:
     """CaptureManifest must carry the new fields so /jobs/{id}/manifest.json surfaces them."""
     from app.capture import CaptureManifest
 
-    fields = CaptureManifest.__dataclass_fields__  # type: ignore[attr-defined]
+    fields = CaptureManifest.__dataclass_fields__
     assert "semantic_post_summary" in fields
     assert "semantic_post_ms" in fields
 
@@ -126,7 +128,9 @@ def test_semantic_post_disabled_is_noop_when_request_unset() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_metrics_slo_no_data_when_no_manifests(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_metrics_slo_no_data_when_no_manifests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.chdir(tmp_path)
     summary = _compute_live_slo_summary()
     assert summary["status"] == "no-data"
@@ -139,9 +143,18 @@ def test_metrics_slo_returns_rollup_when_manifest_present(
     smoke = tmp_path / "benchmarks" / "production"
     smoke.mkdir(parents=True)
     fake_entries = [
-        {"category": "news", "timings": {"capture_ms": 1000, "ocr_ms": 4000, "stitch_ms": 200, "total_ms": 5200}},
-        {"category": "news", "timings": {"capture_ms": 1500, "ocr_ms": 5000, "stitch_ms": 250, "total_ms": 6750}},
-        {"category": "dashboards", "timings": {"capture_ms": 2000, "ocr_ms": 6000, "stitch_ms": 300, "total_ms": 8300}},
+        {
+            "category": "news",
+            "timings": {"capture_ms": 1000, "ocr_ms": 4000, "stitch_ms": 200, "total_ms": 5200},
+        },
+        {
+            "category": "news",
+            "timings": {"capture_ms": 1500, "ocr_ms": 5000, "stitch_ms": 250, "total_ms": 6750},
+        },
+        {
+            "category": "dashboards",
+            "timings": {"capture_ms": 2000, "ocr_ms": 6000, "stitch_ms": 300, "total_ms": 8300},
+        },
     ]
     (smoke / "latest_manifest_index.json").write_text(json.dumps(fake_entries))
     monkeypatch.chdir(tmp_path)

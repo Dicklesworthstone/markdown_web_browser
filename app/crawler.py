@@ -443,7 +443,7 @@ async def submit_and_wait_for_job(
         reuse_cache=reuse_cache,
     )
     snapshot = await job_manager.create_job(request)
-    job_id = str(snapshot["job_id"]) if isinstance(snapshot, dict) else snapshot.job_id
+    job_id = str(snapshot["id"]) if isinstance(snapshot, dict) else snapshot.id
     deadline = asyncio.get_event_loop().time() + timeout_s
     while asyncio.get_event_loop().time() < deadline:
         snap = job_manager.get_snapshot(job_id)

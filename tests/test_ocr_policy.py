@@ -110,25 +110,33 @@ def test_should_reevaluate_policy_signals() -> None:
         reevaluate_after_s=30,
     )
     assert (
-        should_reevaluate_policy(signal=OCRRuntimeSignal.REQUEST_FAILED, decision=decision).reason_code
+        should_reevaluate_policy(
+            signal=OCRRuntimeSignal.REQUEST_FAILED, decision=decision
+        ).reason_code
         == REASON_REEVAL_FAILURE
     )
     assert (
-        should_reevaluate_policy(signal=OCRRuntimeSignal.BACKEND_UNHEALTHY, decision=decision)
-        .reason_code
+        should_reevaluate_policy(
+            signal=OCRRuntimeSignal.BACKEND_UNHEALTHY, decision=decision
+        ).reason_code
         == REASON_REEVAL_FAILURE
     )
     assert (
-        should_reevaluate_policy(signal=OCRRuntimeSignal.BACKEND_RECOVERED, decision=decision)
-        .reason_code
+        should_reevaluate_policy(
+            signal=OCRRuntimeSignal.BACKEND_RECOVERED, decision=decision
+        ).reason_code
         == REASON_REEVAL_RECOVERED
     )
     assert (
-        should_reevaluate_policy(signal=OCRRuntimeSignal.LATENCY_SPIKE, decision=decision).reason_code
+        should_reevaluate_policy(
+            signal=OCRRuntimeSignal.LATENCY_SPIKE, decision=decision
+        ).reason_code
         == REASON_REEVAL_LATENCY
     )
     assert (
-        should_reevaluate_policy(signal=OCRRuntimeSignal.PERIODIC_TIMER, decision=decision).reason_code
+        should_reevaluate_policy(
+            signal=OCRRuntimeSignal.PERIODIC_TIMER, decision=decision
+        ).reason_code
         == REASON_REEVAL_TIMER
     )
     assert (
@@ -226,3 +234,82 @@ def test_should_reevaluate_policy_hard_failure_bypasses_suppression() -> None:
     assert result.should_reevaluate is True
     assert result.reason_code == REASON_REEVAL_FAILURE
     assert result.hard_failure_bypass is True
+
+
+def test_declared_model_policy_changes_provider_limits_and_capture_size(monkeypatch):
+    from app import ocr_policy
+    from app.jobs import _build_capture_config, _build_cache_seed
+    from app.schemas import JobCreateRequest
+    from app.settings import get_settings
+
+    policies = ocr_policy.load_model_policies()
+    default = ocr_policy.resolve_model_policy("olmOCR-2-7B-1025-FP8")
+    smaller = ocr_policy.OCRModelPolicy.model_validate(
+        {**default.model_dump(), "long_side_px": 640}
+    )
+    monkeypatch.setattr(
+        ocr_policy,
+        "load_model_policies",
+        lambda: tuple(smaller if p.key == default.key else p for p in policies),
+    )
+    request = JobCreateRequest(url="https://example.com", ocr_policy=default.key.lower())
+    settings = ocr_policy.settings_for_policy(get_settings(), request.ocr_policy)
+    config = _build_capture_config(request, settings)
+    assert config.long_side_px == 640
+    assert settings.ocr.model == default.key and settings.ocr.use_fp8 is True
+    fp16 = ocr_policy.settings_for_policy(get_settings(), "olmocr-2-7b-1025")
+    assert fp16.ocr.model == "olmOCR-2-7B-1025"
+    assert fp16.ocr.max_concurrency <= 6 and fp16.ocr.use_fp8 is False
+    other_config = _build_capture_config(
+        JobCreateRequest(url=request.url, ocr_policy=fp16.ocr.model), fp16
+    )
+    assert other_config.long_side_px == 1288
+    assert _build_cache_seed(config=config, settings=settings) != _build_cache_seed(
+        config=other_config, settings=fp16
+    )
+    with pytest.raises(ValueError, match="exceeds"):
+        _build_capture_config(
+            JobCreateRequest(url=request.url, ocr_policy=default.key, long_side_px=1288), settings
+        )
+
+
+@pytest.mark.parametrize("policy", ["unknown", "GLM-OCR-MaaS", "GOT-OCR-2", ""])
+def test_unavailable_policies_refused_on_every_request_contract(policy):
+    from app.schemas import BatchJobRequest, CrawlRequest, JobCreateRequest, JobReplayRequest
+
+    for model, payload in (
+        (JobCreateRequest, {"url": "https://example.com"}),
+        (BatchJobRequest, {"urls": ["https://example.com"]}),
+        (CrawlRequest, {"url": "https://example.com"}),
+        (JobReplayRequest, {}),
+    ):
+        with pytest.raises(ValueError):
+            model.model_validate({**payload, "ocr_policy": policy})
+
+
+def test_ignored_nested_capture_options_now_refuse():
+    from app.schemas import BatchJobRequest, CrawlRequest, JobCreateRequest, JobReplayRequest
+
+    for model, payload in (
+        (JobCreateRequest, {"url": "https://example.com"}),
+        (BatchJobRequest, {"urls": ["https://example.com"]}),
+        (CrawlRequest, {"url": "https://example.com"}),
+        (JobReplayRequest, {}),
+    ):
+        for key, value in (
+            ("viewport", {"width": 640}),
+            ("ocr", {"model": "unknown"}),
+            ("typo", True),
+        ):
+            with pytest.raises(ValueError, match="Extra inputs"):
+                model.model_validate({**payload, key: value})
+
+
+@pytest.mark.parametrize("content", ["[]", "{}", "x: []", "x: {long_side_px: -1}"])
+def test_model_registry_rejects_malformed_definition(tmp_path, content):
+    from app.ocr_policy import load_model_policies
+
+    path = tmp_path / "models.yaml"
+    path.write_text(content)
+    with pytest.raises(ValueError):
+        load_model_policies(path)

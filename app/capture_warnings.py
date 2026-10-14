@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import List
-
-from playwright.async_api import Page
+from typing import Protocol
 
 from app.settings import WarningSettings
+
+
+class WarningPage(Protocol):
+    """The DOM evaluation operation consumed by the warning collector."""
+
+    async def evaluate(self, expression: str, /) -> Mapping[str, int | str]: ...
 
 
 @dataclass(slots=True)
@@ -30,7 +35,7 @@ class CaptureWarningEntry:
     threshold: float
 
 
-async def collect_warning_stats(page: Page) -> WarningStats:
+async def collect_warning_stats(page: WarningPage) -> WarningStats:
     """Inspect the DOM and return counts that drive warning decisions."""
 
     result = await page.evaluate(
@@ -60,10 +65,10 @@ def build_warnings(
     settings: WarningSettings,
     sticky_threshold: int = 3,
     dialog_threshold: int = 1,
-) -> List[CaptureWarningEntry]:
+) -> list[CaptureWarningEntry]:
     """Convert DOM stats into structured warnings."""
 
-    warnings: List[CaptureWarningEntry] = []
+    warnings: list[CaptureWarningEntry] = []
 
     if (
         settings.canvas_warning_threshold > 0
@@ -107,8 +112,8 @@ def build_warnings(
 
 
 async def collect_capture_warnings(
-    page: Page, settings: WarningSettings
-) -> List[CaptureWarningEntry]:
+    page: WarningPage, settings: WarningSettings
+) -> list[CaptureWarningEntry]:
     """Gather DOM stats and produce warning entries using configured thresholds."""
 
     stats = await collect_warning_stats(page)
@@ -121,10 +126,10 @@ def build_sweep_warning(
     overlap_pairs: int,
     overlap_match_ratio: float,
     settings: WarningSettings,
-) -> List[CaptureWarningEntry]:
+) -> list[CaptureWarningEntry]:
     """Emit warnings derived from sweep stats (shrink + overlap ratios)."""
 
-    warnings: List[CaptureWarningEntry] = []
+    warnings: list[CaptureWarningEntry] = []
 
     if settings.shrink_warning_threshold > 0 and shrink_events >= settings.shrink_warning_threshold:
         warnings.append(

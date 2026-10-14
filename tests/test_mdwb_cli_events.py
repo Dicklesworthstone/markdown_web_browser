@@ -721,12 +721,12 @@ def test_run_hook_handles_json_serialization_errors(monkeypatch):
     monkeypatch.setattr(subprocess, "run", fake_subprocess_run)
 
     # Create a malicious object that can't be JSON serialized
-    class UnserializableObj:
+    class UnserializablePayload(dict[str, object]):
         def __str__(self):
             return "malicious'; rm -rf /; echo 'pwned"
 
     # Create a payload that will cause JSON serialization to fail
-    malicious_payload = UnserializableObj()
+    malicious_payload = UnserializablePayload(data=object())
 
     mdwb_cli._run_hook("echo test", "event", malicious_payload)
 

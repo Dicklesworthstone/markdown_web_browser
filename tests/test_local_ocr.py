@@ -79,7 +79,10 @@ def _gpu_snapshot() -> HardwareCapabilitySnapshot:
 
 
 def test_normalize_endpoint_trims_openai_suffix() -> None:
-    assert _normalize_endpoint("http://localhost:8001/v1/chat/completions") == "http://localhost:8001/v1"
+    assert (
+        _normalize_endpoint("http://localhost:8001/v1/chat/completions")
+        == "http://localhost:8001/v1"
+    )
     assert _normalize_endpoint("http://localhost:8001/v1/models") == "http://localhost:8001/v1"
 
 
@@ -107,7 +110,9 @@ def test_build_start_plan_gpu_uses_alias_and_parallelism() -> None:
 
 
 @pytest.mark.asyncio
-async def test_ensure_service_reuses_existing_healthy_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_ensure_service_reuses_existing_healthy_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     manager = LocalOCRServiceManager()
     settings = get_settings()
     local_settings = replace(
@@ -116,7 +121,9 @@ async def test_ensure_service_reuses_existing_healthy_endpoint(monkeypatch: pyte
     )
 
     async def _healthy_probe(
-        endpoint: str, *, timeout: int  # noqa: ARG001
+        endpoint: str,
+        *,
+        timeout: int,  # noqa: ARG001
     ) -> tuple[bool, int | None, str | None]:
         return True, 200, f"{endpoint}/models"
 
@@ -150,7 +157,9 @@ async def test_ensure_service_autostarts_when_unhealthy(monkeypatch: pytest.Monk
     probe_calls = 0
 
     async def _probe(
-        endpoint: str, *, timeout: int  # noqa: ARG001
+        endpoint: str,
+        *,
+        timeout: int,  # noqa: ARG001
     ) -> tuple[bool, int | None, str | None]:
         nonlocal probe_calls
         probe_calls += 1
@@ -194,7 +203,9 @@ async def test_ensure_service_honors_autostart_disabled(monkeypatch: pytest.Monk
     )
 
     async def _probe(
-        endpoint: str, *, timeout: int  # noqa: ARG001
+        endpoint: str,
+        *,
+        timeout: int,  # noqa: ARG001
     ) -> tuple[bool, int | None, str | None]:
         return False, None, f"{endpoint}/models"
 
@@ -223,7 +234,9 @@ async def test_ensure_service_retries_and_reports_failure(monkeypatch: pytest.Mo
     pid_counter = 1000
 
     async def _probe(
-        endpoint: str, *, timeout: int  # noqa: ARG001
+        endpoint: str,
+        *,
+        timeout: int,  # noqa: ARG001
     ) -> tuple[bool, int | None, str | None]:
         return False, None, f"{endpoint}/models"
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import ipaddress
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -49,6 +50,8 @@ class BrowserSettings:
     screenshot_mask_selectors: tuple[str, ...]
     screenshot_style_hash: str
     blocklist_path: Path
+    cft_executable: Path | None = None
+    fontconfig_file: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,6 +140,10 @@ class Settings:
     # Authentication settings
     REQUIRE_API_KEY: bool = False
     API_KEY_HEADER: str = "X-API-Key"
+    RATE_LIMIT_PER_MINUTE: int = 60
+    NETWORK_PRIVATE_CIDRS: tuple[str, ...] = ()
+    NETWORK_TRUSTED_OWNERS: tuple[str, ...] = ()
+    NETWORK_TRUST_LOCAL_OPERATOR: bool = False
 
     def manifest_environment(self, *, playwright_version: str | None = None) -> ManifestEnvironment:
         """Return the manifest metadata block used across captures."""
@@ -342,6 +349,10 @@ def get_settings(env_path: str = ".env") -> Settings:
         screenshot_mask_selectors=mask_selectors,
         screenshot_style_hash=screenshot_hash,
         blocklist_path=blocklist_path,
+        cft_executable=Path(cfg("CFT_EXECUTABLE")) if cfg("CFT_EXECUTABLE", default="") else None,
+        fontconfig_file=Path(cfg("PLAYWRIGHT_FONTCONFIG_FILE"))
+        if cfg("PLAYWRIGHT_FONTCONFIG_FILE", default="")
+        else None,
     )
     ocr = OCRSettings(
         server_url=cfg("OLMOCR_SERVER", default="https://ai2endpoints.cirrascale.ai/api"),
@@ -407,6 +418,19 @@ def get_settings(env_path: str = ".env") -> Settings:
     # Authentication settings
     require_api_key = _bool(cfg, "REQUIRE_API_KEY", default=False)
     api_key_header = cfg("API_KEY_HEADER", default="X-API-Key")
+    rate_limit_per_minute = _int(cfg, "RATE_LIMIT_PER_MINUTE", default=60)
+    if rate_limit_per_minute <= 0:
+        raise ValueError("RATE_LIMIT_PER_MINUTE must be positive")
+    private_cidrs = tuple(
+        str(ipaddress.ip_network(value.strip(), strict=True))
+        for value in cfg("NETWORK_PRIVATE_CIDRS", default="").split(",")
+        if value.strip()
+    )
+    trusted_owners = tuple(
+        value.strip()
+        for value in cfg("NETWORK_TRUSTED_OWNERS", default="").split(",")
+        if value.strip()
+    )
 
     return Settings(
         env_path=env_path,
@@ -421,6 +445,10 @@ def get_settings(env_path: str = ".env") -> Settings:
         server_runtime=server_runtime,
         REQUIRE_API_KEY=require_api_key,
         API_KEY_HEADER=api_key_header,
+        RATE_LIMIT_PER_MINUTE=rate_limit_per_minute,
+        NETWORK_PRIVATE_CIDRS=private_cidrs,
+        NETWORK_TRUSTED_OWNERS=trusted_owners,
+        NETWORK_TRUST_LOCAL_OPERATOR=_bool(cfg, "NETWORK_TRUST_LOCAL_OPERATOR", default=False),
     )
 
 

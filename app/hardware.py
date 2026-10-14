@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
+from importlib import import_module
 import os
 import platform
 import subprocess
@@ -146,7 +147,7 @@ def _detect_nvidia_gpus(runner: CommandRunner) -> tuple[list[GPUDeviceCapability
 
 def _detect_torch_gpus() -> tuple[list[GPUDeviceCapability], list[str]]:
     try:
-        import torch  # type: ignore[import-not-found]
+        torch = import_module("torch")
     except Exception:
         return [], []
 

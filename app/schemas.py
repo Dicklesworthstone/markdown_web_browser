@@ -3,16 +3,42 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+import re
+from typing import Annotated, Any
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, Field, HttpUrl, field_validator, model_validator
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    HttpUrl,
+    field_validator,
+    model_validator,
+)
 
 from app.embeddings import EMBEDDING_DIM
+from app.ocr_policy import validate_ocr_policy
+
+
+def validate_profile_id(value: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}", value):
+        raise ValueError(
+            "Profile IDs must start with a letter, digit, _ or - and contain only letters, digits, ., _ or - (max 128)"
+        )
+    return value
+
+
+ProfileId = Annotated[str, AfterValidator(validate_profile_id)]
+OCRPolicyId = Annotated[str, AfterValidator(validate_ocr_policy)]
 
 
 class JobCreateRequest(BaseModel):
     """Payload clients submit to kick off a capture job."""
+
+    model_config = ConfigDict(extra="forbid")
+    ocr_policy: OCRPolicyId | None = None
+    tags: list[str] = Field(default_factory=list, max_length=100)
 
     url: str = Field(description="Target URL to capture")
 
@@ -33,7 +59,7 @@ class JobCreateRequest(BaseModel):
 
         return value
 
-    profile_id: str | None = Field(default=None, description="Browser profile identifier")
+    profile_id: ProfileId | None = Field(default=None, description="Browser profile identifier")
     viewport_width: int | None = Field(
         default=None, ge=1, le=32767, description="Override viewport width"
     )
@@ -82,6 +108,7 @@ class JobCreateRequest(BaseModel):
 class ReplayRequest(BaseModel):
     """Payload for replaying a stored manifest."""
 
+    model_config = ConfigDict(extra="forbid")
     manifest: dict[str, Any] = Field(description="Manifest JSON to replay")
 
     @field_validator("manifest")
@@ -525,10 +552,13 @@ class BatchJobRequest(BaseModel):
     the single-URL POST /jobs contract (id, state, cache_hit, etc.).
     """
 
-    urls: list[str] = Field(..., min_length=1, max_length=200, description="URLs to capture in parallel")
-    profile_id: str | None = Field(default=None)
+    model_config = ConfigDict(extra="forbid")
+    urls: list[str] = Field(
+        ..., min_length=1, max_length=200, description="URLs to capture in parallel"
+    )
+    profile_id: ProfileId | None = Field(default=None)
     reuse_cache: bool = True
-    ocr_policy: str | None = None
+    ocr_policy: OCRPolicyId | None = None
     tags: list[str] = Field(
         default_factory=list,
         description="Free-form labels (e.g. 'dataset:2026-q1', 'team:research') for later /jobs filtering",
@@ -638,18 +668,27 @@ class CrawlRequest(BaseModel):
     request, reusing the same OCR/concurrency settings across the entire crawl.
     """
 
+    model_config = ConfigDict(extra="forbid")
     url: HttpUrl = Field(..., description="Seed URL to crawl (becomes depth 0)")
     max_pages: int = Field(default=10, ge=1, le=200, description="Hard cap on captured pages")
-    max_depth: int = Field(default=1, ge=0, le=2, description="0=seed only, 1=seed+discovered, 2=two hops")
+    max_depth: int = Field(
+        default=1, ge=0, le=2, description="0=seed only, 1=seed+discovered, 2=two hops"
+    )
     domain_allowlist: list[str] = Field(
         default_factory=list,
         description="Restrict expansion to these domains (and subdomains). Empty = follow any link.",
     )
     respect_robots_txt: bool = Field(default=True, description="Honor robots.txt Disallow rules")
-    crawl_delay_ms: int = Field(default=500, ge=0, le=60_000, description="Delay between requests (ms)")
+    crawl_delay_ms: int = Field(
+        default=500, ge=0, le=60_000, description="Delay between requests (ms)"
+    )
     reuse_cache: bool = Field(default=True, description="Reuse content-addressed captures")
-    profile_id: str | None = Field(default=None, description="Auth profile id (passed to each child job)")
-    ocr_policy: str | None = Field(default=None, description="OCR policy key for each child")
+    profile_id: ProfileId | None = Field(
+        default=None, description="Auth profile id (passed to each child job)"
+    )
+    ocr_policy: OCRPolicyId | None = Field(
+        default=None, description="OCR policy key for each child"
+    )
 
 
 class CrawlResponse(BaseModel):
@@ -1056,9 +1095,10 @@ class EmbedderStatsResponse(BaseModel):
 class JobReplayRequest(BaseModel):
     """Request for POST /jobs/{id}/replay — re-emit as a fresh run."""
 
+    model_config = ConfigDict(extra="forbid")
     reuse_cache: bool = True
-    profile_id: str | None = None
-    ocr_policy: str | None = None
+    profile_id: ProfileId | None = None
+    ocr_policy: OCRPolicyId | None = None
 
 
 class JobReplayResponse(BaseModel):
@@ -1145,9 +1185,13 @@ class AdminStatsResponse(BaseModel):
 class AdminPruneRequest(BaseModel):
     """Request for POST /admin/jobs/prune."""
 
-    older_than_days: int = Field(..., ge=1, le=365, description="Delete DONE/FAILED jobs older than N days")
+    older_than_days: int = Field(
+        ..., ge=1, le=365, description="Delete DONE/FAILED jobs older than N days"
+    )
     state: str | None = Field(default=None, description="Restrict to a given state")
-    dry_run: bool = Field(default=True, description="If true, just count candidates without deleting")
+    dry_run: bool = Field(
+        default=True, description="If true, just count candidates without deleting"
+    )
 
 
 class AdminPruneResponse(BaseModel):
@@ -1187,14 +1231,18 @@ class FollowResponse(BaseModel):
     anchor: str
     resolved_href: str | None = None
     resolved_text: str | None = None
-    candidates: list[str] = Field(default_factory=list, description="Other in-page anchors that may match")
+    candidates: list[str] = Field(
+        default_factory=list, description="Other in-page anchors that may match"
+    )
 
 
 class ExportMdQuery(BaseModel):
     """Query for /jobs/{id}/export.md — controls streaming behavior."""
 
     max_chars: int | None = Field(default=None, ge=1, le=2_000_000)
-    strip_provenance: bool = Field(default=True, description="Remove '<!-- source: ... -->' comments")
+    strip_provenance: bool = Field(
+        default=True, description="Remove '<!-- source: ... -->' comments"
+    )
 
 
 class ExportMdResponse(BaseModel):
