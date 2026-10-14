@@ -1,3 +1,5 @@
+import { renderSafeHtml, safeLink, setupAuthentication } from './client.js';
+
 const MAX_EVENT_ROWS = 50;
 const EVENTS_RETRY_INTERVAL_MS = 2000;
 const EMBEDDING_DIM = 1536;
@@ -46,10 +48,6 @@ function initSseHandlers() {
   const root = document.querySelector('[data-stream-root]');
   const statusEl = document.getElementById('job-sse-status');
   if (!root || !statusEl) {
-    return null;
-  }
-  if (typeof window.htmx === 'undefined') {
-    console.warn('htmx not available; SSE extension disabled');
     return null;
   }
 
@@ -104,6 +102,9 @@ function initSseHandlers() {
         break;
       case 'raw':
         el.textContent = payload;
+        if (fieldMap.get('rendered') && typeof marked !== 'undefined') {
+          renderSafeHtml(fieldMap.get('rendered'), marked.parse(payload));
+        }
         break;
       case 'links':
         renderLinks(el, payload);
@@ -112,7 +113,7 @@ function initSseHandlers() {
         renderArtifacts(el, payload);
         break;
       default:
-        el.innerHTML = payload;
+        renderSafeHtml(el, payload);
     }
   };
 
@@ -152,10 +153,55 @@ function initSseHandlers() {
     streamTemplate: root.dataset.streamTemplate || '/jobs/{job_id}/stream',
   };
 
+  let source = null;
   const setConnectUrl = (jobId) => {
     const url = buildTemplateUrl(state.streamTemplate, jobId);
-    root.setAttribute('sse-connect', url);
-    window.htmx.process(root);
+    source?.close();
+    source = new EventSource(url);
+    const activeSource = source;
+    let lastSequence = null;
+    source.addEventListener('job-event', (event) => {
+      if (source === activeSource && /^\d+$/.test(event.lastEventId)) {
+        lastSequence = Number(event.lastEventId);
+      }
+    });
+    source.onopen = () => setStatus(`Connected (${state.jobId})`, 'success');
+    source.onerror = async () => {
+      if (source !== activeSource) return;
+      setStatus('Disconnected — retrying…', 'warning');
+      if (lastSequence === null || state.jobId === 'demo') return;
+      try {
+        const params = new URLSearchParams({ after: String(lastSequence) });
+        const response = await fetch(buildTemplateUrl('/jobs/{job_id}/events.json', state.jobId, params));
+        if (source !== activeSource) return;
+        if (response.status === 409) {
+          activeSource.close();
+          refreshManifest(state.jobId);
+          refreshLinks(state.jobId);
+          setConnectUrl(state.jobId);
+        } else if (response.status === 404) {
+          activeSource.close();
+          setStatus('Job is no longer available.', 'warning');
+        }
+      } catch (error) {
+        // Native EventSource retries transient transport failures.
+        console.error('Failed to check progress cursor', error);
+      }
+    };
+    source.addEventListener('gap', () => {
+      if (source !== activeSource) return;
+      activeSource.close();
+      setStatus('Progress history expired. Reloading the current job…', 'warning');
+      refreshManifest(state.jobId);
+      refreshLinks(state.jobId);
+      // A fresh connection starts at retained history; never reuse the expired ID.
+      setConnectUrl(state.jobId);
+    });
+    for (const [name, handler] of Object.entries(eventHandlers)) {
+      source.addEventListener(name, event => {
+        if (source === activeSource) handler(event.data);
+      });
+    }
   };
 
   const connect = (jobId) => {
@@ -562,7 +608,7 @@ function createLinkRow(entry) {
   title.textContent = entry.text || '(no text)';
   const href = document.createElement('a');
   href.className = 'link-entry__href';
-  href.href = entry.href || '#';
+  href.href = safeLink(entry.href || '#');
   href.target = '_blank';
   href.rel = 'noreferrer noopener';
   href.textContent = entry.href || '—';
@@ -1398,6 +1444,14 @@ function initEventsPanel(root) {
     try {
       const entry = JSON.parse(trimmed);
       const kind = entry.event || 'snapshot';
+      if (kind === 'gap') {
+        cursor = null;
+        setStatus('Event history expired. Reloading retained progress…', 'warning');
+        return;
+      }
+      if (Number.isInteger(entry.sequence) && cursor !== null && entry.sequence <= cursor) {
+        return;
+      }
       if (kind === 'heartbeat') {
         setStatus(`Heartbeat ${entry.data?.count ?? ''}`.trim(), 'pending');
       } else if (entry.snapshot) {
@@ -1407,26 +1461,32 @@ function initEventsPanel(root) {
         appendEventLine(entry);
         setStatus(`Event ${entry.event}`, 'info');
       }
-      if (entry.timestamp) {
-        cursor = entry.timestamp;
+      if (Number.isInteger(entry.sequence)) {
+        cursor = entry.sequence;
       }
     } catch (error) {
       console.error('Failed to parse events payload', error);
     }
   };
 
-  const streamOnce = async () => {
+  const streamOnce = async (controller, jobId) => {
     const params = new URLSearchParams();
-    if (cursor) {
-      params.set('since', cursor);
+    if (cursor !== null) {
+      params.set('after', String(cursor));
     }
     const template = root.dataset.eventsTemplate || '/jobs/{job_id}/events';
-    const response = await fetch(buildTemplateUrl(template, activeJobId, params), {
-      signal: abortController.signal,
+    const response = await fetch(buildTemplateUrl(template, jobId, params), {
+      signal: controller.signal,
     });
+    if (controller !== abortController || controller.signal.aborted) return;
     if (response.status === 404) {
       setStatus('Events feed not available yet.', 'warning');
       await sleep(EVENTS_RETRY_INTERVAL_MS);
+      return;
+    }
+    if (response.status === 409) {
+      cursor = null;
+      setStatus('Event history expired. Reloading retained progress…', 'warning');
       return;
     }
     if (!response.ok) {
@@ -1434,15 +1494,17 @@ function initEventsPanel(root) {
     }
     if (!(response.body?.getReader)) {
       const text = await response.text();
+      if (controller !== abortController || controller.signal.aborted) return;
       text.split('\n').forEach(handleLine);
       return;
     }
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
-    setStatus(`Streaming events for ${activeJobId}…`, 'success');
-    while (!abortController?.signal.aborted) {
+    setStatus(`Streaming events for ${jobId}…`, 'success');
+    while (controller === abortController && !controller.signal.aborted) {
       const { value, done } = await reader.read();
+      if (controller !== abortController || controller.signal.aborted) return;
       if (done) {
         buffer += decoder.decode();
         if (buffer) {
@@ -1461,18 +1523,18 @@ function initEventsPanel(root) {
     }
   };
 
-  const streamLoop = async () => {
-    while (abortController && !abortController.signal.aborted) {
+  const streamLoop = async (controller, jobId) => {
+    while (controller === abortController && !controller.signal.aborted) {
       try {
-        await streamOnce();
+        await streamOnce(controller, jobId);
       } catch (error) {
-        if (abortController?.signal.aborted) {
+        if (controller !== abortController || controller.signal.aborted) {
           return;
         }
         console.error('Events feed failed', error);
         setStatus(error.message || 'Events feed error', 'error');
       }
-      if (abortController?.signal.aborted) {
+      if (controller !== abortController || controller.signal.aborted) {
         break;
       }
       await sleep(EVENTS_RETRY_INTERVAL_MS);
@@ -1494,8 +1556,9 @@ function initEventsPanel(root) {
     if (resumeButton) {
       resumeButton.disabled = true;
     }
-    streamTask = streamLoop().catch((error) => {
-      if (!abortController?.signal.aborted) {
+    const controller = abortController;
+    streamTask = streamLoop(controller, activeJobId).catch((error) => {
+      if (controller === abortController && !controller.signal.aborted) {
         console.error('Events stream crashed', error);
         setStatus(error.message || 'Events feed error', 'error');
         if (resumeButton) {
@@ -1663,6 +1726,10 @@ function init() {
   setupTabs();
   const sse = initSseHandlers();
   initStreamControls(sse);
+  setupAuthentication(() => {
+    document.querySelectorAll('[data-sse-field]').forEach(el => { el.textContent = ''; });
+    sse?.connect('demo');
+  }).catch(error => console.error('Authentication settings unavailable', error));
 }
 
 init();

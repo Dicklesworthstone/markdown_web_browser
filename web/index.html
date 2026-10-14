@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Markdown Web Browser</title>
     <link rel="stylesheet" href="/static/tailwind.css" />
+    <script src="/static/purify.min.js" defer></script>
     <script src="/static/htmx.min.js" defer></script>
     <script src="/static/htmx-ext-sse.js" defer></script>
   </head>
@@ -17,8 +18,6 @@
       data-links-template="/jobs/{job_id}/links.json"
       data-manifest-template="/jobs/{job_id}/manifest.json"
       data-events-template="/jobs/{job_id}/events"
-      hx-ext="sse"
-      sse-connect="/jobs/demo/stream"
     >
       <header class="toolbar">
         <div class="toolbar__group">
@@ -213,6 +212,7 @@
       </section>
     </div>
 
+    <script src="/static/marked.min.js"></script>
     <script src="/static/app.js" type="module"></script>
   </body>
 </html>
