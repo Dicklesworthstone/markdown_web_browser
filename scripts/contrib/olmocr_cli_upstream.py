@@ -15,7 +15,7 @@ import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import List, Optional, Tuple, cast
+from typing import List, Optional, Tuple
 
 import zstandard
 
@@ -523,8 +523,8 @@ def run(
             logger.info("Detected running vLLM at %s; reusing it.", detected_server)
 
     use_external_server = detected_server is not None
-    if use_external_server:
-        server_for_cli = cast(str, detected_server)
+    if detected_server is not None:
+        server_for_cli = detected_server
         base_cmd.extend(["--server", server_for_cli])
         base_cmd.extend(["--model", server_model_name])
         metrics = _fetch_server_metrics(server_for_cli)

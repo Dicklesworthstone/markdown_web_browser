@@ -24,11 +24,14 @@ def _write_pointer_files(
     include_slo: bool = False,
     over_budget: bool = False,
     use_seam_marker_list: bool = False,
+    omit: frozenset[str] = frozenset(),
 ) -> None:
     root.mkdir(parents=True, exist_ok=True)
-    (root / "latest.txt").write_text("2025-11-08\n", encoding="utf-8")
-    (root / "latest_summary.md").write_text("# Summary\n\nSmoke output", encoding="utf-8")
-    manifest_rows = [
+    if "latest.txt" not in omit:
+        (root / "latest.txt").write_text("2025-11-08\n", encoding="utf-8")
+    if "latest_summary.md" not in omit:
+        (root / "latest_summary.md").write_text("# Summary\n\nSmoke output", encoding="utf-8")
+    manifest_rows: list[dict[str, object]] = [
         {
             "category": "docs",
             "url": "https://example.com/article",
@@ -61,13 +64,17 @@ def _write_pointer_files(
             {"hash": "tile-b"},
             {"hash": "tile-a"},  # duplicate hash exercises unique counting
         ]
-    (root / "latest_manifest_index.json").write_text(json.dumps(manifest_rows), encoding="utf-8")
+    if "latest_manifest_index.json" not in omit:
+        (root / "latest_manifest_index.json").write_text(
+            json.dumps(manifest_rows), encoding="utf-8"
+        )
     metrics_payload = {
         "date": "2025-11-08",
         "categories": [{"name": "docs", "p95_capture_ms": 1200, "p95_total_ms": 2200}],
     }
-    (root / "latest_metrics.json").write_text(json.dumps(metrics_payload), encoding="utf-8")
-    if include_weekly:
+    if "latest_metrics.json" not in omit:
+        (root / "latest_metrics.json").write_text(json.dumps(metrics_payload), encoding="utf-8")
+    if include_weekly and "weekly_summary.json" not in omit:
         weekly_payload = {
             "window_days": 7,
             "generated_at": "2025-11-08T00:00:00Z",
@@ -100,7 +107,7 @@ def _write_pointer_files(
             ],
         }
         (root / "weekly_summary.json").write_text(json.dumps(weekly_payload), encoding="utf-8")
-    if include_slo:
+    if include_slo and "latest_slo_summary.json" not in omit:
         slo_payload = {
             "generated_at": "2025-11-08T01:00:00Z",
             "categories": {
@@ -243,16 +250,16 @@ def test_show_latest_smoke_json_output(tmp_path: Path):
 
 
 def test_show_latest_smoke_manifest_missing(tmp_path: Path):
-    _write_pointer_files(tmp_path)
-    (tmp_path / "latest_manifest_index.json").unlink()
+    _write_pointer_files(tmp_path, omit=frozenset({"latest_manifest_index.json"}))
+    assert not (tmp_path / "latest_manifest_index.json").exists()
     result = _invoke_show(tmp_path, "--manifest")
     assert result.exit_code == 1
     assert "latest_manifest_index" in result.output
 
 
 def test_show_latest_smoke_manifest_missing_json(tmp_path: Path):
-    _write_pointer_files(tmp_path)
-    (tmp_path / "latest_manifest_index.json").unlink()
+    _write_pointer_files(tmp_path, omit=frozenset({"latest_manifest_index.json"}))
+    assert not (tmp_path / "latest_manifest_index.json").exists()
     result = _invoke_show(tmp_path, "--manifest", "--json")
     assert result.exit_code == 1
     assert "latest_manifest_index" in result.output
@@ -275,8 +282,8 @@ def test_show_latest_smoke_json_summarizes_raw_seam_markers(tmp_path: Path):
 
 
 def test_show_latest_smoke_metrics_missing_json(tmp_path: Path):
-    _write_pointer_files(tmp_path)
-    (tmp_path / "latest_metrics.json").unlink()
+    _write_pointer_files(tmp_path, omit=frozenset({"latest_metrics.json"}))
+    assert not (tmp_path / "latest_metrics.json").exists()
     result = _invoke_show(tmp_path, "--metrics", "--json")
     assert result.exit_code == 1
     assert "latest_metrics.json missing" in result.output
@@ -293,6 +300,7 @@ def test_show_latest_smoke_metrics_only(tmp_path: Path):
 def test_show_latest_smoke_fails_when_pointer_empty(tmp_path: Path):
     _write_pointer_files(tmp_path)
     (tmp_path / "latest.txt").write_text("   \n", encoding="utf-8")
+    assert (tmp_path / "latest.txt").exists()
     result = _invoke_show(tmp_path, "--manifest")
     assert result.exit_code == 1
     assert "latest.txt is empty" in result.output
@@ -327,8 +335,8 @@ def test_show_latest_smoke_check_passes(tmp_path: Path):
 
 def test_show_latest_smoke_check_missing_file(tmp_path: Path):
     module = _load_cli()
-    _write_pointer_files(tmp_path)
-    (tmp_path / "latest_manifest_index.json").unlink()
+    _write_pointer_files(tmp_path, omit=frozenset({"latest_manifest_index.json"}))
+    assert not (tmp_path / "latest_manifest_index.json").exists()
     result = runner.invoke(module.app, ["check", "--root", str(tmp_path)])
     assert result.exit_code == 1
     assert "manifest_index" in result.output
@@ -365,8 +373,8 @@ def test_show_latest_smoke_check_json_missing(tmp_path: Path):
 
 def test_show_latest_smoke_check_json_missing_summary(tmp_path: Path):
     module = _load_cli()
-    _write_pointer_files(tmp_path)
-    (tmp_path / "latest_summary.md").unlink()
+    _write_pointer_files(tmp_path, omit=frozenset({"latest_summary.md"}))
+    assert not (tmp_path / "latest_summary.md").exists()
     result = runner.invoke(module.app, ["check", "--root", str(tmp_path), "--json"])
     assert result.exit_code == 1
     payload = json.loads(result.output)
@@ -431,8 +439,8 @@ def test_show_latest_smoke_check_requires_slo_present(tmp_path: Path):
 
 def test_show_latest_smoke_check_pointer_missing(tmp_path: Path):
     module = _load_cli()
-    _write_pointer_files(tmp_path)
-    (tmp_path / "latest.txt").unlink()
+    _write_pointer_files(tmp_path, omit=frozenset({"latest.txt"}))
+    assert not (tmp_path / "latest.txt").exists()
     result = runner.invoke(module.app, ["check", "--root", str(tmp_path)])
     assert result.exit_code == 1
     assert "Missing smoke artifacts" in result.output
@@ -443,14 +451,15 @@ def test_show_latest_smoke_check_fails_when_pointer_empty(tmp_path: Path):
     module = _load_cli()
     _write_pointer_files(tmp_path)
     (tmp_path / "latest.txt").write_text("\n", encoding="utf-8")
+    assert (tmp_path / "latest.txt").exists()
     result = runner.invoke(module.app, ["check", "--root", str(tmp_path)])
     assert result.exit_code == 1
     assert "latest.txt is empty" in result.output
 
 
 def test_show_latest_smoke_show_missing_summary(tmp_path: Path):
-    _write_pointer_files(tmp_path)
-    (tmp_path / "latest_summary.md").unlink()
+    _write_pointer_files(tmp_path, omit=frozenset({"latest_summary.md"}))
+    assert not (tmp_path / "latest_summary.md").exists()
     result = _invoke_show(tmp_path, "--summary")
     assert result.exit_code == 0
     assert "latest_summary.md missing" in result.output

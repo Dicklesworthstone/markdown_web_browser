@@ -14,7 +14,8 @@ import time
 import traceback
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, TypedDict
+from urllib.parse import urlsplit
 
 from rich.console import Console, Group
 from rich.panel import Panel
@@ -36,7 +37,12 @@ from rich.markdown import Markdown
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from app.settings import get_settings
+from app.settings import get_settings, load_config
+
+
+class TestResult(TypedDict):
+    success: bool
+    data: dict[str, Any]
 
 
 class IntegrationTestRunner:
@@ -47,6 +53,11 @@ class IntegrationTestRunner:
         self.verbose = verbose
         self.console = Console(record=True, width=140)
         self.settings = get_settings()
+        cfg = load_config(self.settings.env_path)
+        self.headers = {"User-Agent": "OpenAI File Downloader, XaiImageApiFetch/1.0"}
+        api_key = cfg("MDWB_API_KEY", default="")
+        if api_key:
+            self.headers[self.settings.API_KEY_HEADER] = api_key
         self.test_results: Dict[str, Any] = {}
         self.start_time = time.time()
 
@@ -69,14 +80,14 @@ class IntegrationTestRunner:
 
         info_table.add_row("Test Started", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
         info_table.add_row("API Endpoint", self.api_url)
-        info_table.add_row("OCR Server", self.settings.OLMOCR_SERVER)
-        info_table.add_row("OCR Model", self.settings.OLMOCR_MODEL)
+        info_table.add_row("OCR Server", self.settings.ocr.server_url)
+        info_table.add_row("OCR Model", self.settings.ocr.model)
         info_table.add_row(
             "Python Version",
             f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
         )
-        info_table.add_row("Playwright Channel", self.settings.PLAYWRIGHT_CHANNEL)
-        info_table.add_row("Cache Root", str(self.settings.CACHE_ROOT))
+        info_table.add_row("Playwright Channel", self.settings.browser.playwright_channel)
+        info_table.add_row("Cache Root", str(self.settings.storage.cache_root))
 
         self.console.print(info_table)
         self.console.print()
@@ -89,10 +100,10 @@ class IntegrationTestRunner:
         panel_content = Text("Testing API health endpoint to verify server is running", style="dim")
         self.console.print(Panel(panel_content, title="🏥 Health Check", border_style="blue"))
 
-        result = {"success": False, "data": {}}
+        result: TestResult = {"success": False, "data": {}}
 
         try:
-            async with httpx.AsyncClient() as client:
+            async with httpx.AsyncClient(headers=self.headers) as client:
                 # Show request details
                 request_table = Table(title="Request Details", box=box.SIMPLE)
                 request_table.add_column("Field", style="cyan")
@@ -163,10 +174,12 @@ class IntegrationTestRunner:
         )
         self.console.print(Panel(panel_content, title="📸 Capture Job", border_style="blue"))
 
-        result = {"success": False, "data": {}}
+        result: TestResult = {"success": False, "data": {}}
 
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(60.0), headers=self.headers
+            ) as client:
                 # Prepare request
                 payload = {
                     "url": url,
@@ -313,15 +326,17 @@ class IntegrationTestRunner:
         panel_content = Text(f"Retrieving artifacts for job: {job_id}", style="cyan")
         self.console.print(Panel(panel_content, title="📦 Artifacts", border_style="blue"))
 
-        result = {"success": False, "data": {}}
+        result: TestResult = {"success": False, "data": {}}
 
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
-                artifacts = {}
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(30.0), headers=self.headers
+            ) as client:
+                artifacts: dict[str, str | dict[str, Any] | list[dict[str, Any]]] = {}
 
                 # Test different artifact endpoints
                 endpoints = [
-                    ("Markdown", f"/jobs/{job_id}/out.md"),
+                    ("Markdown", f"/jobs/{job_id}/result.md"),
                     ("Links JSON", f"/jobs/{job_id}/links.json"),
                     ("Manifest", f"/jobs/{job_id}/manifest.json"),
                 ]
@@ -339,6 +354,20 @@ class IntegrationTestRunner:
 
                             if response.status_code == 200:
                                 content = response.text if name == "Markdown" else response.json()
+                                if name == "Markdown" and not content.strip():
+                                    raise ValueError("Markdown artifact is empty")
+                                if name == "Manifest" and not (
+                                    isinstance(content, dict) and content
+                                ):
+                                    raise ValueError("Manifest artifact must be a nonempty object")
+                                if name == "Links JSON" and not (
+                                    isinstance(content, dict)
+                                    or isinstance(content, list)
+                                    and all(isinstance(link, dict) for link in content)
+                                ):
+                                    raise ValueError(
+                                        "Links artifact must be an object or object list"
+                                    )
                                 size = len(response.content)
                                 artifacts[name] = content
 
@@ -358,8 +387,9 @@ class IntegrationTestRunner:
                 self.console.print(artifact_table)
 
                 # Show sample of markdown content
-                if "Markdown" in artifacts:
-                    md_content = artifacts["Markdown"][:500]  # First 500 chars
+                markdown = artifacts.get("Markdown")
+                if isinstance(markdown, str):
+                    md_content = markdown[:500]  # First 500 chars
                     md_panel = Panel(
                         Markdown(md_content + "\n\n*... (truncated)*"),
                         title="📝 Markdown Preview",
@@ -370,18 +400,31 @@ class IntegrationTestRunner:
                 # Show links summary
                 if "Links JSON" in artifacts:
                     links_data = artifacts["Links JSON"]
-                    total_links = sum(
-                        len(domain["links"]) for domain in links_data.get("domains", [])
-                    )
+                    if isinstance(links_data, list):
+                        links = links_data
+                    elif isinstance(links_data, dict):
+                        if "domains" in links_data:
+                            links = [
+                                link for domain in links_data["domains"] for link in domain["links"]
+                            ]
+                        else:
+                            links = links_data.get("anchors")
+                    else:
+                        raise ValueError("Links artifact has invalid shape")
+                    if not isinstance(links, list) or not all(
+                        isinstance(link, dict) for link in links
+                    ):
+                        raise ValueError("Links entries must be objects")
+                    domains = {urlsplit(str(link.get("href", ""))).netloc for link in links}
 
                     links_tree = Tree("🔗 Links Summary")
-                    links_tree.add(f"Total Links: {total_links}")
-                    links_tree.add(f"Domains: {len(links_data.get('domains', []))}")
+                    links_tree.add(f"Total Links: {len(links)}")
+                    links_tree.add(f"Domains: {len(domains)}")
 
                     self.console.print(links_tree)
 
                 result = {
-                    "success": len(artifacts) > 0,
+                    "success": len(artifacts) == len(endpoints),
                     "data": {
                         "artifacts_retrieved": list(artifacts.keys()),
                         "total_size": sum(len(str(v)) for v in artifacts.values()),
@@ -408,13 +451,13 @@ class IntegrationTestRunner:
         panel_content = Text("Checking Prometheus metrics endpoint", style="dim")
         self.console.print(Panel(panel_content, title="📈 Metrics", border_style="blue"))
 
-        result = {"success": False, "data": {}}
+        result: TestResult = {"success": False, "data": {}}
 
         try:
-            async with httpx.AsyncClient() as client:
+            async with httpx.AsyncClient(headers=self.headers) as client:
                 # Get metrics
                 with self.console.status("[bold green]Fetching metrics..."):
-                    response = await client.get(f"{self.api_url}:9000/metrics", timeout=5.0)
+                    response = await client.get(f"{self.api_url}/metrics", timeout=5.0)
 
                 if response.status_code == 200:
                     metrics_text = response.text
@@ -453,13 +496,19 @@ class IntegrationTestRunner:
                     self.console.print(metrics_table)
 
                     result = {
-                        "success": True,
+                        "success": bool(metrics_data),
                         "data": {
                             "metrics_count": len(metrics_data),
                             "sample_metrics": {k: v for k, v in list(metrics_data.items())[:5]},
                         },
                     }
-                    self.console.print("✅ [green]Metrics endpoint is healthy![/green]")
+                    if metrics_data:
+                        self.console.print("✅ [green]Metrics endpoint is healthy![/green]")
+                    else:
+                        result["data"]["error"] = "Metrics endpoint returned no numeric samples"
+                        self.console.print(
+                            "❌ [red]Metrics endpoint returned no numeric samples[/red]"
+                        )
                 else:
                     self.console.print(
                         f"⚠️ [yellow]Metrics endpoint returned {response.status_code}[/yellow]"
@@ -467,11 +516,10 @@ class IntegrationTestRunner:
                     result["data"]["status_code"] = response.status_code
 
         except Exception as e:
-            # Metrics might not be available, which is okay
-            self.console.print(f"ℹ️ [yellow]Metrics endpoint not available: {str(e)}[/yellow]")
+            self.console.print(f"❌ [red]Metrics endpoint not available: {str(e)}[/red]")
             result = {
-                "success": True,  # Not a critical failure
-                "data": {"note": "Metrics endpoint not configured"},
+                "success": False,
+                "data": {"error": str(e)},
             }
 
         self.console.print()
