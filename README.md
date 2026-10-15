@@ -320,7 +320,7 @@ mdwb fetch https://finviz.com --watch
    - Python 3.13, uv ≥0.8, and the system deps Playwright requires.
    - Install system dependencies: `sudo apt-get install libvips-dev` (Ubuntu/Debian) or `brew install vips` (macOS).
    - Sync the Python3.13 environment: `uv sync --python 3.13 --extra dev`.
-   - Install bundled Chromium/system dependencies with `uv run playwright install chromium --with-deps`. Separately install the exact [Chrome for Testing](https://googlechromelabs.github.io/chrome-for-testing/) build selected by `CFT_VERSION` and set `CFT_EXECUTABLE`; the capture adapter verifies the observed build.
+   - Install bundled Chromium/system dependencies with `uv run playwright install chromium --with-deps`. Separately install the exact [Chrome for Testing](https://googlechromelabs.github.io/chrome-for-testing/) build selected by `CFT_VERSION` and set `CFT_EXECUTABLE`; the capture adapter verifies the observed build. On Linux x86_64, `install.sh` does this for the default `chrome-130.0.6723.69` pin (`python -m scripts.install_helpers install-cft`), checking the archive against the same SHA-256 as CI.
    - Optional (GPU/olmOCR power users): run `scripts/setup_olmocr_cuda12.sh` to provision CUDA 12.6 + the local vLLM toolchain described in `docs/olmocr_cli_tool_documentation.md`.
 2. **Configure environment**
    - Create `.env` from `.env.example` only if it does not exist; preserve existing configuration.
@@ -383,7 +383,7 @@ The CLI reads `API_BASE_URL` + `MDWB_API_KEY` from `.env`; override with `--api-
 Both helpers reuse the CLI’s auth + HTTP plumbing, accept the same `--api-base/--http2` flags, fall back to existing jobs when you only need post-processing, and now support `--out` so automations can ingest the results directly.
 
 ## Prerequisites & environment
-- **Chrome for Testing pin:** Install the exact `CFT_VERSION` build from [official CfT artifacts](https://github.com/GoogleChromeLabs/chrome-for-testing). Set `CFT_EXECUTABLE` to its executable, or on Linux place it at `~/.cache/mdwb/cft/<four-part-build>/chrome-linux64/chrome`. The capture launcher refuses missing or mismatched builds before OCR; stock Chrome is a separate, explicitly unqualified channel. `.env` remains operator-owned.
+- **Chrome for Testing pin:** Install the exact `CFT_VERSION` build from [official CfT artifacts](https://github.com/GoogleChromeLabs/chrome-for-testing). Set `CFT_EXECUTABLE` to its executable, or on Linux place it at `~/.cache/mdwb/cft/<four-part-build>/chrome-linux64/chrome`. The capture launcher refuses missing or mismatched builds before OCR; stock Chrome is a separate, explicitly unqualified channel. `.env` remains operator-owned; the installer only removes the colored log lines that installers before 2026-10-14 wrote into it (and resets the `CFT_VERSION` they garbled to the pin), keeping the original as `.env.bak-legacy-cft-<timestamp>`.
 - **Transport + viewport:** Defaults (`PLAYWRIGHT_TRANSPORT=cdp`, viewport 1280×2000, DPR 2) live in `app/settings.py` and must align with PLAN §§3, 19.
 - **OCR credentials:** `OLMOCR_SERVER`, `OLMOCR_API_KEY`, and `OLMOCR_MODEL` are required unless you point at `OCR_LOCAL_URL`.
 - **Warning log + blocklist:** Keep `WARNING_LOG_PATH` and `BLOCKLIST_PATH` writable so scroll/overlay incidents are persisted (`docs/config.md` documents every field).

@@ -24,6 +24,9 @@ APT_LOCK_WAIT_SECONDS="${MDWB_APT_LOCK_WAIT_SECONDS:-300}"
 # Verified official versioned installer bytes; changes require a fresh hash review.
 readonly UV_INSTALLER_VERSION="0.13.0"
 readonly UV_INSTALLER_SHA256="283cbef4bdaca819bd896b0dacb8a085c4c05dbc880642aa5001d97bc4db74ba"
+# Chrome for Testing build the installer fetches on Linux x86_64; same archive digest as CI.
+readonly CFT_PINNED_BUILD="130.0.6723.69"
+readonly CFT_PINNED_LINUX64_SHA256="f789d53911a50cfa4a2bc1f09cde57567247f52515436d92b1aa9de93c2787d0"
 
 # Colors for output
 RED='\033[0;31m'
@@ -467,7 +470,7 @@ install_playwright_browsers() {
 
     print_color "$BLUE" "Installing Playwright Chromium..."
     print_color "$YELLOW" "  This installs Playwright's bundled Chromium for explicitly selected chromium runs."
-    print_color "$YELLOW" "  It does not install the exact Chrome for Testing build named by CFT_VERSION."
+    print_color "$YELLOW" "  The Chrome for Testing build named by CFT_VERSION is a separate step."
 
     # Playwright's bundled Chromium and Chrome for Testing are distinct artifacts.
     if [ "$(detect_os)" = "debian" ]; then
@@ -501,11 +504,49 @@ install_playwright_browsers() {
         fi
     fi
 
-    print_color "$YELLOW" "  Before capture, install the exact CfT build from:"
-    print_color "$YELLOW" "    https://googlechromelabs.github.io/chrome-for-testing/"
-    print_color "$YELLOW" "  Set CFT_EXECUTABLE to that executable; capture verifies its observed build."
-
     return 0
+}
+
+# Fetch the pinned Chrome for Testing build into the location the capture launcher
+# reads by default. Skipped when the configuration names another build or executable.
+install_pinned_cft() {
+    if [ "$INSTALL_BROWSERS" = false ]; then
+        return 0
+    fi
+    if [ "$(uname -s)" != Linux ] || [ "$(uname -m)" != x86_64 ]; then
+        print_color "$YELLOW" "  Chrome for Testing is fetched automatically only on Linux x86_64."
+        print_color "$YELLOW" "  Install the CFT_VERSION build from https://googlechromelabs.github.io/chrome-for-testing/"
+        print_color "$YELLOW" "  and set CFT_EXECUTABLE to it; capture verifies the observed build."
+        return 0
+    fi
+
+    local selected
+    selected=$(uv run --python 3.13 python - <<'PY'
+from app.capture import _normalize_channel
+from app.settings import get_settings
+
+browser = get_settings().browser
+channels = [_normalize_channel(value) for value in browser.playwright_channel.split(",")]
+if "cft" in channels and browser.cft_executable is None:
+    print(browser.cft_version.removeprefix("chrome-"))
+PY
+    ) || return 0
+    if [ -z "$selected" ]; then
+        return 0
+    fi
+    if [ "$selected" != "$CFT_PINNED_BUILD" ]; then
+        print_color "$YELLOW" "  CFT_VERSION names $selected; the installer only fetches the verified $CFT_PINNED_BUILD."
+        print_color "$YELLOW" "  Install that build from https://googlechromelabs.github.io/chrome-for-testing/"
+        return 0
+    fi
+
+    print_color "$BLUE" "Installing Chrome for Testing $CFT_PINNED_BUILD..."
+    if uv run --python 3.13 python -m scripts.install_helpers install-cft \
+        --build "$CFT_PINNED_BUILD" --sha256 "$CFT_PINNED_LINUX64_SHA256"; then
+        print_color "$GREEN" "✓ Chrome for Testing $CFT_PINNED_BUILD verified and in place"
+    else
+        print_color "$YELLOW" "⚠ Chrome for Testing was not installed; see the error above."
+    fi
 }
 
 # Function to setup configuration
@@ -513,7 +554,17 @@ setup_config() {
     print_color "$BLUE" "Setting up configuration..."
 
     if [ -e ".env" ] || [ -L ".env" ]; then
-        print_color "$GREEN" "✓ Preserved existing .env without modification"
+        local repaired
+        if ! repaired=$(uv run --python 3.13 python -m scripts.install_helpers repair-legacy-env \
+            --build "$CFT_PINNED_BUILD"); then
+            print_color "$RED" "Error: installer residue in .env could not be repaired."
+            return 1
+        fi
+        if [ -n "$repaired" ]; then
+            print_color "$YELLOW" "$repaired"
+        else
+            print_color "$GREEN" "✓ Preserved existing .env without modification"
+        fi
         if [ -n "$OCR_API_KEY" ]; then
             print_color "$YELLOW" "  --ocr-key was not applied because .env already exists."
         fi
@@ -781,6 +832,7 @@ main() {
     setup_python_env
     install_playwright_browsers
     setup_config
+    install_pinned_cft
 
     # Run tests
     echo
