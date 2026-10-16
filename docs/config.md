@@ -17,18 +17,21 @@ print(settings.ocr.server_url)
 
 | Name | Default | Purpose / Manifest Echo |
 | --- | --- | --- |
-| `OLMOCR_SERVER` | `https://ai2endpoints.cirrascale.ai/api` | Remote olmOCR endpoint recorded as `ocr.server_url`. Required for `scripts/olmocr_cli.py`. |
-| `OLMOCR_API_KEY` | *(unset)* | API key for hosted olmOCR. Required outside local dev (CLI now enforces this). |
-| `OLMOCR_MODEL` | `olmOCR-2-7B-1025-FP8` | Default OCR policy identifier included in manifests + provenance comments (required by CLI). |
-| `API_BASE_URL` | `http://localhost:8000` | FastAPI base URL consumed by the CLI + automation; the CLI now fails fast if unset. |
-| `MDWB_API_KEY` | *(unset)* | Optional bearer token for `/jobs` HTTP calls (CLI + automation). |
+| `OLMOCR_SERVER` | `https://ai2endpoints.cirrascale.ai/api` | Remote olmOCR endpoint recorded as `ocr.server_url` (falls back to `OCR_SERVER`). |
+| `OLMOCR_API_KEY` | *(unset)* | API key for hosted olmOCR (falls back to `OCR_API_KEY`). |
+| `OLMOCR_MODEL` | `olmOCR-2-7B-1025-FP8` | Default OCR policy identifier included in manifests + provenance comments (falls back to `OCR_MODEL`). |
+| `API_BASE_URL` | `http://localhost:8007` | FastAPI base URL consumed by the CLI + automation; the CLI fails fast if unset. |
+| `MDWB_API_KEY` | *(unset)* | Optional bearer/API key token for `/jobs` HTTP calls (CLI + automation). |
+| `REQUIRE_API_KEY` | `false` | Require API key authentication on protected API endpoints. |
+| `API_KEY_HEADER` | `X-API-Key` | HTTP header inspected for API keys alongside `Authorization: Bearer`. |
+| `RATE_LIMIT_PER_MINUTE` | `60` | Token-bucket rate limit per minute per identity/IP. |
 | `OCR_LOCAL_URL` | *(unset)* | Optional self-hosted olmOCR endpoint; overrides `OLMOCR_SERVER` when set. |
 | `OCR_LOCAL_AUTOSTART` | `true` | Enables automatic probe/reuse + local server autostart for local OpenAI-compatible OCR backends. |
 | `OCR_LOCAL_STARTUP_TIMEOUT_S` | `180` | Max seconds to wait for local OCR service readiness before deterministic failure/restart handling. |
 | `OCR_LOCAL_HEALTHCHECK_TIMEOUT_S` | `5` | Timeout (seconds) for each local OCR health probe attempt. |
 | `OCR_LOCAL_MAX_RESTARTS` | `1` | Number of restart attempts after a failed local OCR startup before marking local runtime unavailable. |
 | `OCR_USE_FP8` | `true` | Whether FP8 inference is enabled; surfaced via `environment.ocr_use_fp8`. |
-| `OCR_MAX_BATCH_TILES` | `3` | Maximum number of tiles bundled into each OCR HTTP request (helps keep payloads deterministic). |
+| `OCR_MAX_BATCH_TILES` | `3` | Maximum number of tiles bundled into each OCR HTTP request on batch-capable endpoints. |
 | `OCR_MAX_BATCH_BYTES` | `25000000` | Byte ceiling for a single OCR request; batches exceeding this size are split automatically. |
 | `OCR_DAILY_QUOTA_TILES` | *(unset)* | Optional hosted OCR quota (in tiles). When set, manifests emit warnings at 70 % usage. |
 | `OCR_MIN_CONCURRENCY` | `2` | Minimum OCR concurrency window (`environment.ocr_concurrency.min`). |
@@ -63,6 +66,15 @@ print(settings.ocr.server_url)
 | `PROMETHEUS_PORT` | `9000` | Port for the standalone Prometheus exporter (the API also exposes `/metrics`). |
 | `HTMX_SSE_HEARTBEAT_MS` | `4000` | Interval (ms) for SSE heartbeat events streamed to the UI. |
 | `WEBHOOK_SECRET` | `mdwb-dev-webhook` | Shared secret used to sign `/jobs/{id}/webhooks` callbacks. |
+| `SEMANTIC_POST_ENABLED` | `false` | Default enablement for optional LLM semantic post-processing. |
+| `SEMANTIC_POST_ENDPOINT` | *(empty)* | HTTP(S) or OpenAI-compatible `/v1/chat/completions` endpoint for semantic post-processing. |
+| `SEMANTIC_POST_MODEL` | *(empty)* | Model identifier sent to the semantic post-processor. |
+| `SEMANTIC_POST_API_KEY` | *(empty)* | Bearer token sent in `Authorization` header for semantic post-processing. |
+| `SEMANTIC_POST_TIMEOUT_MS` | `30000` | Timeout (ms) for semantic post-processing HTTP requests. |
+| `SEMANTIC_POST_MAX_CHARS` | *(unset)* | Optional character cap for Markdown passed to semantic post-processing. |
+| `OPENAI_BASE_URL` | *(empty)* | Base URL for `openai-compatible` text embedder (`/v1/embeddings`). |
+| `OPENAI_API_KEY` | *(empty)* | Bearer token for `openai-compatible` text embedder. |
+| `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` | Model identifier for `openai-compatible` text embedder. |
 | `MDWB_SERVER_IMPL` | `uvicorn` | API server runtime used by `scripts/run_server.py` (`uvicorn` for dev, `granian` for higher throughput). |
 | `MDWB_SERVER_WORKERS` | `1` | Worker processes for the launcher (set higher in production or when using Granian). |
 | `MDWB_GRANIAN_RUNTIME_THREADS` | `1` | Runtime threads per worker when running under Granian. |

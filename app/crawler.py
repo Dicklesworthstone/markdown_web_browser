@@ -121,6 +121,7 @@ class CrawlOrchestrator:
 
     def __init__(self, *, store: Any | None = None) -> None:
         self._active_crawls: Dict[str, CrawlState] = {}
+        self._tasks: Dict[str, asyncio.Task[None]] = {}
         self._robots_checker: Optional[RobotsChecker] = None
         # Optional JobManager-backed store; lets the crawler read links.json from
         # completed jobs so depth-1 expansion follows real anchors (not stubs).
@@ -145,9 +146,14 @@ class CrawlOrchestrator:
         if config.domain_allowlist:
             parsed = urlparse(url)
             domain = parsed.netloc.lower()
+            if ":" in domain:
+                domain = domain.split(":", 1)[0]
 
             allowed = False
-            for allowed_domain in config.domain_allowlist:
+            for raw_allowed in config.domain_allowlist:
+                allowed_domain = raw_allowed.lower().strip()
+                if ":" in allowed_domain:
+                    allowed_domain = allowed_domain.split(":", 1)[0]
                 if domain == allowed_domain or domain.endswith(f".{allowed_domain}"):
                     allowed = True
                     break
@@ -167,44 +173,88 @@ class CrawlOrchestrator:
         *,
         job_id: str,
         store: Any | None = None,
+        base_url: str | None = None,
     ) -> List[str]:
         """Extract outbound links from a completed capture job.
 
-        Reads ``links.json`` (harvested by ``app.dom_links``) so depth-1 expansion
-        follows the same anchors operators see in the dashboard. Returns absolute
-        URLs only; relative URLs and fragments are dropped (handled by the seed
-        domain filter at expansion time).
+        Reads persisted links via ``Store.read_links(job_id)`` or ``Store.fetch_run(job_id)``
+        (handling both the canonical ``list[dict]`` shape produced by ``serialize_links``
+        and ``{"anchors": [...]}`` mappings) so depth-1 expansion follows harvested anchors.
         """
-        if not job_id or store is None:
+        active_store = store if store is not None else self._store
+        if not job_id or active_store is None:
             return []
-        try:
-            record = store.get_run_record(job_id)  # type: ignore[attr-defined]
-        except Exception as exc:
-            LOGGER.warning("crawl: could not load run record for %s: %s", job_id, exc)
-            return []
-        if record is None:
-            return []
-        try:
-            artifact_root = record.artifact_root
-        except AttributeError:
-            return []
-        links_path = Path(artifact_root) / "links.json"
-        if not links_path.exists():
-            return []
-        try:
-            payload = json.loads(links_path.read_text(encoding="utf-8"))
-        except Exception as exc:
-            LOGGER.warning("crawl: failed to parse links.json for %s: %s", job_id, exc)
-            return []
-        anchors = payload.get("anchors") if isinstance(payload, dict) else None
+
+        payload: Any = None
+        read_links_fn = getattr(active_store, "read_links", None)
+        if callable(read_links_fn):
+            try:
+                payload = read_links_fn(job_id)
+            except Exception:
+                payload = None
+
+        if payload is None:
+            record = None
+            for attr_name in ("fetch_run", "get_run_record"):
+                fetcher = getattr(active_store, attr_name, None)
+                if callable(fetcher):
+                    try:
+                        record = fetcher(job_id)
+                        if record is not None:
+                            break
+                    except Exception as exc:
+                        LOGGER.warning("crawl: could not load run record for %s: %s", job_id, exc)
+            if record is None:
+                return []
+            artifact_dir = (
+                getattr(record, "cache_path", None)
+                or getattr(record, "artifact_root", None)
+            )
+            if not artifact_dir:
+                manifest_path = getattr(record, "manifest_path", None)
+                if manifest_path:
+                    artifact_dir = str(Path(str(manifest_path)).parent)
+            if not artifact_dir:
+                return []
+            links_path = Path(str(artifact_dir)) / "links.json"
+            if not links_path.exists():
+                return []
+            try:
+                payload = json.loads(links_path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                LOGGER.warning("crawl: failed to parse links.json for %s: %s", job_id, exc)
+                return []
+
+        if isinstance(payload, dict):
+            anchors = payload.get("anchors")
+        elif isinstance(payload, list):
+            anchors = payload
+        else:
+            anchors = None
         if not isinstance(anchors, list):
             return []
+
         urls: list[str] = []
+        seen: set[str] = set()
+        normalized_base = base_url.split("#", 1)[0] if base_url else None
         for entry in anchors:
             if not isinstance(entry, dict):
                 continue
-            href = entry.get("href")
-            if isinstance(href, str) and href.startswith(("http://", "https://")):
+            raw_href = entry.get("href")
+            if not isinstance(raw_href, str):
+                continue
+            href = raw_href.strip()
+            if not href or href.startswith(("#", "javascript:", "mailto:", "tel:", "data:")):
+                continue
+            if base_url and not href.startswith(("http://", "https://")):
+                href = urljoin(base_url, href)
+            href = href.split("#", 1)[0]
+            if not href.startswith(("http://", "https://")):
+                continue
+            if normalized_base and href == normalized_base:
+                continue
+            if href not in seen:
+                seen.add(href)
                 urls.append(href)
         return urls
 
@@ -213,23 +263,7 @@ class CrawlOrchestrator:
         config: CrawlConfig,
         capture_fn: Callable[[str], Any] | None = None,
     ) -> str:
-        """Start a new crawl job.
-
-        Args:
-            config: Crawl configuration
-            capture_fn: Function to call for capturing each URL
-                       Signature: async def capture(url: str) -> str (returns job_id)
-
-        Returns:
-            crawl_id: Unique identifier for this crawl
-
-        Example:
-            async def my_capture(url: str) -> str:
-                # Submit capture job and return job_id
-                return "job_abc123"
-
-            crawl_id = await orchestrator.start_crawl(config, my_capture)
-        """
+        """Start a new crawl job."""
         import uuid
 
         crawl_id = f"crawl_{uuid.uuid4().hex[:12]}"
@@ -248,7 +282,8 @@ class CrawlOrchestrator:
         self._active_crawls[crawl_id] = state
 
         # Start crawl in background
-        asyncio.create_task(self._run_crawl(crawl_id, capture_fn))
+        task = asyncio.create_task(self._run_crawl(crawl_id, capture_fn))
+        self._tasks[crawl_id] = task
 
         LOGGER.info(f"Started crawl {crawl_id} from {config.seed_url}")
 
@@ -259,12 +294,7 @@ class CrawlOrchestrator:
         crawl_id: str,
         capture_fn: Callable[[str], Any] | None = None,
     ) -> None:
-        """Execute the crawl (runs in background).
-
-        Args:
-            crawl_id: Crawl identifier
-            capture_fn: Function to capture each URL
-        """
+        """Execute the crawl (runs in background)."""
         state = self._active_crawls[crawl_id]
         config = state.config
 
@@ -274,8 +304,9 @@ class CrawlOrchestrator:
 
         try:
             while state.pending and len(state.visited) < config.max_pages:
-                # Get next URL
-                url = state.pending.pop()
+                # Pop lowest-depth URL first for deterministic breadth-first expansion
+                url = min(state.pending, key=lambda u: (state.url_depths.get(u, 0), u))
+                state.pending.remove(url)
                 depth = state.url_depths.get(url, 0)
 
                 LOGGER.info(f"Crawling {url} (depth={depth})")
@@ -307,22 +338,28 @@ class CrawlOrchestrator:
                         result.job_id = job_id
                         result.status = "success"
 
-                        # Extract links from the just-completed seed job
-                        if depth == 0 and job_id:
+                        # Extract links when further depth expansion is permitted
+                        if job_id and depth < config.max_depth:
                             links = await self._extract_links(
                                 job_id=job_id,
                                 store=self._store,
+                                base_url=url,
                             )
                             result.discovered_links = links
 
-                            # Add discovered links to pending
                             for link in links:
-                                if link not in state.visited and link not in state.pending:
+                                next_depth = depth + 1
+                                if (
+                                    link not in state.visited
+                                    and link not in state.pending
+                                    and self._should_crawl(link, config, next_depth)
+                                ):
                                     state.pending.add(link)
-                                    state.url_depths[link] = depth + 1
+                                    state.url_depths[link] = next_depth
 
                     except Exception as e:
                         LOGGER.error(f"Failed to capture {url}: {e}")
+                        result.job_id = getattr(e, "job_id", result.job_id)
                         result.status = "failed"
                         result.error = str(e)
                         state.failed.add(url)
@@ -332,7 +369,8 @@ class CrawlOrchestrator:
                 state.results.append(result)
 
                 # Delay between requests
-                await asyncio.sleep(config.crawl_delay_ms / 1000.0)
+                if config.crawl_delay_ms > 0 and state.pending and len(state.visited) < config.max_pages:
+                    await asyncio.sleep(config.crawl_delay_ms / 1000.0)
 
             # Mark as completed
             state.status = CrawlStatus.COMPLETED
@@ -344,20 +382,19 @@ class CrawlOrchestrator:
                 f"failed={len(state.failed)}"
             )
 
+        except asyncio.CancelledError:
+            state.status = CrawlStatus.FAILED
+            state.finished_at = datetime.now(timezone.utc)
+            raise
         except Exception as e:
             LOGGER.error(f"Crawl {crawl_id} failed: {e}")
             state.status = CrawlStatus.FAILED
             state.finished_at = datetime.now(timezone.utc)
+        finally:
+            self._tasks.pop(crawl_id, None)
 
     def get_crawl_status(self, crawl_id: str) -> Optional[Dict]:
-        """Get status of a crawl job.
-
-        Args:
-            crawl_id: Crawl identifier
-
-        Returns:
-            Status dict or None if not found
-        """
+        """Get status of a crawl job."""
         state = self._active_crawls.get(crawl_id)
         if not state:
             return None
@@ -368,10 +405,14 @@ class CrawlOrchestrator:
             "status": state.status.value,
             "started_at": state.started_at.isoformat(),
             "finished_at": state.finished_at.isoformat() if state.finished_at else None,
+            "max_pages": state.config.max_pages,
+            "max_depth": state.config.max_depth,
+            "visited": len(state.visited),
             "discovered": len(state.visited) + len(state.pending),
             "completed": len([r for r in state.results if r.status == "success"]),
             "failed": len(state.failed),
             "pending": len(state.pending),
+            "queued_urls": sorted(state.pending),
             "results": [
                 {
                     "url": r.url,
@@ -385,18 +426,14 @@ class CrawlOrchestrator:
         }
 
     async def cancel_crawl(self, crawl_id: str) -> bool:
-        """Cancel an active crawl.
-
-        Args:
-            crawl_id: Crawl identifier
-
-        Returns:
-            True if cancelled, False if not found
-        """
+        """Cancel an active crawl."""
         state = self._active_crawls.get(crawl_id)
         if not state:
             return False
 
+        task = self._tasks.pop(crawl_id, None)
+        if task is not None and not task.done():
+            task.cancel()
         state.status = CrawlStatus.FAILED
         state.finished_at = datetime.now(timezone.utc)
 
@@ -414,6 +451,8 @@ def get_crawler(*, store: Any | None = None) -> CrawlOrchestrator:
 
     if _global_crawler is None:
         _global_crawler = CrawlOrchestrator(store=store)
+    elif store is not None and _global_crawler._store is None:
+        _global_crawler._store = store
 
     return _global_crawler
 
@@ -425,14 +464,14 @@ async def submit_and_wait_for_job(
     profile_id: str | None = None,
     ocr_policy: str | None = None,
     reuse_cache: bool = True,
-    poll_interval_s: float = 1.0,
+    owner: str | None = None,
+    poll_interval_s: float = 0.05,
     timeout_s: float = 600.0,
 ) -> str:
     """Submit a capture via JobManager and block until it finishes.
 
-    Returns the job id. This is the bridge between CrawlOrchestrator and the
-    capture pipeline so depth-1 expansion reuses the same profile/OCR/cache
-    plumbing as a direct ``POST /jobs`` call.
+    Consumes the canonical ``id`` field from ``JobSnapshot`` and raises on
+    refusal, failure, cancellation, or timeout.
     """
     from app.schemas import JobCreateRequest
 
@@ -442,18 +481,57 @@ async def submit_and_wait_for_job(
         ocr_policy=ocr_policy,
         reuse_cache=reuse_cache,
     )
-    snapshot = await job_manager.create_job(request)
-    job_id = str(snapshot["job_id"]) if isinstance(snapshot, dict) else snapshot.job_id
-    deadline = asyncio.get_event_loop().time() + timeout_s
-    while asyncio.get_event_loop().time() < deadline:
+    if owner is not None:
+        try:
+            snapshot = await job_manager.create_job(request, owner=owner)
+        except TypeError:
+            snapshot = await job_manager.create_job(request)
+    else:
+        snapshot = await job_manager.create_job(request)
+
+    if isinstance(snapshot, dict):
+        raw_id = snapshot.get("id") or snapshot.get("job_id")
+    else:
+        raw_id = getattr(snapshot, "id", None) or getattr(snapshot, "job_id", None)
+    job_id = str(raw_id or "").strip()
+    if not job_id:
+        raise ValueError("JobManager.create_job returned a snapshot without canonical 'id'")
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_s
+    while True:
         snap = job_manager.get_snapshot(job_id)
         if snap is None:
+            err = RuntimeError(f"Capture job {job_id} disappeared before completion")
+            setattr(err, "job_id", job_id)
+            raise err
+        raw_state = snap.get("state") if isinstance(snap, dict) else getattr(snap, "state", None)
+        state = getattr(raw_state, "value", raw_state)
+        state_str = str(state or "").upper()
+        if state_str == "DONE":
             return job_id
-        state = snap.get("state") if isinstance(snap, dict) else getattr(snap, "state", None)
-        if state in {"DONE", "FAILED", "CANCELLED"}:
-            return job_id
+        if state_str in {"FAILED", "CANCELLED"}:
+            err_detail = (
+                snap.get("error")
+                if isinstance(snap, dict)
+                else getattr(snap, "error", None)
+            ) or state_str.lower()
+            err = RuntimeError(f"Capture job {job_id} {state_str.lower()}: {err_detail}")
+            setattr(err, "job_id", job_id)
+            raise err
+        if loop.time() >= deadline:
+            cancel_fn = getattr(job_manager, "cancel_job", None)
+            if callable(cancel_fn):
+                try:
+                    cancel_fn(job_id, reason=f"crawl timeout after {timeout_s}s")
+                except Exception:
+                    pass
+            timeout_err = TimeoutError(
+                f"Timed out waiting for capture job {job_id} after {timeout_s}s"
+            )
+            setattr(timeout_err, "job_id", job_id)
+            raise timeout_err
         await asyncio.sleep(poll_interval_s)
-    return job_id
 
 
 # Convenience function for simple crawls

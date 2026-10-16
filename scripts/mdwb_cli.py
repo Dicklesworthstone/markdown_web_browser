@@ -213,6 +213,7 @@ def _auth_headers(settings: APISettings) -> dict[str, str]:
     headers: dict[str, str] = {}
     if settings.api_key:
         headers["Authorization"] = f"Bearer {settings.api_key}"
+        headers["X-API-Key"] = settings.api_key
     return headers
 
 

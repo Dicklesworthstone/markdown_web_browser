@@ -21,8 +21,12 @@ __all__ = [
     "StorageSettings",
     "WarningSettings",
     "DeduplicationSettings",
+    "SemanticPostConfig",
+    "EmbedderConfig",
     "Settings",
     "resolve_ocr_backend_defaults",
+    "resolve_semantic_post_settings",
+    "resolve_openai_embedder_settings",
     "load_config",
     "get_settings",
 ]
@@ -49,6 +53,9 @@ class BrowserSettings:
     screenshot_mask_selectors: tuple[str, ...]
     screenshot_style_hash: str
     blocklist_path: Path
+    executable_path: Path | None = None
+    enforce_version_pin: bool = False
+    max_concurrent_browsers: int = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,6 +127,27 @@ class LoggingSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class SemanticPostConfig:
+    """Configuration for optional semantic post-processing."""
+
+    enabled: bool = False
+    endpoint: str = ""
+    model: str = ""
+    api_key: str = ""
+    timeout_ms: int = 30000
+    max_chars: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class EmbedderConfig:
+    """Configuration for OpenAI-compatible and local embedding backends."""
+
+    openai_base_url: str = ""
+    openai_api_key: str = ""
+    openai_embedding_model: str = "text-embedding-3-small"
+
+
+@dataclass(frozen=True, slots=True)
 class Settings:
     """Top-level immutable configuration container."""
 
@@ -134,9 +162,13 @@ class Settings:
     webhook_secret: str
     server_runtime: str
 
-    # Authentication settings
+    # Authentication & rate-limit settings
     REQUIRE_API_KEY: bool = False
     API_KEY_HEADER: str = "X-API-Key"
+    RATE_LIMIT_PER_MINUTE: int = 60
+    api_base_url: str = "http://localhost:8007"
+    semantic_post: SemanticPostConfig = SemanticPostConfig()
+    embedders: EmbedderConfig = EmbedderConfig()
 
     def manifest_environment(self, *, playwright_version: str | None = None) -> ManifestEnvironment:
         """Return the manifest metadata block used across captures."""
@@ -324,6 +356,15 @@ def get_settings(env_path: str = ".env") -> Settings:
         screenshot_mask_selectors=mask_selectors,
     )
 
+    exec_raw = str(
+        cfg("CFT_EXECUTABLE_PATH", default="")
+        or cfg("PLAYWRIGHT_EXECUTABLE_PATH", default="")
+        or ""
+    ).strip()
+    executable_path = Path(exec_raw) if exec_raw else None
+    enforce_version_pin = _bool(cfg, "CFT_ENFORCE_PIN", default=False)
+    max_concurrent_browsers = max(1, _int(cfg, "MAX_CONCURRENT_BROWSERS", default=4))
+
     browser = BrowserSettings(
         cft_version=cfg("CFT_VERSION", default="chrome-130.0.6723.69"),
         cft_label=cfg("CFT_LABEL", default="Stable-1"),
@@ -342,11 +383,21 @@ def get_settings(env_path: str = ".env") -> Settings:
         screenshot_mask_selectors=mask_selectors,
         screenshot_style_hash=screenshot_hash,
         blocklist_path=blocklist_path,
+        executable_path=executable_path,
+        enforce_version_pin=enforce_version_pin,
+        max_concurrent_browsers=max_concurrent_browsers,
+    )
+    ocr_server = cfg("OLMOCR_SERVER", default=None) or cfg(
+        "OCR_SERVER", default="https://ai2endpoints.cirrascale.ai/api"
+    )
+    ocr_api_key = cfg("OLMOCR_API_KEY", default=None) or cfg("OCR_API_KEY", default=None)
+    ocr_model = cfg("OLMOCR_MODEL", default=None) or cfg(
+        "OCR_MODEL", default="olmOCR-2-7B-1025-FP8"
     )
     ocr = OCRSettings(
-        server_url=cfg("OLMOCR_SERVER", default="https://ai2endpoints.cirrascale.ai/api"),
-        api_key=cfg("OLMOCR_API_KEY", default=None),
-        model=cfg("OLMOCR_MODEL", default="olmOCR-2-7B-1025-FP8"),
+        server_url=ocr_server,
+        api_key=ocr_api_key,
+        model=ocr_model,
         local_url=cfg("OCR_LOCAL_URL", default=None),
         local_autostart=_bool(cfg, "OCR_LOCAL_AUTOSTART", default=True),
         local_startup_timeout_s=_int(cfg, "OCR_LOCAL_STARTUP_TIMEOUT_S", default=180),
@@ -403,10 +454,29 @@ def get_settings(env_path: str = ".env") -> Settings:
     )
     webhook_secret = cfg("WEBHOOK_SECRET", default="mdwb-dev-webhook")
     server_runtime = cfg("MDWB_SERVER_IMPL", default="uvicorn").lower()
+    api_base_url = str(cfg("API_BASE_URL", default="http://localhost:8007")).strip()
 
-    # Authentication settings
+    semantic_post_cfg = SemanticPostConfig(
+        enabled=_bool(cfg, "SEMANTIC_POST_ENABLED", default=False),
+        endpoint=str(cfg("SEMANTIC_POST_ENDPOINT", default="") or "").strip(),
+        model=str(cfg("SEMANTIC_POST_MODEL", default="") or "").strip(),
+        api_key=str(cfg("SEMANTIC_POST_API_KEY", default="") or "").strip(),
+        timeout_ms=max(1000, _int(cfg, "SEMANTIC_POST_TIMEOUT_MS", default=30000)),
+        max_chars=_optional_int(cfg, "SEMANTIC_POST_MAX_CHARS"),
+    )
+    embedders_cfg = EmbedderConfig(
+        openai_base_url=str(cfg("OPENAI_BASE_URL", default="") or "").strip(),
+        openai_api_key=str(cfg("OPENAI_API_KEY", default="") or "").strip(),
+        openai_embedding_model=str(
+            cfg("OPENAI_EMBEDDING_MODEL", default="text-embedding-3-small")
+            or "text-embedding-3-small"
+        ).strip(),
+    )
+
+    # Authentication & rate-limit settings
     require_api_key = _bool(cfg, "REQUIRE_API_KEY", default=False)
     api_key_header = cfg("API_KEY_HEADER", default="X-API-Key")
+    rate_limit_per_minute = max(1, _int(cfg, "RATE_LIMIT_PER_MINUTE", default=60))
 
     return Settings(
         env_path=env_path,
@@ -421,7 +491,112 @@ def get_settings(env_path: str = ".env") -> Settings:
         server_runtime=server_runtime,
         REQUIRE_API_KEY=require_api_key,
         API_KEY_HEADER=api_key_header,
+        RATE_LIMIT_PER_MINUTE=rate_limit_per_minute,
+        api_base_url=api_base_url,
+        semantic_post=semantic_post_cfg,
+        embedders=embedders_cfg,
     )
+
+
+def resolve_semantic_post_settings(
+    active_settings: Settings | None = None,
+    *,
+    enabled_override: bool | None = None,
+    max_chars_override: int | None = None,
+) -> SemanticPostConfig:
+    """Resolve semantic post-processing config exclusively via python-decouple."""
+
+    s = active_settings or settings
+    cfg = load_config(s.env_path)
+    enabled = (
+        bool(enabled_override)
+        if enabled_override is not None
+        else _bool(cfg, "SEMANTIC_POST_ENABLED", default=s.semantic_post.enabled)
+    )
+    endpoint = str(
+        cfg("SEMANTIC_POST_ENDPOINT", default=s.semantic_post.endpoint) or ""
+    ).strip()
+    model = str(cfg("SEMANTIC_POST_MODEL", default=s.semantic_post.model) or "").strip()
+    api_key = str(
+        cfg("SEMANTIC_POST_API_KEY", default=s.semantic_post.api_key) or ""
+    ).strip()
+    timeout_ms = max(
+        1000,
+        _int(cfg, "SEMANTIC_POST_TIMEOUT_MS", default=s.semantic_post.timeout_ms),
+    )
+    max_chars = (
+        max_chars_override
+        if max_chars_override is not None
+        else _optional_int(cfg, "SEMANTIC_POST_MAX_CHARS") or s.semantic_post.max_chars
+    )
+    return SemanticPostConfig(
+        enabled=enabled,
+        endpoint=endpoint,
+        model=model,
+        api_key=api_key,
+        timeout_ms=timeout_ms,
+        max_chars=max_chars,
+    )
+
+
+def resolve_openai_embedder_settings(
+    active_settings: Settings | None = None,
+) -> EmbedderConfig:
+    """Resolve OpenAI-compatible embedder settings exclusively via python-decouple."""
+
+    s = active_settings or settings
+    cfg = load_config(s.env_path)
+    base_url = str(
+        cfg("OPENAI_BASE_URL", default=s.embedders.openai_base_url) or ""
+    ).strip()
+    api_key = str(cfg("OPENAI_API_KEY", default=s.embedders.openai_api_key) or "").strip()
+    model = str(
+        cfg("OPENAI_EMBEDDING_MODEL", default=s.embedders.openai_embedding_model)
+        or "text-embedding-3-small"
+    ).strip()
+    return EmbedderConfig(
+        openai_base_url=base_url,
+        openai_api_key=api_key,
+        openai_embedding_model=model,
+    )
+
+
+def effective_require_api_key(active_settings: Settings | None = None) -> bool:
+    """Resolve REQUIRE_API_KEY honoring both the Settings object and python-decouple overrides."""
+    s = active_settings or settings
+    if s.REQUIRE_API_KEY:
+        return True
+    try:
+        cfg = load_config(s.env_path)
+        return _bool(cfg, "REQUIRE_API_KEY", default=s.REQUIRE_API_KEY)
+    except Exception:
+        return bool(s.REQUIRE_API_KEY)
+
+
+def effective_api_key_header(active_settings: Settings | None = None) -> str:
+    """Resolve API_KEY_HEADER honoring both the Settings object and python-decouple overrides."""
+    s = active_settings or settings
+    if s.API_KEY_HEADER and s.API_KEY_HEADER != "X-API-Key":
+        return s.API_KEY_HEADER
+    try:
+        cfg = load_config(s.env_path)
+        header = str(cfg("API_KEY_HEADER", default=s.API_KEY_HEADER or "X-API-Key")).strip()
+        return header or "X-API-Key"
+    except Exception:
+        return s.API_KEY_HEADER or "X-API-Key"
+
+
+def effective_rate_limit_per_minute(active_settings: Settings | None = None) -> int:
+    """Resolve RATE_LIMIT_PER_MINUTE honoring both the Settings object and python-decouple overrides."""
+    s = active_settings or settings
+    default_rpm = getattr(s, "RATE_LIMIT_PER_MINUTE", 60)
+    if default_rpm != 60:
+        return max(1, int(default_rpm))
+    try:
+        cfg = load_config(s.env_path)
+        return max(1, _int(cfg, "RATE_LIMIT_PER_MINUTE", default=int(default_rpm)))
+    except Exception:
+        return max(1, int(default_rpm))
 
 
 # Statically importable settings singleton for modules that prefer constants over DI.

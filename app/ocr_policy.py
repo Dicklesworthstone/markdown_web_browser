@@ -1,12 +1,245 @@
-"""Deterministic OCR autopilot policy engine."""
+"""Deterministic OCR autopilot policy engine and model catalog resolver."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from enum import Enum
+from functools import lru_cache
+from pathlib import Path
+from typing import Any, Mapping
 
 BACKEND_MODE_OPENAI_COMPATIBLE = "openai-compatible"
 BACKEND_MODE_MAAS = "maas"
+
+PROMPT_TEMPLATE_OLMOCR_V4 = "olmocr_v4"
+PROMPT_TEMPLATE_OLMOCR_V4_YAML = PROMPT_TEMPLATE_OLMOCR_V4
+PROMPT_TEMPLATE_GLM_OCR_DEFAULT = "glm_ocr_default"
+PROMPT_TEMPLATE_GENERIC_OCR = "generic_ocr"
+VALID_PROMPT_TEMPLATES = frozenset(
+    {
+        PROMPT_TEMPLATE_OLMOCR_V4,
+        PROMPT_TEMPLATE_GLM_OCR_DEFAULT,
+        PROMPT_TEMPLATE_GENERIC_OCR,
+    }
+)
+
+DEFAULT_MODELS_YAML_PATH = Path(__file__).resolve().parent.parent / "docs" / "models.yaml"
+
+MODEL_POLICY_ALIASES: dict[str, str] = {
+    "default": "olmOCR-2-7B-1025-FP8",
+    "olmocr": "olmOCR-2-7B-1025-FP8",
+    "olmocr-fp8": "olmOCR-2-7B-1025-FP8",
+    "olmocr-2-7b-1025-fp8": "olmOCR-2-7B-1025-FP8",
+    "allenai/olmocr-2-7b-1025-fp8": "olmOCR-2-7B-1025-FP8",
+    "olmocr-fp16": "olmOCR-2-7B-1025",
+    "olmocr-2-7b-1025": "olmOCR-2-7B-1025",
+    "allenai/olmocr-2-7b-1025": "olmOCR-2-7B-1025",
+    "glm-ocr-maas": "GLM-OCR-MaaS",
+    "glm-ocr-local-openai": "GLM-OCR-Local-OpenAI",
+    "glm-ocr": "GLM-OCR-Local-OpenAI",
+    "glm-4.1v-9b-thinking": "GLM-OCR-Local-OpenAI",
+    "thudm/glm-4.1v-9b-thinking": "GLM-OCR-Local-OpenAI",
+    "zai-org/glm-4.1v-9b-thinking": "GLM-OCR-Local-OpenAI",
+    "got-ocr-2": "GOT-OCR-2",
+    "texthawk2": "TextHawk2",
+}
+
+
+@dataclass(slots=True, frozen=True)
+class OCRModelProfile:
+    """Operational profile for an OCR policy declared in docs/models.yaml."""
+
+    policy_key: str
+    provider: str
+    display_name: str
+    long_side_px: int = 1288
+    fp8_preferred: bool = False
+    max_tiles_in_flight: int = 8
+    prompt_template: str = PROMPT_TEMPLATE_OLMOCR_V4
+    disabled: bool = False
+    notes: str | None = None
+    refs: tuple[str, ...] = ()
+
+
+def _parse_models_yaml_raw(raw_text: str) -> dict[str, dict[str, Any]]:
+    try:
+        import yaml  # type: ignore[import-untyped]
+
+        loaded = yaml.safe_load(raw_text)
+        if isinstance(loaded, dict):
+            return {
+                str(k): dict(v)
+                for k, v in loaded.items()
+                if isinstance(k, str) and isinstance(v, Mapping)
+            }
+    except Exception:
+        pass
+
+    # Deterministic fallback parser for docs/models.yaml's 2-level YAML map
+    result: dict[str, dict[str, Any]] = {}
+    current_key: str | None = None
+    in_refs = False
+    for raw_line in raw_text.splitlines():
+        line = raw_line.split("#", 1)[0].rstrip()
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        stripped = line.strip()
+        if indent == 0 and stripped.endswith(":"):
+            current_key = stripped[:-1].strip()
+            result[current_key] = {}
+            in_refs = False
+            continue
+        if current_key is None:
+            continue
+        if stripped.startswith("- ") and in_refs:
+            val = stripped[2:].strip().strip("\"'")
+            refs = result[current_key].setdefault("refs", [])
+            if isinstance(refs, list):
+                refs.append(val)
+            continue
+        if ":" in stripped:
+            k, v = stripped.split(":", 1)
+            k = k.strip()
+            v = v.strip()
+            if k == "refs" and not v:
+                result[current_key]["refs"] = []
+                in_refs = True
+                continue
+            in_refs = False
+            if v.lower() in {"true", "false"}:
+                result[current_key][k] = v.lower() == "true"
+            elif v.isdigit():
+                result[current_key][k] = int(v)
+            else:
+                result[current_key][k] = v.strip("\"'")
+    return result
+
+
+@lru_cache(maxsize=8)
+def _load_model_catalog_cached(resolved_path: str) -> dict[str, OCRModelProfile]:
+    path = Path(resolved_path)
+    if not path.exists():
+        raise FileNotFoundError(f"OCR model catalog not found at {path}")
+    raw_map = _parse_models_yaml_raw(path.read_text(encoding="utf-8"))
+    catalog: dict[str, OCRModelProfile] = {}
+    for policy_key, entry in raw_map.items():
+        provider = str(entry.get("provider") or "open").strip()
+        display_name = str(entry.get("display_name") or policy_key).strip()
+        long_side_px = int(entry.get("long_side_px") or 1288)
+        if long_side_px < 1:
+            raise ValueError(f"Invalid long_side_px for {policy_key}: {long_side_px}")
+        fp8_preferred = bool(entry.get("fp8_preferred", False))
+        max_tiles_in_flight = int(entry.get("max_tiles_in_flight") or 8)
+        if max_tiles_in_flight < 1:
+            raise ValueError(
+                f"Invalid max_tiles_in_flight for {policy_key}: {max_tiles_in_flight}"
+            )
+        prompt_template = str(
+            entry.get("prompt_template") or PROMPT_TEMPLATE_OLMOCR_V4
+        ).strip()
+        if prompt_template not in VALID_PROMPT_TEMPLATES:
+            raise ValueError(
+                f"Invalid prompt_template {prompt_template!r} for {policy_key}; "
+                f"expected one of {sorted(VALID_PROMPT_TEMPLATES)}"
+            )
+        disabled = bool(entry.get("disabled", False))
+        notes_raw = entry.get("notes")
+        notes = str(notes_raw).strip() if isinstance(notes_raw, str) and notes_raw.strip() else None
+        refs_raw = entry.get("refs")
+        refs = (
+            tuple(str(item).strip() for item in refs_raw if str(item).strip())
+            if isinstance(refs_raw, (list, tuple))
+            else ()
+        )
+        catalog[policy_key] = OCRModelProfile(
+            policy_key=policy_key,
+            provider=provider,
+            display_name=display_name,
+            long_side_px=long_side_px,
+            fp8_preferred=fp8_preferred,
+            max_tiles_in_flight=max_tiles_in_flight,
+            prompt_template=prompt_template,
+            disabled=disabled,
+            notes=notes,
+            refs=refs,
+        )
+    return catalog
+
+
+def load_model_catalog(path: str | Path | None = None) -> dict[str, OCRModelProfile]:
+    """Load and validate the OCR model catalog from docs/models.yaml."""
+
+    target = Path(path) if path is not None else DEFAULT_MODELS_YAML_PATH
+    return dict(_load_model_catalog_cached(str(target.resolve())))
+
+
+def resolve_model_profile(
+    policy_or_model: str,
+    *,
+    catalog: Mapping[str, OCRModelProfile] | None = None,
+    allow_disabled: bool = False,
+) -> OCRModelProfile:
+    """Resolve a policy/model key or alias against docs/models.yaml.
+
+    Raises ValueError if the policy is unknown or disabled (when allow_disabled=False).
+    """
+
+    if not isinstance(policy_or_model, str) or not policy_or_model.strip():
+        raise ValueError("OCR policy/model must be a non-empty string")
+    active_catalog = dict(catalog) if catalog is not None else load_model_catalog()
+    cleaned = policy_or_model.strip()
+
+    matched: OCRModelProfile | None = active_catalog.get(cleaned)
+    if matched is None:
+        lower = cleaned.lower()
+        alias_target = MODEL_POLICY_ALIASES.get(lower)
+        if alias_target and alias_target in active_catalog:
+            matched = active_catalog[alias_target]
+        else:
+            for key, profile in active_catalog.items():
+                if key.lower() == lower:
+                    matched = profile
+                    break
+
+    if matched is None:
+        known = ", ".join(sorted(active_catalog))
+        raise ValueError(
+            f"Unknown OCR policy/model {policy_or_model!r}; declared policies: {known}"
+        )
+
+    if matched.disabled and not allow_disabled:
+        raise ValueError(
+            f"OCR policy {matched.policy_key!r} is disabled in docs/models.yaml"
+        )
+
+    return matched
+
+
+def resolve_prompt_template(
+    policy_or_model: str | None,
+    *,
+    catalog: Mapping[str, OCRModelProfile] | None = None,
+) -> str:
+    """Resolve the prompt_template for a model or policy, falling back by family."""
+
+    if not policy_or_model:
+        return PROMPT_TEMPLATE_OLMOCR_V4
+    try:
+        profile = resolve_model_profile(
+            policy_or_model,
+            catalog=catalog,
+            allow_disabled=True,
+        )
+        return profile.prompt_template
+    except ValueError:
+        lower = (policy_or_model or "").lower()
+        if "glm" in lower:
+            return PROMPT_TEMPLATE_GLM_OCR_DEFAULT
+        if "got-ocr" in lower or "texthawk" in lower:
+            return PROMPT_TEMPLATE_GENERIC_OCR
+        return PROMPT_TEMPLATE_OLMOCR_V4
+
 
 REASON_LOCAL_GPU_PREFERRED = "policy.local.gpu-preferred"
 REASON_LOCAL_CPU_FALLBACK = "policy.local.cpu-fallback"

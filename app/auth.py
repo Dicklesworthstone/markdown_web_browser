@@ -12,10 +12,16 @@ from typing import TYPE_CHECKING, Iterator, Optional
 if TYPE_CHECKING:
     from app.store import Store
 
+import sys
 from fastapi import Depends, Header, HTTPException, Request, status
 from sqlmodel import Field, Session, SQLModel, select
 
-from app.settings import Settings, settings as global_settings
+from app.settings import (
+    Settings,
+    effective_api_key_header,
+    effective_require_api_key,
+    settings as global_settings,
+)
 
 
 class APIKey(SQLModel, table=True):
@@ -144,6 +150,7 @@ def verify_api_key(
             result.last_used_at = now
             session.add(result)
             session.commit()
+            session.refresh(result)
 
     return result
 
@@ -170,22 +177,36 @@ def revoke_api_key(session: Session, key_id: int) -> bool:
 # Global store instance for database connection pooling
 # Creating the engine is expensive, so we create it once and reuse it
 _global_store: Optional["Store"] = None
+_explicit_store: Optional["Store"] = None
 _store_lock = threading.Lock()
 
 
+def set_store(store: Optional["Store"]) -> None:
+    """Explicitly bind a Store instance for authentication lookups."""
+    global _explicit_store, _global_store
+    with _store_lock:
+        _explicit_store = store
+        if store is not None:
+            _global_store = store
+
+
 def get_store() -> "Store":
-    """Get or create the global Store instance.
+    """Get or create the active Store instance.
 
-    This ensures we only create one database engine for the entire application,
-    enabling proper connection pooling and avoiding expensive engine initialization
-    on every request.
-
-    Thread-safe singleton implementation using double-checked locking pattern.
-
-    Returns:
-        Store: Global store instance with reusable database engine
+    Prefers an explicitly bound store or ``app.main.store`` when running inside
+    the FastAPI application (so TestClient fixtures that swap ``app.main.store``
+    are honored), falling back to a singleton ``Store``.
     """
     global _global_store
+
+    if _explicit_store is not None:
+        return _explicit_store
+
+    main_mod = sys.modules.get("app.main")
+    if main_mod is not None:
+        main_store = getattr(main_mod, "store", None)
+        if main_store is not None and hasattr(main_store, "session"):
+            return main_store
 
     # Fast path - if already initialized, return immediately without locking
     if _global_store is not None:
@@ -193,7 +214,6 @@ def get_store() -> "Store":
 
     # Slow path - need to initialize, acquire lock
     with _store_lock:
-        # Double-check: another thread might have initialized while we waited for lock
         if _global_store is None:
             from app.store import Store
 
@@ -203,19 +223,179 @@ def get_store() -> "Store":
 
 
 def get_db_session() -> Iterator[Session]:
-    """FastAPI dependency to get database session.
-
-    Uses the global Store instance to ensure database engine is reused
-    across all requests, enabling proper connection pooling.
-
-    Usage:
-        @app.get("/endpoint")
-        def endpoint(session: Session = Depends(get_db_session)):
-            ...
-    """
-    store = get_store()  # Use global instance instead of creating new one
+    """FastAPI dependency to get database session."""
+    store = get_store()
     with store.session() as session:
         yield session
+
+
+_AUTH_EXEMPT_EXACT_PATHS = {
+    "/",
+    "/browser",
+    "/health",
+    "/healthz",
+    "/health/beads",
+    "/health/live",
+    "/health/ready",
+    "/docs",
+    "/redoc",
+    "/openapi.json",
+}
+
+
+def is_auth_exempt_path(path: str) -> bool:
+    """Return True if a request path is exempt from mandatory API key auth."""
+    if path in _AUTH_EXEMPT_EXACT_PATHS:
+        return True
+    if path.startswith("/static/") or path.startswith("/web/"):
+        return True
+    if path.startswith("/jobs/share/"):
+        return True
+    return False
+
+
+def extract_api_key_from_request(
+    request: Request | None,
+    active_settings: Settings | None = None,
+    *,
+    explicit_key: str | None = None,
+) -> tuple[str | None, str]:
+    """Extract an API key candidate and configured header name from a request.
+
+    Checks:
+    1. ``explicit_key`` argument (if passed directly to ``get_auth_context``)
+    2. Configured ``API_KEY_HEADER`` (default ``X-API-Key``)
+    3. ``X-API-Key`` header (when a custom header name is configured)
+    4. ``Authorization: Bearer <key>`` or ``Authorization: ApiKey <key>``
+    5. ``mdwb_api_key`` cookie or ``?api_key=`` query param (for browser SSE / img requests)
+    """
+    header_name = effective_api_key_header(active_settings)
+    if explicit_key:
+        return explicit_key.strip(), header_name
+    if request is None:
+        return None, header_name
+
+    # 1. Configured header
+    val = request.headers.get(header_name)
+    if val and val.strip():
+        return val.strip(), header_name
+
+    # 2. Standard X-API-Key fallback
+    if header_name.lower() != "x-api-key":
+        val = request.headers.get("X-API-Key")
+        if val and val.strip():
+            return val.strip(), header_name
+
+    # 3. Authorization header (used by mdwb_cli.py and olmocr_cli.py)
+    auth_header = request.headers.get("Authorization")
+    if auth_header and auth_header.strip():
+        parts = auth_header.strip().split(None, 1)
+        if len(parts) == 2 and parts[0].lower() in {"bearer", "apikey", "token"}:
+            candidate = parts[1].strip()
+            if candidate:
+                return candidate, header_name
+
+    # 4. Cookie / query param for browser UI (EventSource / tile image tags)
+    cookie_key = request.cookies.get("mdwb_api_key")
+    if cookie_key and cookie_key.strip():
+        return cookie_key.strip(), header_name
+
+    query_key = request.query_params.get("api_key")
+    if query_key and query_key.strip():
+        return query_key.strip(), header_name
+
+    return None, header_name
+
+
+def resolve_request_auth(
+    request: Request,
+    *,
+    session: Session | None = None,
+    x_api_key: str | None = None,
+    settings: Settings | None = None,
+) -> AuthContext:
+    """Validate request authentication and populate ``request.state.auth_context``."""
+    if hasattr(request.state, "auth_context") and isinstance(
+        request.state.auth_context, AuthContext
+    ) and x_api_key is None and settings is None:
+        return request.state.auth_context
+
+    active_settings = settings or global_settings
+    require_key = effective_require_api_key(active_settings)
+    candidate_key, header_name = extract_api_key_from_request(
+        request,
+        active_settings,
+        explicit_key=x_api_key,
+    )
+
+    if not require_key and not candidate_key:
+        ctx = AuthContext(
+            api_key_id=0,
+            api_key_name="anonymous",
+            api_key_prefix="none",
+            rate_limit=None,
+            owner=None,
+        )
+        request.state.auth_context = ctx
+        return ctx
+
+    if not candidate_key:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Missing API key. Provide {header_name} header.",
+            headers={"WWW-Authenticate": "ApiKey"},
+        )
+
+    if not candidate_key.startswith("mdwb_") or len(candidate_key) != 37:
+        if not require_key:
+            ctx = AuthContext(
+                api_key_id=0,
+                api_key_name="anonymous",
+                api_key_prefix="none",
+                rate_limit=None,
+                owner=None,
+            )
+            request.state.auth_context = ctx
+            return ctx
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid API key format",
+            headers={"WWW-Authenticate": "ApiKey"},
+        )
+
+    def _lookup_ctx(db_session: Session) -> Optional[AuthContext]:
+        rec = verify_api_key(db_session, candidate_key)
+        if not rec:
+            return None
+        if rec.id is None:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Database error: API key missing ID",
+            )
+        return AuthContext(
+            api_key_id=rec.id,
+            api_key_name=rec.name,
+            api_key_prefix=rec.key_prefix,
+            rate_limit=rec.rate_limit,
+            owner=rec.owner,
+        )
+
+    if session is not None:
+        ctx_found = _lookup_ctx(session)
+    else:
+        store = get_store()
+        with store.session() as db_session:
+            ctx_found = _lookup_ctx(db_session)
+
+    if ctx_found is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or revoked API key",
+            headers={"WWW-Authenticate": "ApiKey"},
+        )
+
+    request.state.auth_context = ctx_found
+    return ctx_found
 
 
 async def get_auth_context(
@@ -224,69 +404,82 @@ async def get_auth_context(
     x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
     settings: Settings | None = None,
 ) -> AuthContext:
-    """FastAPI dependency to get authentication context from request.
-
-    Validates API key and returns authentication context.
-    Raises HTTPException if authentication fails.
-
-    Usage:
-        @app.get("/protected")
-        async def protected_endpoint(auth: AuthContext = Depends(get_auth_context)):
-            return {"message": f"Authenticated as {auth.api_key_name}"}
-    """
-    active_settings = settings or global_settings
-
-    # Check if authentication is required
-    if not active_settings.REQUIRE_API_KEY:
-        # Return a default context for unauthenticated access
-        return AuthContext(
-            api_key_id=0,
-            api_key_name="anonymous",
-            api_key_prefix="none",
-            rate_limit=None,
-            owner=None,
-        )
-
-    # Get API key from header
-    if not x_api_key:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing API key. Provide X-API-Key header.",
-            headers={"WWW-Authenticate": "ApiKey"},
-        )
-
-    # Verify API key format
-    if not x_api_key.startswith("mdwb_") or len(x_api_key) != 37:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid API key format",
-            headers={"WWW-Authenticate": "ApiKey"},
-        )
-
-    # Verify API key against database
-    api_key_record = verify_api_key(session, x_api_key)
-    if not api_key_record:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or revoked API key",
-            headers={"WWW-Authenticate": "ApiKey"},
-        )
-
-    # Return authentication context from database record
-    # api_key_record.id should always be set for records from DB, but check for type safety
-    if api_key_record.id is None:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Database error: API key missing ID",
-        )
-
-    return AuthContext(
-        api_key_id=api_key_record.id,
-        api_key_name=api_key_record.name,
-        api_key_prefix=api_key_record.key_prefix,
-        rate_limit=api_key_record.rate_limit,
-        owner=api_key_record.owner,
+    """FastAPI dependency to get authentication context from request."""
+    explicit = x_api_key if isinstance(x_api_key, str) else None
+    return resolve_request_auth(
+        request,
+        session=session,
+        x_api_key=explicit,
+        settings=settings,
     )
+
+
+def get_request_owner(request: Request) -> str | None:
+    """Return the authenticated owner bound to ``request.state.auth_context``, if any."""
+    ctx = getattr(request.state, "auth_context", None)
+    if isinstance(ctx, AuthContext):
+        return ctx.owner
+    return None
+
+
+def can_access_owner(request_owner: str | None, resource_owner: str | None) -> bool:
+    """Return True iff ``request_owner`` is permitted to access ``resource_owner``."""
+    return request_owner == resource_owner
+
+
+def ensure_owner_access(request: Request, resource_owner: str | None) -> None:
+    """Raise 403 Forbidden if the request's owner does not match ``resource_owner``."""
+    req_owner = get_request_owner(request)
+    if not can_access_owner(req_owner, resource_owner):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: resource belongs to a different owner",
+        )
+
+
+_RESERVED_JOB_PATH_SEGMENTS = {"batch", "crawl", "search", "stream", "demo", "share"}
+
+
+def resolve_job_owner(job_id: str) -> tuple[bool, str | None]:
+    """Return (exists, owner) for ``job_id`` across ``app.main.JOB_MANAGER`` and ``Store``."""
+    main_mod = sys.modules.get("app.main")
+    if main_mod is not None:
+        jm = getattr(main_mod, "JOB_MANAGER", None)
+        if jm is not None:
+            get_owner_fn = getattr(jm, "get_owner", None)
+            if callable(get_owner_fn):
+                try:
+                    exists, owner = get_owner_fn(job_id)
+                    if exists:
+                        return True, owner
+                except Exception:
+                    pass
+            snapshots = getattr(jm, "_snapshots", None)
+            if isinstance(snapshots, dict) and job_id in snapshots:
+                snap = snapshots[job_id]
+                if isinstance(snap, dict):
+                    return True, snap.get("owner")
+    try:
+        store = get_store()
+        record = store.fetch_run(job_id)
+        if record is not None:
+            return True, getattr(record, "owner", None)
+    except Exception:
+        pass
+    return False, None
+
+
+def check_job_owner_access(request: Request, job_id: str) -> None:
+    """Raise 403 Forbidden if ``job_id`` exists and belongs to a different owner."""
+    if not job_id or job_id in _RESERVED_JOB_PATH_SEGMENTS:
+        return
+    req_owner = get_request_owner(request)
+    exists, job_owner = resolve_job_owner(job_id)
+    if exists and not can_access_owner(req_owner, job_owner):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: resource belongs to a different owner",
+        )
 
 
 # CLI helper function for generating keys

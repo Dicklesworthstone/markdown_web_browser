@@ -677,3 +677,492 @@ def test_delete_webhook_unknown_job_propagates_keyerror():
 
     with pytest.raises(KeyError):
         manager.delete_webhook("missing-job", url="https://example.com/hook")
+
+
+@pytest.mark.asyncio
+async def test_job_manager_stage_progress_and_global_stream(tmp_path: Path):
+    """Multi-tile capture emits monotonic stage + tile progress to per-job and global subscribers."""
+    config = StorageConfig(cache_root=tmp_path / "cache", db_path=tmp_path / "runs.db")
+    store = Store(config)
+
+    async def _staged_runner(*, job_id: str, url: str, store: Store, config=None, request=None):  # noqa: ANN001
+        cb = getattr(config, "on_stage", None)
+        if callable(cb):
+            cb("NAVIGATING", {"done": 0, "total": 0})
+            cb("SCROLLING", {"done": 0, "total": 0, "sweep_count": 2})
+            cb("CAPTURING", {"done": 0, "total": 0})
+            cb("TILING", {"done": 0, "total": 3})
+            cb("OCR_SUBMITTING", {"done": 0, "total": 3})
+            for idx in range(1, 4):
+                cb("OCR_WAITING", {"done": idx, "total": 3})
+            cb("STITCHING", {"done": 3, "total": 3})
+        res, artifacts = await _fake_runner(
+            job_id=job_id, url=url, store=store, config=config, request=request
+        )
+        res.manifest.tiles_total = 3
+        return res, artifacts
+
+    manager = JobManager(store=store, runner=_staged_runner)
+    global_queue = manager.subscribe_global()
+    try:
+        snapshot = await manager.create_job(JobCreateRequest(url="https://example.com/staged"))
+        job_id = snapshot["id"]
+        assert "job_id" not in snapshot  # canonical JobSnapshot key is "id"
+        await manager._tasks[job_id]
+
+        events = manager.get_events(job_id)
+        states_seen = [
+            e["snapshot"]["state"] for e in events if e.get("event") == "snapshot"
+        ]
+        for expected_state in (
+            JobState.BROWSER_STARTING.value,
+            JobState.NAVIGATING.value,
+            JobState.SCROLLING.value,
+            JobState.CAPTURING.value,
+            JobState.TILING.value,
+            JobState.OCR_SUBMITTING.value,
+            JobState.OCR_WAITING.value,
+            JobState.STITCHING.value,
+            JobState.DONE.value,
+        ):
+            assert expected_state in states_seen, f"missing {expected_state} in {states_seen}"
+
+        ocr_waiting_done = [
+            e["snapshot"]["progress"]["done"]
+            for e in events
+            if e.get("event") == "snapshot"
+            and e["snapshot"]["state"] == JobState.OCR_WAITING.value
+        ]
+        assert ocr_waiting_done == [1, 2, 3]
+
+        sequences = [e["sequence"] for e in events]
+        assert sequences == list(range(len(events)))
+
+        # Verify global subscriber received events with job_id + monotonic sequences
+        global_events: list[dict[str, Any]] = []
+        while not global_queue.empty():
+            global_events.append(global_queue.get_nowait())
+        assert len(global_events) == len(events)
+        assert all(ge["job_id"] == job_id for ge in global_events)
+        assert [ge["sequence"] for ge in global_events] == sequences
+
+        # Verify subscribe_events(min_sequence=...) cursor continuity
+        mid_seq = sequences[len(sequences) // 2]
+        backlog, sub_q = manager.subscribe_events(job_id, min_sequence=mid_seq)
+        manager.unsubscribe_events(job_id, sub_q)
+        assert [e["sequence"] for e in backlog] == [s for s in sequences if s > mid_seq]
+    finally:
+        manager.unsubscribe_global(global_queue)
+
+
+@pytest.mark.asyncio
+async def test_subscriber_queue_is_bounded_and_drops_oldest(tmp_path: Path):
+    """Stalled subscribers cannot cause unbounded queue growth."""
+    config = StorageConfig(cache_root=tmp_path / "cache", db_path=tmp_path / "runs.db")
+    manager = JobManager(store=Store(config), runner=_fake_runner)
+    global_q = manager.subscribe_global()
+    try:
+        for idx in range(jobs_module._SUBSCRIBER_QUEUE_MAXSIZE + 40):
+            jobs_module._put_bounded(global_q, {"seq": idx})
+        assert global_q.qsize() == jobs_module._SUBSCRIBER_QUEUE_MAXSIZE
+        first_retained = global_q.get_nowait()
+        assert first_retained["seq"] == 40
+    finally:
+        manager.unsubscribe_global(global_q)
+
+
+@pytest.mark.asyncio
+async def test_job_cancellation_prevents_done_overwrite_and_persists(tmp_path: Path):
+    """Cancelling an in-flight job marks CANCELLED in memory and Store and cleans up task."""
+    config = StorageConfig(cache_root=tmp_path / "cache", db_path=tmp_path / "runs.db")
+    store = Store(config)
+    started = asyncio.Event()
+
+    async def _slow_runner(*, job_id: str, url: str, store: Store, config=None, request=None):  # noqa: ANN001
+        started.set()
+        await asyncio.sleep(10.0)
+        return await _fake_runner(
+            job_id=job_id, url=url, store=store, config=config, request=request
+        )
+
+    manager = JobManager(store=store, runner=_slow_runner)
+    snapshot = await manager.create_job(JobCreateRequest(url="https://example.com/cancel-me"))
+    job_id = snapshot["id"]
+    await asyncio.wait_for(started.wait(), timeout=2.0)
+
+    cancelled = manager.cancel_job(job_id, reason="user requested abort")
+    assert cancelled is True
+
+    task = manager._tasks.get(job_id)
+    if task is not None:
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    final_snap = manager.get_snapshot(job_id)
+    assert final_snap is not None
+    assert final_snap["state"] == JobState.CANCELLED.value
+    assert final_snap["error"] == "user requested abort"
+    assert job_id not in manager._tasks
+
+    record = store.fetch_run(job_id)
+    assert record is not None
+    assert record.status == JobState.CANCELLED.value
+
+
+@pytest.mark.asyncio
+async def test_job_timeout_marks_failed_and_persists(tmp_path: Path):
+    """Jobs exceeding job_timeout_seconds transition to FAILED and persist status."""
+    config = StorageConfig(cache_root=tmp_path / "cache", db_path=tmp_path / "runs.db")
+    store = Store(config)
+
+    async def _hanging_runner(*, job_id: str, url: str, store: Store, config=None, request=None):  # noqa: ANN001
+        await asyncio.sleep(5.0)
+        return await _fake_runner(
+            job_id=job_id, url=url, store=store, config=config, request=request
+        )
+
+    manager = JobManager(store=store, runner=_hanging_runner, job_timeout_seconds=1)
+    snapshot = await manager.create_job(JobCreateRequest(url="https://example.com/timeout"))
+    job_id = snapshot["id"]
+    await asyncio.wait_for(manager._tasks[job_id], timeout=3.0)
+
+    final_snap = manager.get_snapshot(job_id)
+    assert final_snap is not None
+    assert final_snap["state"] == JobState.FAILED.value
+    assert "timeout" in (final_snap.get("error") or "").lower()
+    record = store.fetch_run(job_id)
+    assert record is not None
+    assert record.status == JobState.FAILED.value
+
+
+@pytest.mark.asyncio
+async def test_job_manager_shutdown_cancels_active_tasks(tmp_path: Path):
+    """JobManager.shutdown cancels all in-flight tasks and stops the watchdog."""
+    config = StorageConfig(cache_root=tmp_path / "cache", db_path=tmp_path / "runs.db")
+    store = Store(config)
+    started = asyncio.Event()
+
+    async def _blocking_runner(*, job_id: str, url: str, store: Store, config=None, request=None):  # noqa: ANN001
+        started.set()
+        await asyncio.sleep(30.0)
+        return await _fake_runner(
+            job_id=job_id, url=url, store=store, config=config, request=request
+        )
+
+    manager = JobManager(store=store, runner=_blocking_runner)
+    manager.start_watchdog()
+    snap = await manager.create_job(JobCreateRequest(url="https://example.com/shutdown"))
+    job_id = snap["id"]
+    await asyncio.wait_for(started.wait(), timeout=2.0)
+
+    await manager.shutdown(timeout_s=2.0)
+    assert manager._tasks == {}
+    final_snap = manager.get_snapshot(job_id)
+    assert final_snap is not None
+    assert final_snap["state"] == JobState.CANCELLED.value
+
+
+@pytest.mark.asyncio
+async def test_cache_lifecycle_accounting_invalidation_and_clear(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Verify miss -> hit -> refresh accounting, URL invalidation, and clear without deleting files."""
+    from fastapi.testclient import TestClient
+    import app.main as main_module
+
+    base_settings = jobs_module.global_settings
+    monkeypatch.setattr(
+        jobs_module,
+        "global_settings",
+        replace(base_settings, ocr=replace(base_settings.ocr, local_url="")),
+    )
+    config = StorageConfig(cache_root=tmp_path / "cache", db_path=tmp_path / "runs.db")
+    store = Store(config)
+    manager = JobManager(store=store, runner=_fake_runner)
+    monkeypatch.setattr(main_module, "store", store)
+    monkeypatch.setattr(main_module, "JOB_MANAGER", manager)
+
+    url = "https://example.com/cache-lifecycle"
+
+    # 1. Cold miss
+    miss_snap = await manager.create_job(JobCreateRequest(url=url))
+    assert miss_snap["cache_hit"] is False
+    await manager._tasks[miss_snap["id"]]
+    miss_final = manager.get_snapshot(miss_snap["id"])
+    assert miss_final is not None
+    assert miss_final["cache_hit"] is False
+    manifest_file = Path(miss_final["manifest_path"])
+    assert manifest_file.exists()
+
+    # 2. Warm hit
+    hit_snap = await manager.create_job(JobCreateRequest(url=url))
+    assert hit_snap["state"] == JobState.DONE.value
+    assert hit_snap["cache_hit"] is True
+    assert hit_snap["cache_source_job_id"] == miss_snap["id"]
+    assert hit_snap["manifest"]["cache_hit"] is True
+    assert hit_snap["manifest"]["cache_source_job_id"] == miss_snap["id"]
+
+    # 3. Forced refresh (reuse_cache=False) -> miss
+    refresh_snap = await manager.create_job(JobCreateRequest(url=url, reuse_cache=False))
+    assert refresh_snap["cache_hit"] is False
+    await manager._tasks[refresh_snap["id"]]
+
+    # Verify list_jobs and /metrics/cache agree
+    jobs_list, total_jobs = manager.list_jobs(limit=20)
+    assert total_jobs == 3
+    by_id = {item["id"]: item for item in jobs_list}
+    assert by_id[miss_snap["id"]]["cache_hit"] is False
+    assert by_id[hit_snap["id"]]["cache_hit"] is True
+    assert by_id[hit_snap["id"]]["cache_source_job_id"] == miss_snap["id"]
+    assert by_id[refresh_snap["id"]]["cache_hit"] is False
+
+    with TestClient(main_module.app) as client:
+        metrics_resp = client.get("/metrics/cache")
+        assert metrics_resp.status_code == 200
+        metrics_data = metrics_resp.json()
+        assert metrics_data["enabled"] is True
+        assert metrics_data["entries"] == 1
+        assert metrics_data["hits"] == 1
+        assert metrics_data["misses"] == 2
+        assert abs(metrics_data["hit_rate"] - (1 / 3)) < 1e-6
+
+        # 4. Invalidate URL via JSON body and confirm next request is a miss while files remain on disk
+        inv_resp = client.post("/admin/cache/invalidate", json={"url": url})
+        assert inv_resp.status_code == 200
+        inv_data = inv_resp.json()
+        assert inv_data["removed"] is True
+        assert inv_data["invalidated_entries"] >= 1
+        assert manifest_file.exists(), "Cache invalidation must never delete artifact files"
+
+        metrics_after_inv = client.get("/metrics/cache").json()
+        assert metrics_after_inv["entries"] == 0
+
+        post_inv_snap = await manager.create_job(JobCreateRequest(url=url))
+        assert post_inv_snap["cache_hit"] is False
+        await manager._tasks[post_inv_snap["id"]]
+
+        # 5. Clear all cache entries and confirm non-destructive metadata invalidation
+        clear_resp = client.post("/admin/cache/clear")
+        assert clear_resp.status_code == 200
+        clear_data = clear_resp.json()
+        assert clear_data["cleared_entries"] >= 1
+        assert manifest_file.exists(), "Cache clear must never delete artifact files"
+        assert client.get("/metrics/cache").json()["entries"] == 0
+
+
+def test_cache_key_sensitive_to_style_blocklist_prompt_semantic_and_profile_state(
+    tmp_path: Path,
+) -> None:
+    """Verify cache seed/key changes across all capture, blocklist, OCR, semantic-post, and profile inputs."""
+    from app.blocklist import cached_blocklist
+    from app.cache import compute_cache_key_from_config
+    from app.capture import CaptureConfig
+
+    bl_v1 = tmp_path / "blocklist_v1.json"
+    bl_v1.write_text(
+        '{"version": "v1", "global": ["#cookie"], "domains": {"example.com": [".ad-v1"]}}',
+        encoding="utf-8",
+    )
+    bl_v2 = tmp_path / "blocklist_v2.json"
+    bl_v2.write_text(
+        '{"version": "v2", "global": ["#cookie"], "domains": {"example.com": [".ad-v2"]}}',
+        encoding="utf-8",
+    )
+    cached_blocklist.cache_clear()
+
+    profiles_root = tmp_path / "profiles"
+    profile_state_file = profiles_root / "prof1" / "storage_state.json"
+    profile_state_file.parent.mkdir(parents=True, exist_ok=True)
+    profile_state_file.write_text('{"cookies": [{"name": "sid", "value": "111"}]}', encoding="utf-8")
+
+    base_settings = replace(
+        jobs_module.global_settings,
+        browser=replace(
+            jobs_module.global_settings.browser,
+            blocklist_path=bl_v1,
+        ),
+        storage=replace(
+            jobs_module.global_settings.storage,
+            profiles_root=profiles_root,
+        ),
+        ocr=replace(jobs_module.global_settings.ocr, local_url=""),
+    )
+    base_cfg = CaptureConfig(url="https://example.com/page", profile_id="prof1")
+    base_key = compute_cache_key_from_config(base_cfg, base_settings)
+
+    # 1. Blocklist selector/version change
+    settings_bl2 = replace(
+        base_settings,
+        browser=replace(base_settings.browser, blocklist_path=bl_v2),
+    )
+    assert compute_cache_key_from_config(base_cfg, settings_bl2) != base_key
+
+    # 2. Scroll settle ms change
+    settings_settle = replace(
+        base_settings,
+        browser=replace(base_settings.browser, scroll_settle_ms=999),
+    )
+    assert compute_cache_key_from_config(base_cfg, settings_settle) != base_key
+
+    # 3. Screenshot style hash change
+    settings_style = replace(
+        base_settings,
+        browser=replace(base_settings.browser, screenshot_style_hash="custom-style-v9"),
+    )
+    assert compute_cache_key_from_config(base_cfg, settings_style) != base_key
+
+    # 4. OCR policy / prompt template change
+    cfg_glm = replace(base_cfg, ocr_policy="glm-ocr", ocr_model="glm-ocr")
+    assert compute_cache_key_from_config(cfg_glm, base_settings) != base_key
+
+    # 5. Semantic post-processing settings change
+    cfg_sem1 = replace(base_cfg, semantic_post_enabled=True, semantic_post_max_chars=4000)
+    cfg_sem2 = replace(base_cfg, semantic_post_enabled=True, semantic_post_max_chars=8000)
+    key_sem1 = compute_cache_key_from_config(cfg_sem1, base_settings)
+    key_sem2 = compute_cache_key_from_config(cfg_sem2, base_settings)
+    assert key_sem1 != base_key
+    assert key_sem1 != key_sem2
+
+    # 6. Profile storage_state.json mutation on disk
+    profile_state_file.write_text('{"cookies": [{"name": "sid", "value": "222"}]}', encoding="utf-8")
+    assert compute_cache_key_from_config(base_cfg, base_settings) != base_key
+
+
+@pytest.mark.asyncio
+async def test_cache_hit_rejects_failed_truncated_and_expired_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Runs with validation failures, truncated sweeps, or expired TTL must never hit cache."""
+    base_settings = jobs_module.global_settings
+    monkeypatch.setattr(
+        jobs_module,
+        "global_settings",
+        replace(base_settings, ocr=replace(base_settings.ocr, local_url="")),
+    )
+    config = StorageConfig(cache_root=tmp_path / "cache", db_path=tmp_path / "runs.db")
+    store = Store(config)
+
+    mode = {"kind": "validation_failure"}
+
+    async def _flawed_runner(*, job_id: str, url: str, store: Store, config=None, request=None):  # noqa: ANN001
+        res, artifacts = await _fake_runner(
+            job_id=job_id, url=url, store=store, config=config, request=request
+        )
+        if mode["kind"] == "validation_failure":
+            res.manifest.validation_failures = ["tile 0 checksum mismatch"]
+        elif mode["kind"] == "truncated":
+            res.manifest.sweep_stats.truncated_by_max_steps = True
+        store.write_manifest(job_id=job_id, manifest=res.manifest)
+        return res, artifacts
+
+    manager = JobManager(store=store, runner=_flawed_runner)
+    url = "https://example.com/flawed"
+
+    # 1. Run with validation failure -> not eligible for cache hit
+    first = await manager.create_job(JobCreateRequest(url=url, reuse_cache=False))
+    await manager._tasks[first["id"]]
+    rec1 = store.fetch_run(first["id"])
+    assert rec1 is not None
+    assert store.find_cache_hit(rec1.cache_key) is None
+
+    # 2. Run with truncated_by_max_steps -> not eligible for cache hit
+    mode["kind"] = "truncated"
+    second = await manager.create_job(JobCreateRequest(url=url))
+    assert second["cache_hit"] is False
+    await manager._tasks[second["id"]]
+    rec2 = store.fetch_run(second["id"])
+    assert rec2 is not None
+    assert store.find_cache_hit(rec2.cache_key) is None
+
+    # 3. Clean run -> eligible, then expired when TTL=0
+    mode["kind"] = "clean"
+    third = await manager.create_job(JobCreateRequest(url=url))
+    assert third["cache_hit"] is False
+    await manager._tasks[third["id"]]
+    rec3 = store.fetch_run(third["id"])
+    assert rec3 is not None
+    assert store.find_cache_hit(rec3.cache_key) is not None
+
+    store.cache_ttl_hours = 0
+    assert store.find_cache_hit(rec3.cache_key) is None
+
+
+def test_failover_served_model_partitions_runtime_cache_key() -> None:
+    """When served_ocr_model differs from requested ocr_model, runtime cache key is partitioned."""
+    primary_manifest = types.SimpleNamespace(
+        cache_seed="seed-123",
+        backend_id="olmocr-remote-openai",
+        backend_mode="openai-compatible",
+        hardware_path="remote",
+        fallback_chain=["olmocr-remote-openai"],
+        ocr_model="olmOCR-2-7B-1025-FP8",
+        served_ocr_model="olmOCR-2-7B-1025-FP8",
+        cache_key="initial",
+    )
+    failover_manifest = types.SimpleNamespace(
+        cache_seed="seed-123",
+        backend_id="olmocr-remote-openai",
+        backend_mode="openai-compatible",
+        hardware_path="remote",
+        fallback_chain=["olmocr-remote-openai"],
+        ocr_model="olmOCR-2-7B-1025-FP8",
+        served_ocr_model="glm-ocr-fallback",
+        cache_key="initial",
+    )
+    jobs_module._refresh_manifest_cache_key(cast(Any, primary_manifest))
+    jobs_module._refresh_manifest_cache_key(cast(Any, failover_manifest))
+    assert primary_manifest.cache_key != failover_manifest.cache_key
+
+
+@pytest.mark.asyncio
+async def test_inflight_duplicate_request_reuses_primary_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Concurrent identical requests with reuse_cache=True coalesce onto the primary in-flight run."""
+    base_settings = jobs_module.global_settings
+    monkeypatch.setattr(
+        jobs_module,
+        "global_settings",
+        replace(base_settings, ocr=replace(base_settings.ocr, local_url="")),
+    )
+    config = StorageConfig(cache_root=tmp_path / "cache", db_path=tmp_path / "runs.db")
+    store = Store(config)
+    gate = asyncio.Event()
+    run_calls = 0
+
+    async def _gated_runner(*, job_id: str, url: str, store: Store, config=None, request=None):  # noqa: ANN001
+        nonlocal run_calls
+        run_calls += 1
+        await gate.wait()
+        return await _fake_runner(
+            job_id=job_id, url=url, store=store, config=config, request=request
+        )
+
+    manager = JobManager(store=store, runner=_gated_runner)
+    url = "https://example.com/inflight-coalesce"
+
+    first = await manager.create_job(JobCreateRequest(url=url, reuse_cache=True))
+    second = await manager.create_job(JobCreateRequest(url=url, reuse_cache=True))
+
+    assert second["cache_source_job_id"] == first["id"]
+    gate.set()
+
+    await asyncio.gather(
+        manager._tasks[first["id"]],
+        manager._tasks[second["id"]],
+    )
+
+    assert run_calls == 1
+    first_final = manager.get_snapshot(first["id"])
+    second_final = manager.get_snapshot(second["id"])
+    assert first_final is not None and first_final["state"] == JobState.DONE.value
+    assert first_final["cache_hit"] is False
+    assert second_final is not None and second_final["state"] == JobState.DONE.value
+    assert second_final["cache_hit"] is True
+    assert second_final["cache_source_job_id"] == first["id"]
+
+    stats = store.cache_stats()
+    assert stats["misses"] == 1
+    assert stats["hits"] == 1
+    assert stats["entries"] == 1
+

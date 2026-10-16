@@ -100,36 +100,56 @@ def compute_cache_key(
 def compute_cache_key_from_config(config: CaptureConfig, settings: Any) -> str:
     """Compute cache key from CaptureConfig and Settings objects.
 
-    This is a convenience wrapper around compute_cache_key that extracts
-    parameters from configuration objects.
-
-    Args:
-        config: CaptureConfig with capture parameters
-        settings: Settings object with OCR configuration
-
-    Returns:
-        Cache key (64-character hex string)
+    This is a convenience wrapper that delegates to the canonical runtime
+    cache key builder in ``app.jobs`` when a full Settings object is provided.
     """
-    return compute_cache_key(
-        url=config.url,
-        viewport_width=config.viewport_width,
-        viewport_height=config.viewport_height,
-        device_scale_factor=config.device_scale_factor,
-        color_scheme=config.color_scheme,
-        long_side_px=settings.browser.long_side_px,
-        viewport_overlap_px=settings.browser.viewport_overlap_px,
-        tile_overlap_px=settings.browser.tile_overlap_px,
-        scroll_settle_ms=settings.browser.scroll_settle_ms,
-        screenshot_style_hash=settings.browser.screenshot_style_hash,
-        mask_selectors=settings.browser.screenshot_mask_selectors or (),
-        blocklist_selectors=(),  # Currently not configurable; always empty
-        ocr_model=settings.ocr.model,
-        ocr_use_fp8=settings.ocr.use_fp8,
-    )
+    try:
+        from app.jobs import _build_cache_key
+
+        return _build_cache_key(config=config, settings=settings)
+    except Exception:
+        from app.blocklist import cached_blocklist
+        from app.capture import compute_effective_style_hash
+
+        blocklist_selectors: tuple[str, ...] = ()
+        blocklist_version = ""
+        blocklist_path = getattr(settings.browser, "blocklist_path", None)
+        if blocklist_path:
+            try:
+                bl = cached_blocklist(str(blocklist_path))
+                blocklist_version = str(bl.version or "")
+                blocklist_selectors = tuple(bl.selectors_for_url(config.url))
+            except Exception:
+                pass
+        effective_style_hash = compute_effective_style_hash(
+            settings_browser=settings.browser,
+            config=config,
+            blocklist_version=blocklist_version,
+        )
+        return compute_cache_key(
+            url=config.url,
+            viewport_width=config.viewport_width,
+            viewport_height=config.viewport_height,
+            device_scale_factor=config.device_scale_factor,
+            color_scheme=config.color_scheme,
+            long_side_px=config.long_side_px or settings.browser.long_side_px,
+            viewport_overlap_px=settings.browser.viewport_overlap_px,
+            tile_overlap_px=settings.browser.tile_overlap_px,
+            scroll_settle_ms=settings.browser.scroll_settle_ms,
+            screenshot_style_hash=effective_style_hash,
+            mask_selectors=settings.browser.screenshot_mask_selectors or (),
+            blocklist_selectors=blocklist_selectors,
+            ocr_model=config.ocr_model or config.ocr_policy or settings.ocr.model,
+            ocr_use_fp8=(
+                config.ocr_use_fp8
+                if config.ocr_use_fp8 is not None
+                else settings.ocr.use_fp8
+            ),
+        )
 
 
 class CacheManager:
-    """Manages content-addressed cache with TTL and invalidation."""
+    """Manages content-addressed cache with TTL and non-destructive invalidation."""
 
     def __init__(self, cache_root: Path, default_ttl_hours: int = 168):
         """Initialize cache manager.
@@ -140,6 +160,7 @@ class CacheManager:
         """
         self.cache_root = Path(cache_root)
         self.default_ttl = timedelta(hours=default_ttl_hours)
+        self._invalidated_keys: set[str] = set()
 
     def get_cache_path(self, cache_key: str) -> Path:
         """Get filesystem path for a cache key.
@@ -160,7 +181,7 @@ class CacheManager:
         cache_key: str,
         ttl: Optional[timedelta] = None,
     ) -> bool:
-        """Check if cache entry exists and is not expired.
+        """Check if cache entry exists, is not invalidated, and is not expired.
 
         Args:
             cache_key: Cache key to check
@@ -169,6 +190,9 @@ class CacheManager:
         Returns:
             True if cache is valid, False otherwise
         """
+        if cache_key in self._invalidated_keys:
+            return False
+
         cache_path = self.get_cache_path(cache_key)
 
         if not cache_path.exists():
@@ -177,18 +201,34 @@ class CacheManager:
         # Check TTL using manifest timestamp
         manifest_path = cache_path / "artifact" / "manifest.json"
         if not manifest_path.exists():
+            manifest_path = cache_path / "manifest.json"
+        if not manifest_path.exists():
             return False
 
         try:
-            with open(manifest_path) as f:
+            with open(manifest_path, encoding="utf-8") as f:
                 manifest = json.load(f)
 
+            if manifest.get("cache_invalidated"):
+                return False
+            if manifest.get("validation_failures") or manifest.get("error"):
+                return False
+            sweep_stats = manifest.get("sweep_stats")
+            if isinstance(sweep_stats, dict) and sweep_stats.get("truncated_by_max_steps"):
+                return False
+
             # Get timestamp from manifest
-            timestamp_str = manifest.get("metadata", {}).get("started_at")
+            timestamp_str = (
+                manifest.get("metadata", {}).get("started_at")
+                or manifest.get("started_at")
+                or manifest.get("finished_at")
+            )
             if not timestamp_str:
                 return False
 
             timestamp = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=timezone.utc)
             age = datetime.now(timezone.utc) - timestamp
 
             effective_ttl = ttl or self.default_ttl
@@ -209,37 +249,48 @@ class CacheManager:
         """
         cache_path = self.get_cache_path(cache_key)
         manifest_path = cache_path / "artifact" / "manifest.json"
+        if not manifest_path.exists():
+            manifest_path = cache_path / "manifest.json"
 
         if not manifest_path.exists():
             return None
 
         try:
-            with open(manifest_path) as f:
+            with open(manifest_path, encoding="utf-8") as f:
                 return json.load(f)
         except Exception:
             return None
 
     def invalidate_cache(self, cache_key: str) -> bool:
-        """Invalidate a cache entry by removing it.
+        """Mark a cache entry invalidated in metadata without deleting files on disk.
 
         Args:
             cache_key: Cache key to invalidate
 
         Returns:
-            True if cache was deleted, False if it didn't exist
+            True if cache entry existed and was invalidated, False otherwise
         """
-        import shutil
-
         cache_path = self.get_cache_path(cache_key)
+        if not cache_path.exists():
+            return False
 
-        if cache_path.exists():
-            shutil.rmtree(cache_path)
-            return True
-
-        return False
+        self._invalidated_keys.add(cache_key)
+        for candidate in (
+            cache_path / "artifact" / "manifest.json",
+            cache_path / "manifest.json",
+        ):
+            if candidate.exists():
+                try:
+                    payload = json.loads(candidate.read_text(encoding="utf-8"))
+                    if isinstance(payload, dict):
+                        payload["cache_invalidated"] = True
+                        candidate.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+                except Exception:
+                    pass
+        return True
 
     def invalidate_url(self, url: str) -> int:
-        """Invalidate all cache entries for a specific URL.
+        """Invalidate all cache entries for a specific URL without deleting files.
 
         Args:
             url: URL to invalidate
@@ -247,7 +298,6 @@ class CacheManager:
         Returns:
             Number of cache entries invalidated
         """
-        # Normalize URL
         from urllib.parse import urlparse, urlunparse
 
         parsed = urlparse(url)
@@ -268,31 +318,29 @@ class CacheManager:
         if not cache_base.exists():
             return 0
 
-        # Iterate through all buckets
         for bucket_dir in cache_base.iterdir():
             if not bucket_dir.is_dir():
                 continue
 
-            # Check each cache entry
             for cache_dir in bucket_dir.iterdir():
                 if not cache_dir.is_dir():
                     continue
 
                 metadata = self.get_cache_metadata(cache_dir.name)
-                if metadata and metadata.get("url") == normalized_url:
+                if metadata and metadata.get("url") in (url, normalized_url):
                     if self.invalidate_cache(cache_dir.name):
                         count += 1
 
         return count
 
     def cleanup_expired(self, ttl: Optional[timedelta] = None) -> int:
-        """Remove expired cache entries.
+        """Mark expired cache entries invalidated without deleting files.
 
         Args:
             ttl: Custom TTL (uses default if not provided)
 
         Returns:
-            Number of entries removed
+            Number of entries invalidated
         """
         count = 0
         cache_base = self.cache_root / "cache"
@@ -309,8 +357,9 @@ class CacheManager:
                     continue
 
                 if not self.is_cache_valid(cache_dir.name, ttl):
-                    if self.invalidate_cache(cache_dir.name):
-                        count += 1
+                    if cache_dir.name not in self._invalidated_keys:
+                        if self.invalidate_cache(cache_dir.name):
+                            count += 1
 
         return count
 

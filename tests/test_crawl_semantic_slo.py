@@ -234,3 +234,128 @@ def test_cli_slo_help_works() -> None:
     result = runner.invoke(mdwb_cli.cli, ["slo", "--help"])
     assert result.exit_code == 0
     assert "--json" in result.output
+
+
+# ---------------------------------------------------------------------------
+# Real CrawlOrchestrator + submit_and_wait_for_job depth-1 expansion
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_crawl_orchestrator_expands_persisted_links_and_serves_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """CrawlOrchestrator must read canonical list[dict] links.json and expand depth-1 pages."""
+    import asyncio
+    from app.crawler import CrawlConfig, CrawlOrchestrator, submit_and_wait_for_job
+    from app.jobs import JobManager
+    from app.store import StorageConfig, Store
+    from tests.test_job_manager import _fake_runner
+
+    store = Store(StorageConfig(cache_root=tmp_path / "cache", db_path=tmp_path / "runs.db"))
+
+    async def _crawl_runner(*, job_id: str, url: str, store: Store, config=None, request=None):  # noqa: ANN001
+        res, artifacts = await _fake_runner(
+            job_id=job_id, url=url, store=store, config=config, request=request
+        )
+        if url.rstrip("/") == "https://example.com":
+            store.write_links(
+                job_id=job_id,
+                links=[
+                    {"href": "https://example.com/about", "text": "About", "source": "dom"},
+                    {"href": "/docs#intro", "text": "Docs", "source": "dom"},
+                    {"href": "https://other.org/skip", "text": "External", "source": "dom"},
+                ],
+            )
+        else:
+            store.write_links(job_id=job_id, links=[])
+        return res, artifacts
+
+    jm = JobManager(store=store, runner=_crawl_runner)
+    orchestrator = CrawlOrchestrator(store=store)
+    monkeypatch.setattr("app.main._crawler", orchestrator)
+
+    async def _capture(url: str) -> str:
+        return await submit_and_wait_for_job(jm, url=url, reuse_cache=False, timeout_s=5.0)
+
+    cfg = CrawlConfig(
+        seed_url="https://example.com",
+        max_pages=3,
+        max_depth=1,
+        domain_allowlist=["example.com"],
+        respect_robots_txt=False,
+        crawl_delay_ms=0,
+    )
+    crawl_id = await orchestrator.start_crawl(cfg, capture_fn=_capture)
+    task = orchestrator._tasks.get(crawl_id)
+    assert task is not None
+    await asyncio.wait_for(task, timeout=5.0)
+
+    status_resp = client.get(f"/crawl/{crawl_id}")
+    assert status_resp.status_code == 200
+    body = status_resp.json()
+    assert body["status"] == "completed"
+    assert body["max_pages"] == 3
+    assert body["max_depth"] == 1
+    assert body["completed"] == 3
+    assert body["failed"] == 0
+    captured_urls = {r["url"] for r in body["results"] if r["status"] == "success"}
+    assert captured_urls == {
+        "https://example.com",
+        "https://example.com/about",
+        "https://example.com/docs",
+    }
+
+
+@pytest.mark.asyncio
+async def test_submit_and_wait_for_job_handles_failure_and_timeout(tmp_path: Path) -> None:
+    """submit_and_wait_for_job raises RuntimeError on FAILED and TimeoutError on timeout."""
+    import asyncio
+    from app.crawler import submit_and_wait_for_job
+    from app.jobs import JobManager, JobState
+    from app.store import StorageConfig, Store
+
+    store = Store(StorageConfig(cache_root=tmp_path / "cache", db_path=tmp_path / "runs.db"))
+
+    async def _failing_runner(*, job_id: str, url: str, store: Store, config=None, request=None):  # noqa: ANN001
+        raise RuntimeError("boom during capture")
+
+    jm_fail = JobManager(store=store, runner=_failing_runner)
+    with pytest.raises(RuntimeError, match="boom during capture") as exc_info:
+        await submit_and_wait_for_job(jm_fail, url="https://example.com/fail", timeout_s=2.0)
+    assert getattr(exc_info.value, "job_id", None)
+
+    async def _slow_runner(*, job_id: str, url: str, store: Store, config=None, request=None):  # noqa: ANN001
+        await asyncio.sleep(10.0)
+        raise AssertionError("unreachable")
+
+    jm_slow = JobManager(store=store, runner=_slow_runner)
+    with pytest.raises(TimeoutError):
+        await submit_and_wait_for_job(jm_slow, url="https://example.com/slow", timeout_s=0.15)
+    # Job should have been cancelled on timeout
+    for snap in jm_slow._snapshots.values():
+        assert snap["state"] == JobState.CANCELLED.value
+
+
+def test_unknown_job_endpoints_return_404(client: TestClient) -> None:
+    """Querying non-existent jobs must return 404 instead of 500 or empty 200."""
+    missing_id = "nonexistent-job-999999"
+    for path in (
+        f"/jobs/{missing_id}",
+        f"/jobs/{missing_id}/raw",
+        f"/jobs/{missing_id}/events.json",
+        f"/jobs/{missing_id}/sections",
+        f"/jobs/{missing_id}/toc",
+        f"/jobs/{missing_id}/summary",
+        f"/jobs/{missing_id}/extract",
+        f"/jobs/{missing_id}/links",
+        f"/jobs/{missing_id}/links/docs",
+        f"/jobs/{missing_id}/follow?anchor=top",
+    ):
+        resp = client.get(path)
+        assert resp.status_code == 404, f"Expected 404 for GET {path}, got {resp.status_code}"
+
+    assert client.post(f"/jobs/{missing_id}/tag", json={"tag": "x"}).status_code == 404
+    assert client.post(f"/jobs/{missing_id}/tags", json={"tags": ["x"]}).status_code == 404
+    assert client.delete(f"/jobs/{missing_id}/tag/x").status_code == 404
+    assert client.post(f"/jobs/{missing_id}/share").status_code == 404

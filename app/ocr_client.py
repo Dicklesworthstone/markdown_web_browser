@@ -8,7 +8,7 @@ import base64
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Protocol, Sequence
+from typing import Any, Callable, Protocol, Sequence
 
 import httpx
 
@@ -24,8 +24,12 @@ from app.ocr_policy import (
     OCRPolicyRuntimeState,
     OCRReevaluationContext,
     OCRRuntimeSignal,
+    PROMPT_TEMPLATE_GENERIC_OCR,
+    PROMPT_TEMPLATE_GLM_OCR_DEFAULT,
     REASON_REEVAL_SUPPRESSED_COOLDOWN,
     REASON_REEVAL_SUPPRESSED_FLAPPING,
+    resolve_model_profile,
+    resolve_prompt_template,
     select_ocr_backend,
     should_reevaluate_policy,
 )
@@ -51,6 +55,19 @@ GLM_MAAS_DEFAULT_API_URL = "https://open.bigmodel.cn/api/paas/v4/layout_parsing"
 GLM_DEFAULT_PROMPT = (
     "Recognize the text in the image and output in Markdown format. Preserve the original "
     "layout including headings, paragraphs, tables, and formulas."
+)
+OLMOCR_V4_YAML_PROMPT = (
+    "Attached is one page of a document that you must process. "
+    "Just return the plain text representation of this document as if you were reading it naturally. "
+    "Convert equations to LaTeX and tables to HTML.\n"
+    "If there are any figures or charts, label them with the following markdown syntax "
+    "![Alt text describing the contents of the figure](page_startx_starty_width_height.png)\n"
+    "Return your output as markdown, with a front matter section on top specifying values for the "
+    "primary_language, is_rotation_valid, rotation_correction, is_table, and is_diagram parameters."
+)
+GENERIC_OCR_PROMPT = (
+    "Extract all visible text from the attached image and return clean Markdown preserving headings, "
+    "lists, tables, code blocks, and reading order."
 )
 @dataclass(slots=True, frozen=True)
 class OCRBackendRuntime:
@@ -337,6 +354,8 @@ class SubmitTilesResult:
     autotune: "OcrAutotuneSnapshot | None" = None
     reevaluate_policy: bool = False
     reevaluation_reason_code: str | None = None
+    served_model: str | None = None
+    prompt_template: str | None = None
 
 
 @dataclass(slots=True)
@@ -665,12 +684,21 @@ async def probe_ocr_backend(
         _select_server_url(cfg, backend=backend),
         backend_mode=backend.backend_mode,
     )
+    try:
+        model_profile = resolve_model_profile(cfg.ocr.model, allow_disabled=True)
+    except Exception:
+        model_profile = None
     capabilities: dict[str, object] = {
         "supports_submit": backend.backend_mode in {BACKEND_MODE_OPENAI_COMPATIBLE, BACKEND_MODE_MAAS},
         "supports_probe": True,
         "supports_health": True,
         "max_batch_tiles": cfg.ocr.max_batch_tiles,
         "max_batch_bytes": cfg.ocr.max_batch_bytes,
+        "max_tiles_in_flight": (
+            model_profile.max_tiles_in_flight if model_profile else cfg.ocr.max_concurrency
+        ),
+        "prompt_template": resolve_prompt_template(cfg.ocr.model),
+        "long_side_px": model_profile.long_side_px if model_profile else 1288,
         "reason_codes": list(backend.reason_codes),
         "reevaluate_after_s": backend.reevaluate_after_s,
         "host_capabilities": capabilities_snapshot.to_dict(),
@@ -777,6 +805,7 @@ async def submit_tiles(
     requests: Sequence[OCRRequest],
     settings: Settings | None = None,
     client: httpx.AsyncClient | None = None,
+    on_progress: Callable[[int, int, dict[str, Any] | None], None] | None = None,
 ) -> SubmitTilesResult:
     """Submit tiles to the configured olmOCR endpoint and return Markdown + telemetry."""
 
@@ -794,6 +823,8 @@ async def submit_tiles(
             backend=backend,
             host_capabilities=capabilities_snapshot.to_dict(),
             local_service=None,
+            served_model=cfg.ocr.model,
+            prompt_template=resolve_prompt_template(cfg.ocr.model),
         )
 
     failover_events: list[OCRFailoverEvent] = []
@@ -876,6 +907,7 @@ async def submit_tiles(
                 backend=candidate,
                 local_service=local_service,
                 client=client,
+                on_progress=on_progress,
             )
         except Exception as exc:
             circuit_opened, cooldown_s = _circuit_breaker.record_failure(candidate.backend_id)
@@ -932,6 +964,7 @@ async def _submit_tiles_single_backend(
     backend: OCRBackendRuntime,
     local_service: dict[str, object] | None,
     client: httpx.AsyncClient | None,
+    on_progress: Callable[[int, int, dict[str, Any] | None], None] | None = None,
 ) -> SubmitTilesResult:
     if backend.backend_mode not in {BACKEND_MODE_OPENAI_COMPATIBLE, BACKEND_MODE_MAAS}:
         raise NotImplementedError(
@@ -971,8 +1004,14 @@ async def _submit_tiles_single_backend(
 
     telemetry: list[OCRBatchTelemetry] = []
     markdown_by_id: dict[str, str] = {req.tile_id: "" for req in requests}
+    observed_served_models: list[str] = []
+    observed_prompt_templates: list[str] = []
+    total_tiles = len(requests)
+    completed_tile_ids: set[str] = set()
+    reported_done = 0
 
     async def _submit(group: list[_EncodedTile]) -> None:
+        nonlocal reported_done
         async with limiter.slot():
             batch_result = await _submit_batch(
                 group,
@@ -984,15 +1023,40 @@ async def _submit_tiles_single_backend(
                 backend_id=backend.backend_id,
             )
         telemetry.append(batch_result.telemetry)
+        if batch_result.served_model:
+            observed_served_models.append(batch_result.served_model)
+        if batch_result.prompt_template:
+            observed_prompt_templates.append(batch_result.prompt_template)
         for tile_id, chunk in zip(batch_result.tile_ids, batch_result.markdown, strict=True):
             markdown_by_id[tile_id] = chunk
+            completed_tile_ids.add(tile_id)
+        if callable(on_progress):
+            target_done = len(completed_tile_ids)
+            while reported_done < target_done:
+                reported_done += 1
+                try:
+                    on_progress(
+                        reported_done,
+                        total_tiles,
+                        {
+                            "done": reported_done,
+                            "total": total_tiles,
+                            "tile_ids": list(batch_result.tile_ids),
+                            "request_id": batch_result.telemetry.request_id,
+                        },
+                    )
+                except Exception:
+                    pass
         await limiter.record(batch_result.telemetry)
 
     try:
         await asyncio.gather(*(_submit(group) for group in batches))
     finally:
         if owns_client:
-            await http_client.aclose()
+            try:
+                await asyncio.shield(http_client.aclose())
+            except BaseException:
+                pass
 
     quota_status = _quota_tracker.record(
         len(requests), limit=settings.ocr.daily_quota_tiles, ratio=_QUOTA_WARNING_RATIO
@@ -1012,6 +1076,13 @@ async def _submit_tiles_single_backend(
         autotune_snapshot.policy_flap_suppression_count = policy_state.flap_suppression_count
         autotune_snapshot.policy_switch_count_window = len(policy_state.switch_timestamps)
     markdown_chunks = [markdown_by_id[tile.tile_id] for tile in encoded_tiles]
+    default_model = encoded_tiles[0].model if encoded_tiles else settings.ocr.model
+    served_model = observed_served_models[0] if observed_served_models else default_model
+    prompt_template = (
+        observed_prompt_templates[0]
+        if observed_prompt_templates
+        else resolve_prompt_template(default_model)
+    )
     return SubmitTilesResult(
         markdown_chunks=markdown_chunks,
         batches=telemetry,
@@ -1022,6 +1093,8 @@ async def _submit_tiles_single_backend(
         autotune=autotune_snapshot,
         reevaluate_policy=reevaluate_policy,
         reevaluation_reason_code=reevaluation_reason_code,
+        served_model=served_model,
+        prompt_template=prompt_template,
     )
 
 
@@ -1048,6 +1121,8 @@ class _BatchResult:
     tile_ids: tuple[str, ...]
     markdown: list[str]
     telemetry: OCRBatchTelemetry
+    served_model: str | None = None
+    prompt_template: str | None = None
 
 
 async def _submit_batch(
@@ -1078,6 +1153,8 @@ async def _submit_batch(
             backend_id=backend_id,
             model_override=model_override,
         )
+        served_model = payload.get("model") if isinstance(payload, dict) else None
+        prompt_template = resolve_prompt_template(model_override or tiles[0].model or served_model)
         start = time.perf_counter()
         try:
             response = await http_client.post(endpoint, headers=headers, json=payload)
@@ -1095,7 +1172,13 @@ async def _submit_batch(
                 payload_bytes=payload_bytes,
                 attempts=attempts,
             )
-            return _BatchResult(tile_ids=tile_ids, markdown=markdown, telemetry=telemetry)
+            return _BatchResult(
+                tile_ids=tile_ids,
+                markdown=markdown,
+                telemetry=telemetry,
+                served_model=str(served_model) if served_model is not None else None,
+                prompt_template=prompt_template,
+            )
         except httpx.HTTPStatusError as exc:
             status_code = exc.response.status_code
             if _should_try_next_model_alias(
@@ -1165,6 +1248,7 @@ def _build_payload(
     model = model_override or tiles[0].model
     if not model:
         raise ValueError("Model must be specified for OCR requests")
+    prompt_template = resolve_prompt_template(model)
     if (
         backend_id.endswith("-remote-openai")
         and not model.startswith("allenai/")
@@ -1172,21 +1256,29 @@ def _build_payload(
     ):
         model = f"allenai/{model.split('-FP8')[0]}"  # Remove -FP8 suffix and add prefix
 
-    # olmOCR's official prompt from build_no_anchoring_v4_yaml_prompt()
-    # https://github.com/allenai/olmocr/blob/main/olmocr/prompts/prompts.py
-    # Note: Model doesn't format output with markdown syntax (headings, bold, etc) despite instructions
+    if prompt_template == PROMPT_TEMPLATE_GLM_OCR_DEFAULT or backend_id.startswith("glm"):
+        if len(tiles) == 1:
+            return build_glm_openai_chat_payload(
+                image_b64=tiles[0].image_b64,
+                model=model,
+                prompt=GLM_DEFAULT_PROMPT,
+            )
+        prompt_text = GLM_DEFAULT_PROMPT
+        max_tokens = 4096
+        temperature = 0.01
+    elif prompt_template == PROMPT_TEMPLATE_GENERIC_OCR:
+        prompt_text = GENERIC_OCR_PROMPT
+        max_tokens = 8000
+        temperature = 0.1
+    else:
+        prompt_text = OLMOCR_V4_YAML_PROMPT
+        max_tokens = 8000
+        temperature = 0.1
+
     content = [
         {
             "type": "text",
-            "text": (
-                "Attached is one page of a document that you must process. "
-                "Just return the plain text representation of this document as if you were reading it naturally. "
-                "Convert equations to LaTeX and tables to HTML.\n"
-                "If there are any figures or charts, label them with the following markdown syntax "
-                "![Alt text describing the contents of the figure](page_startx_starty_width_height.png)\n"
-                "Return your output as markdown, with a front matter section on top specifying values for the "
-                "primary_language, is_rotation_valid, rotation_correction, is_table, and is_diagram parameters."
-            ),
+            "text": prompt_text,
         }
     ]
 
@@ -1199,8 +1291,8 @@ def _build_payload(
     return {
         "model": model,
         "messages": [{"role": "user", "content": content}],
-        "max_tokens": 8000,  # Match olmOCR toolkit configuration
-        "temperature": 0.1,  # Low temperature for deterministic OCR output (per olmOCR docs)
+        "max_tokens": max_tokens,
+        "temperature": temperature,
     }
 
 
@@ -1433,6 +1525,12 @@ def _resolve_runtime_concurrency_limits(
         max_limit = max(1, min(max_limit, suggested_max))
         min_limit = 1
         profile = "local-cpu-conservative"
+    else:
+        try:
+            model_profile = resolve_model_profile(settings.ocr.model, allow_disabled=True)
+            max_limit = max(min_limit, min(max_limit, model_profile.max_tiles_in_flight))
+        except Exception:
+            pass
 
     return min_limit, max_limit, profile
 

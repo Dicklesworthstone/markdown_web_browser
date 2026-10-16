@@ -19,10 +19,18 @@ const deviceScaleFactor = parseIntEnv('PLAYWRIGHT_DEVICE_SCALE_FACTOR', 2);
 const actionTimeout = parseIntEnv('PLAYWRIGHT_ACTION_TIMEOUT_MS', 15_000);
 const navigationTimeout = parseIntEnv('PLAYWRIGHT_NAVIGATION_TIMEOUT_MS', 30_000);
 const colorScheme = process.env.PLAYWRIGHT_COLOR_SCHEME?.toLowerCase() === 'dark' ? 'dark' : 'light';
-const baseURL = process.env.PLAYWRIGHT_BASE_URL ?? 'http://localhost:8000';
+const baseURL = process.env.PLAYWRIGHT_BASE_URL ?? process.env.API_BASE_URL ?? 'http://localhost:8007';
+const channelAliases = {
+  cft: 'chrome',
+  'chrome-for-testing': 'chrome',
+};
+const normalizeChannel = (raw) => {
+  const cleaned = (raw ?? 'chrome').trim().toLowerCase();
+  return channelAliases[cleaned] ?? cleaned;
+};
 const channelCandidates = parseListEnv(process.env.PLAYWRIGHT_CHANNEL, 'cft,chromium');
-const channel = channelCandidates[0];
-const channelFallbacks = channelCandidates.slice(1);
+const channel = normalizeChannel(channelCandidates[0]);
+const channelFallbacks = channelCandidates.slice(1).map(normalizeChannel);
 
 const transportCandidates = parseListEnv(process.env.PLAYWRIGHT_TRANSPORT, 'cdp');
 const resolvedTransport = (transportCandidates[0] ?? 'cdp').toLowerCase();
@@ -35,7 +43,17 @@ const maskSelectors = (process.env.PLAYWRIGHT_SCREENSHOT_MASKS ?? '')
 
 const launchOptions = {
   channel,
+  args: [
+    '--headless=new',
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-dev-shm-usage',
+    `--window-size=${viewportWidth},${viewportHeight}`,
+  ],
 };
+if (process.env.CFT_EXECUTABLE_PATH) {
+  launchOptions.executablePath = process.env.CFT_EXECUTABLE_PATH;
+}
 
 if (resolvedTransport === 'bidi') {
   // @ts-ignore -- protocol is a documented experimental option in Playwright 1.50+

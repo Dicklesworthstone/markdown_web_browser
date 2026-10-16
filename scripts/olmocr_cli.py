@@ -124,6 +124,7 @@ def _auth_headers(settings: CLISettings) -> dict[str, str]:
     headers: dict[str, str] = {}
     if settings.mdwb_api_key:
         headers["Authorization"] = f"Bearer {settings.mdwb_api_key}"
+        headers["X-API-Key"] = settings.mdwb_api_key
     return headers
 
 

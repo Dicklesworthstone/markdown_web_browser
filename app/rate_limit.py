@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import threading
 import time
 from dataclasses import dataclass
@@ -10,31 +12,39 @@ from typing import Any, Dict, Optional
 from fastapi import HTTPException, Request, Response, status
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from app.settings import Settings
+from app.auth import (
+    check_job_owner_access,
+    extract_api_key_from_request,
+    get_store,
+    is_auth_exempt_path,
+    resolve_request_auth,
+)
+from app.settings import Settings, effective_rate_limit_per_minute
 
 
 def extract_rate_limit_key(request: Request) -> str:
     """Extract rate limit key from request.
 
-    Uses API key (if valid), auth context, or falls back to client IP.
+    Uses auth context (if authenticated), API key header/Bearer token, or falls back to client IP.
 
     Args:
         request: FastAPI Request object
 
     Returns:
-        Rate limit key string (api_key:*, api_key_id:*, or ip:*)
+        Rate limit key string (api_key_id:*, api_key:*, or ip:*)
     """
-    # Try to get API key from header
-    api_key = request.headers.get("X-API-Key", None)
+    if hasattr(request.state, "auth_context") and getattr(
+        request.state.auth_context, "api_key_id", 0
+    ):
+        return f"api_key_id:{request.state.auth_context.api_key_id}"
+
+    api_key, _ = extract_api_key_from_request(request)
     if api_key and api_key.startswith("mdwb_") and len(api_key) == 37:
-        # Valid API key format - use prefix for rate limiting
         return f"api_key:{api_key[:12]}"
 
-    # Try to get from auth context (if auth middleware ran)
     if hasattr(request.state, "auth_context"):
         return f"api_key_id:{request.state.auth_context.api_key_id}"
 
-    # Fall back to client IP
     client_host = request.client.host if request.client else "unknown"
     return f"ip:{client_host}"
 
@@ -64,7 +74,7 @@ class TokenBucket:
     def _refill(self) -> None:
         """Refill tokens based on elapsed time."""
         now = time.time()
-        elapsed = now - self.last_refill
+        elapsed = max(0.0, now - self.last_refill)
 
         # Add tokens based on elapsed time
         new_tokens = elapsed * self.refill_rate
@@ -84,7 +94,6 @@ class TokenBucket:
     def get_stats(self) -> Dict[str, float]:
         """Get current bucket statistics."""
         self._refill()
-        # Prevent division by zero if capacity is 0
         utilization = 1.0 - (self.tokens / self.capacity) if self.capacity > 0 else 0.0
         return {
             "tokens": self.tokens,
@@ -95,156 +104,300 @@ class TokenBucket:
 
 
 class RateLimiter:
-    """In-memory rate limiter using token buckets.
+    """Token-bucket rate limiter with optional SQLite-backed cross-worker synchronization."""
 
-    For production with multiple workers, consider using Redis.
-    """
-
-    def __init__(self, requests_per_minute: int = 60, burst_capacity: int | None = None):
-        """Initialize rate limiter.
-
-        Args:
-            requests_per_minute: Sustained rate limit (must be positive)
-            burst_capacity: Maximum burst capacity (defaults to requests_per_minute)
-
-        Raises:
-            ValueError: If requests_per_minute is not positive
-        """
+    def __init__(
+        self,
+        requests_per_minute: int = 60,
+        burst_capacity: int | None = None,
+        *,
+        store: Any | None = None,
+    ):
         if requests_per_minute <= 0:
             raise ValueError(f"requests_per_minute must be positive, got {requests_per_minute}")
 
         self.requests_per_minute = requests_per_minute
         self.requests_per_second = requests_per_minute / 60.0
-
-        # Allow bursts up to the per-minute limit
         self.burst_capacity = burst_capacity or requests_per_minute
-
-        # Storage: key -> TokenBucket
         self.buckets: Dict[str, TokenBucket] = {}
+        self.store = store
+        self._lock = threading.Lock()
 
-    def _create_bucket(self) -> TokenBucket:
-        """Create a new token bucket with configured limits."""
+    def _create_bucket(
+        self,
+        *,
+        requests_per_minute: int | None = None,
+        burst_capacity: int | None = None,
+    ) -> TokenBucket:
+        rpm = requests_per_minute if (requests_per_minute and requests_per_minute > 0) else self.requests_per_minute
+        cap = burst_capacity if (burst_capacity and burst_capacity > 0) else (
+            rpm if requests_per_minute else self.burst_capacity
+        )
         return TokenBucket(
-            capacity=self.burst_capacity,
-            tokens=self.burst_capacity,  # Start full
-            refill_rate=self.requests_per_second,
+            capacity=cap,
+            tokens=float(cap),
+            refill_rate=rpm / 60.0,
             last_refill=time.time(),
         )
 
-    def _get_bucket(self, key: str) -> TokenBucket:
-        """Get or create a token bucket for the given key."""
+    def _get_bucket(
+        self,
+        key: str,
+        *,
+        requests_per_minute: int | None = None,
+    ) -> TokenBucket:
+        rpm = requests_per_minute if (requests_per_minute and requests_per_minute > 0) else self.requests_per_minute
+        cap = rpm if requests_per_minute else self.burst_capacity
+        rps = rpm / 60.0
         if key not in self.buckets:
-            self.buckets[key] = self._create_bucket()
+            self.buckets[key] = self._create_bucket(requests_per_minute=rpm, burst_capacity=cap)
+        else:
+            bucket = self.buckets[key]
+            if bucket.capacity != cap or abs(bucket.refill_rate - rps) > 1e-9:
+                bucket._refill()
+                bucket.capacity = cap
+                bucket.refill_rate = rps
+                bucket.tokens = min(float(cap), bucket.tokens)
         return self.buckets[key]
 
-    def check_rate_limit(self, key: str, tokens: int = 1) -> tuple[bool, Dict[str, Any]]:
-        """Check if request is allowed under rate limit.
+    def _consume_shared_store(
+        self,
+        store: Any,
+        key: str,
+        tokens: int,
+        *,
+        rpm: int,
+        cap: int,
+    ) -> tuple[bool, TokenBucket] | None:
+        engine = getattr(store, "engine", None)
+        if engine is None:
+            return None
+        rps = rpm / 60.0
+        try:
+            with engine.connect() as conn:
+                conn.exec_driver_sql("PRAGMA busy_timeout=50")
+                try:
+                    with conn.begin():
+                        try:
+                            row = conn.exec_driver_sql(
+                                "SELECT capacity, tokens, refill_rate, last_refill FROM rate_limit_buckets WHERE key = ?",
+                                (key,),
+                            ).fetchone()
+                        except Exception:
+                            conn.exec_driver_sql(
+                                """
+                                CREATE TABLE IF NOT EXISTS rate_limit_buckets (
+                                    key TEXT PRIMARY KEY,
+                                    capacity INTEGER NOT NULL,
+                                    tokens REAL NOT NULL,
+                                    refill_rate REAL NOT NULL,
+                                    last_refill REAL NOT NULL
+                                )
+                                """
+                            )
+                            row = None
+                        now = time.time()
+                        if row is None:
+                            bucket = TokenBucket(
+                                capacity=cap,
+                                tokens=float(cap),
+                                refill_rate=rps,
+                                last_refill=now,
+                            )
+                        else:
+                            bucket = TokenBucket(
+                                capacity=cap,
+                                tokens=min(float(cap), float(row[1])),
+                                refill_rate=rps,
+                                last_refill=float(row[3]),
+                            )
+                        allowed = bucket.consume(tokens)
+                        conn.exec_driver_sql(
+                            """
+                            INSERT INTO rate_limit_buckets (key, capacity, tokens, refill_rate, last_refill)
+                            VALUES (?, ?, ?, ?, ?)
+                            ON CONFLICT(key) DO UPDATE SET
+                                capacity = excluded.capacity,
+                                tokens = excluded.tokens,
+                                refill_rate = excluded.refill_rate,
+                                last_refill = excluded.last_refill
+                            """,
+                            (
+                                key,
+                                bucket.capacity,
+                                bucket.tokens,
+                                bucket.refill_rate,
+                                bucket.last_refill,
+                            ),
+                        )
+                        self.buckets[key] = bucket
+                        return allowed, bucket
+                finally:
+                    try:
+                        conn.exec_driver_sql("PRAGMA busy_timeout=30000")
+                    except Exception:
+                        pass
+        except Exception:
+            return None
 
-        Returns:
-            (allowed, stats) tuple where stats contains rate limit info:
-                - limit: Maximum requests per minute
-                - remaining: Current tokens available
-                - reset: Unix timestamp when bucket will be completely full
-                - retry_after: (if not allowed) Seconds to wait before retrying
-        """
-        bucket = self._get_bucket(key)
-        allowed = bucket.consume(tokens)
+    def check_rate_limit(
+        self,
+        key: str,
+        tokens: int = 1,
+        *,
+        requests_per_minute: int | None = None,
+        store: Any | None = None,
+    ) -> tuple[bool, Dict[str, Any]]:
+        """Check if request is allowed under rate limit."""
+        rpm = requests_per_minute if (requests_per_minute and requests_per_minute > 0) else self.requests_per_minute
+        cap = rpm if requests_per_minute else self.burst_capacity
+        active_store = store or self.store
 
-        stats = bucket.get_stats()
-        stats["limit"] = self.requests_per_minute
-        stats["remaining"] = int(bucket.tokens)
-        # Reset = when bucket will be completely full (burst capacity restored)
-        # Note: You may still have tokens available before this time
-        stats["reset"] = int(time.time() + bucket.time_until_available(self.burst_capacity))
+        with self._lock:
+            shared_res = (
+                self._consume_shared_store(active_store, key, tokens, rpm=rpm, cap=cap)
+                if active_store is not None
+                else None
+            )
+            if shared_res is not None:
+                allowed, bucket = shared_res
+            else:
+                bucket = self._get_bucket(key, requests_per_minute=rpm)
+                allowed = bucket.consume(tokens)
 
-        if not allowed:
-            # Retry after = when next single token will be available
-            stats["retry_after"] = int(bucket.time_until_available(1)) + 1
+            stats = bucket.get_stats()
+            stats["limit"] = rpm
+            stats["remaining"] = int(bucket.tokens)
+            stats["reset"] = int(time.time() + bucket.time_until_available(cap))
 
-        return allowed, stats
+            if not allowed:
+                stats["retry_after"] = int(bucket.time_until_available(1)) + 1
+
+            return allowed, stats
+
+    def reset(self, *, store: Any | None = None) -> None:
+        """Clear all in-memory and persisted rate-limit buckets."""
+        with self._lock:
+            self.buckets.clear()
+            active_store = store or self.store
+            engine = getattr(active_store, "engine", None) if active_store is not None else None
+            if engine is not None:
+                try:
+                    with engine.begin() as conn:
+                        conn.exec_driver_sql("DELETE FROM rate_limit_buckets")
+                except Exception:
+                    pass
 
     def cleanup_stale_buckets(self, max_age_seconds: float = 3600) -> int:
-        """Remove buckets that haven't been used recently.
-
-        Returns:
-            Number of buckets removed
-        """
+        """Remove buckets that haven't been used recently."""
         now = time.time()
-        stale_keys = [
-            key
-            for key, bucket in self.buckets.items()
-            if now - bucket.last_refill > max_age_seconds
-        ]
+        with self._lock:
+            stale_keys = [
+                key
+                for key, bucket in self.buckets.items()
+                if now - bucket.last_refill > max_age_seconds
+            ]
 
-        for key in stale_keys:
-            del self.buckets[key]
+            for key in stale_keys:
+                del self.buckets[key]
 
-        return len(stale_keys)
+            return len(stale_keys)
 
 
-# Global rate limiter instance (for single-process deployments)
-# For multi-worker deployments, use Redis-backed rate limiting
 _global_limiter: Optional[RateLimiter] = None
 _limiter_lock = threading.Lock()
 
 
 def get_rate_limiter(settings: Settings | None = None) -> RateLimiter:
-    """Get or create the global rate limiter instance.
-
-    Thread-safe singleton implementation using double-checked locking pattern.
-
-    Args:
-        settings: Optional settings to configure rate limiter.
-                  Only used on first initialization, ignored afterwards.
-
-    Returns:
-        RateLimiter: Global rate limiter instance
-    """
+    """Get or create the global rate limiter instance."""
     global _global_limiter
 
-    # Fast path - if already initialized, return immediately without locking
     if _global_limiter is not None:
         return _global_limiter
 
-    # Slow path - need to initialize, acquire lock
     with _limiter_lock:
-        # Double-check: another thread might have initialized while we waited for lock
         if _global_limiter is None:
-            from app.settings import settings as global_settings
-
-            active_settings = settings or global_settings
-
-            # Get rate limit from settings, default to 60 requests per minute
-            requests_per_minute = getattr(active_settings, "RATE_LIMIT_PER_MINUTE", 60)
-
+            requests_per_minute = effective_rate_limit_per_minute(settings)
             _global_limiter = RateLimiter(requests_per_minute=requests_per_minute)
 
     return _global_limiter
 
 
-class RateLimitMiddleware(BaseHTTPMiddleware):
-    """FastAPI middleware for rate limiting.
+def reset_rate_limiter() -> None:
+    """Reset the global rate limiter and any SQLite-backed bucket rows."""
+    global _global_limiter
+    try:
+        store = get_store()
+    except Exception:
+        store = None
+    if _global_limiter is not None:
+        _global_limiter.reset(store=store)
+    elif store is not None:
+        engine = getattr(store, "engine", None)
+        if engine is not None:
+            try:
+                with engine.begin() as conn:
+                    conn.exec_driver_sql("DELETE FROM rate_limit_buckets")
+            except Exception:
+                pass
 
-    Adds rate limit headers to all responses:
-    - X-RateLimit-Limit: Maximum requests per minute
-    - X-RateLimit-Remaining: Remaining requests in current window
-    - X-RateLimit-Reset: Unix timestamp when limit resets
-    """
+
+class RateLimitMiddleware(BaseHTTPMiddleware):
+    """FastAPI middleware enforcing API key authentication and token-bucket rate limiting."""
 
     def __init__(self, app, limiter: Optional[RateLimiter] = None):
         super().__init__(app)
+        self._custom_limiter = limiter is not None
         self.limiter = limiter or get_rate_limiter()
 
     async def dispatch(self, request: Request, call_next):
-        """Process request and apply rate limiting."""
+        """Authenticate request (when required) and apply rate limiting."""
+        path = request.url.path
+        exempt = is_auth_exempt_path(path)
+        is_health_or_stream = (
+            path.startswith("/health")
+            or path.startswith("/static/")
+            or path.startswith("/web/")
+            or path.endswith("/stream")
+            or path.endswith("/events")
+        )
 
-        # Get rate limit key (API key or IP address)
+        try:
+            await asyncio.to_thread(resolve_request_auth, request)
+        except HTTPException as exc:
+            if not exempt:
+                return Response(
+                    content=json.dumps({"detail": exc.detail}),
+                    status_code=exc.status_code,
+                    headers=dict(exc.headers or {}),
+                    media_type="application/json",
+                )
+
         rate_limit_key = self._get_rate_limit_key(request)
 
-        # Check rate limit
-        allowed, stats = self.limiter.check_rate_limit(rate_limit_key)
+        auth_ctx = getattr(request.state, "auth_context", None)
+        key_rate_limit = getattr(auth_ctx, "rate_limit", None) if auth_ctx is not None else None
+        if key_rate_limit is not None and key_rate_limit > 0:
+            effective_rpm: int | None = int(key_rate_limit)
+        elif not self._custom_limiter:
+            effective_rpm = effective_rate_limit_per_minute()
+        else:
+            effective_rpm = None
 
-        # Add rate limit headers
+        active_store = None
+        if not self._custom_limiter and not is_health_or_stream:
+            try:
+                active_store = get_store()
+            except Exception:
+                active_store = None
+
+        allowed, stats = await asyncio.to_thread(
+            self.limiter.check_rate_limit,
+            rate_limit_key,
+            requests_per_minute=effective_rpm,
+            store=active_store,
+        )
+
         headers = {
             "X-RateLimit-Limit": str(stats["limit"]),
             "X-RateLimit-Remaining": str(stats["remaining"]),
@@ -252,9 +405,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         }
 
         if not allowed:
-            # Rate limit exceeded
             headers["Retry-After"] = str(stats["retry_after"])
-
             return Response(
                 content='{"detail": "Rate limit exceeded. Please try again later."}',
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -262,62 +413,58 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
                 media_type="application/json",
             )
 
-        # Process request
+        if not exempt and path.startswith("/jobs/"):
+            parts = [seg for seg in path.split("/") if seg]
+            if len(parts) >= 2 and parts[0] == "jobs":
+                try:
+                    await asyncio.to_thread(check_job_owner_access, request, parts[1])
+                except HTTPException as exc:
+                    err_headers = dict(headers)
+                    err_headers.update(dict(exc.headers or {}))
+                    return Response(
+                        content=json.dumps({"detail": exc.detail}),
+                        status_code=exc.status_code,
+                        headers=err_headers,
+                        media_type="application/json",
+                    )
+
         response = await call_next(request)
 
-        # Add rate limit headers to response
         for key, value in headers.items():
             response.headers[key] = value
 
         return response
 
     def _get_rate_limit_key(self, request: Request) -> str:
-        """Extract rate limit key from request.
-
-        Uses API key if available, otherwise falls back to client IP.
-        """
+        """Extract rate limit key from request."""
         return extract_rate_limit_key(request)
 
 
-# Dependency for manual rate limit checking in endpoints
 async def check_rate_limit(
     request: Request,
     tokens: int = 1,
 ) -> Dict[str, Any]:
-    """FastAPI dependency to manually check rate limits in endpoints.
-
-    Usage for single token (default):
-        @app.get("/expensive-operation")
-        async def expensive_op(rate_info: Dict = Depends(check_rate_limit)):
-            # This endpoint consumes 1 token
-            ...
-
-    For operations that consume multiple tokens, create a wrapper function:
-        async def check_rate_limit_5(request: Request) -> Dict[str, Any]:
-            return await check_rate_limit(request, tokens=5)
-
-        @app.post("/batch-operation")
-        async def batch_op(rate_info: Dict = Depends(check_rate_limit_5)):
-            # This endpoint consumes 5 tokens
-            ...
-
-    Or use functools.partial:
-        from functools import partial
-
-        @app.post("/batch-operation")
-        async def batch_op(
-            rate_info: Dict = Depends(partial(check_rate_limit, tokens=5))
-        ):
-            # This endpoint consumes 5 tokens
-            ...
-    """
+    """FastAPI dependency to manually check rate limits in endpoints."""
     limiter = get_rate_limiter()
-
-    # Get rate limit key
     key = extract_rate_limit_key(request)
+    auth_ctx = getattr(request.state, "auth_context", None)
+    key_rate_limit = getattr(auth_ctx, "rate_limit", None) if auth_ctx is not None else None
+    effective_rpm = (
+        int(key_rate_limit)
+        if (key_rate_limit is not None and key_rate_limit > 0)
+        else effective_rate_limit_per_minute()
+    )
+    try:
+        active_store = get_store()
+    except Exception:
+        active_store = None
 
-    # Check rate limit
-    allowed, stats = limiter.check_rate_limit(key, tokens)
+    allowed, stats = limiter.check_rate_limit(
+        key,
+        tokens,
+        requests_per_minute=effective_rpm,
+        store=active_store,
+    )
 
     if not allowed:
         raise HTTPException(

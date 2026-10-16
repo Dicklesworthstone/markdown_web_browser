@@ -1016,13 +1016,15 @@ async def test_real_ocr_api_multiple_images():
 @pytest.mark.skipif(not OLMOCR_API_KEY, reason="Requires real OCR API key")
 async def test_real_ocr_api_with_actual_webpage_screenshot():
     """Test with a real screenshot from an actual website."""
+    from app.capture import _launch_browser
+
     settings = get_settings()
 
     # Use playwright to capture a real website with proper cleanup
     browser = None
     try:
         async with async_playwright() as p:
-            browser = await p.chromium.launch()
+            browser = await _launch_browser(p, settings.browser.playwright_channel)
             page = await browser.new_page()
 
             # Navigate to a real website
@@ -1089,3 +1091,38 @@ async def test_real_ocr_api_concurrent_requests():
     # All should have content
     for section in result.markdown_chunks:
         assert len(section) > 0
+
+
+def test_build_payload_selects_prompt_template_by_model() -> None:
+    tile_glm = ocr_client_module._EncodedTile(
+        tile_id="t1",
+        image_b64="YWJj",
+        size_bytes=4,
+        model="GLM-OCR-Local-OpenAI",
+    )
+    glm_payload = ocr_client_module._build_payload(
+        [tile_glm],
+        use_fp8=False,
+        backend_mode="openai-compatible",
+        backend_id="glm-ocr-local-openai",
+    )
+    glm_text = glm_payload["messages"][0]["content"][0]["text"]
+    assert glm_text == ocr_client_module.GLM_DEFAULT_PROMPT
+    assert "primary_language" not in glm_text
+
+    tile_olm = ocr_client_module._EncodedTile(
+        tile_id="t2",
+        image_b64="YWJj",
+        size_bytes=4,
+        model="olmOCR-2-7B-1025-FP8",
+    )
+    olm_payload = ocr_client_module._build_payload(
+        [tile_olm],
+        use_fp8=True,
+        backend_mode="openai-compatible",
+        backend_id="olmocr-remote-openai",
+    )
+    olm_text = olm_payload["messages"][0]["content"][0]["text"]
+    assert olm_text == ocr_client_module.OLMOCR_V4_YAML_PROMPT
+    assert olm_payload["model"] == "allenai/olmOCR-2-7B-1025"
+

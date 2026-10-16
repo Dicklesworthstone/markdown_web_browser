@@ -159,7 +159,12 @@ async def test_perform_viewport_sweeps_handles_shrink_retry(
 
     assert stats.shrink_events == 1
     assert stats.retry_attempts == 1
-    assert stats.sweep_count >= 2
+    assert stats.attempt_count == 2
+    assert stats.abandoned_tile_count == 1
+    assert len(stats.attempt_history) == 2
+    assert stats.attempt_history[0]["reason"] == "scroll_height_shrank"
+    assert stats.attempt_history[1]["reason"] == "completed"
+    assert stats.sweep_count == 2
     assert stats.overlap_pairs == stats.sweep_count - 1
     assert stats.overlap_match_ratio == pytest.approx(1.0)
     assert user_agent == "FakeAgent/1.0"
@@ -171,6 +176,190 @@ async def test_perform_viewport_sweeps_handles_shrink_retry(
     assert failures == []
     assert sweep_events, "sweep events should capture per-step telemetry"
     assert len(tiles) == stats.sweep_count
+    # Active tiles must not duplicate y_offset=0 from the abandoned attempt
+    assert [t.viewport_y_offset for t in tiles] == [0, 500]
     # Ensure scrollTo was invoked with the expected offsets (0 for reset plus >0 for sweeps).
     assert page.scroll_calls[0] == 0
     assert any(offset > 0 for offset in page.scroll_calls[1:])
+
+
+@pytest.mark.asyncio()
+async def test_adversarial_lazy_content_seam_alignment_and_dom_overlay(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real browser capture settles [aria-busy], triggers lazy growth, aligns cross-sweep seams, and harvests dom_overlay."""
+    from dataclasses import replace
+    from datetime import datetime, timezone
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    import threading
+    from app.capture import capture_tiles
+    from app.settings import get_settings
+    from app.store import StorageConfig, Store
+
+    html_doc = b"""<!doctype html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <title>Adversarial Lazy & Seam Test</title>
+      <style>
+        body { margin: 0; font-family: sans-serif; background: #ffffff; color: #111111; }
+        .block { height: 500px; padding: 20px; box-sizing: border-box; border-bottom: 2px solid #333; }
+      </style>
+    </head>
+    <body>
+      <main id="app" aria-busy="true">
+        <section class="block" id="sec-1"><h1>Section One Alpha</h1><p>Initial visible paragraph.</p></section>
+        <section class="block" id="sec-2"><h2>Section Two Beta</h2><p>Overlap seam region content.</p></section>
+        <div id="lazy-slot" data-lazy="true" style="min-height: 50px;"></div>
+      </main>
+      <script>
+        setTimeout(() => {
+          const lazy = document.getElementById('lazy-slot');
+          if (lazy) {
+            lazy.innerHTML = '<section class="block" id="sec-3"><h2>Section Three Lazy</h2><p><a href="https://example.com/lazy">Lazy Link</a></p></section>';
+          }
+          document.getElementById('app').setAttribute('aria-busy', 'false');
+        }, 40);
+      </script>
+    </body>
+    </html>"""
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(html_doc)))
+            self.end_headers()
+            self.wfile.write(html_doc)
+
+        def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+            return
+
+    server = HTTPServer(("127.0.0.1", 0), _Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        base_settings = get_settings()
+        browser_cfg = replace(
+            base_settings.browser,
+            viewport_overlap_px=120,
+            tile_overlap_px=120,
+            scroll_settle_ms=60,
+        )
+        monkeypatch.setattr(
+            "app.capture.get_settings",
+            lambda: replace(base_settings, browser=browser_cfg),
+        )
+
+        url = f"http://127.0.0.1:{server.server_port}/"
+        config = CaptureConfig(
+            url=url,
+            viewport_width=800,
+            viewport_height=600,
+            device_scale_factor=1,
+        )
+        result = await capture_tiles(config)
+
+        # 3 sections * 500px = 1500px > 600px viewport -> multiple sweeps
+        assert len(result.tiles) >= 2
+        assert result.manifest.sweep_stats.busy_timeout_count == 0
+        assert result.dom_snapshot is not None
+        dom_text = result.dom_snapshot.decode("utf-8")
+        assert "Section Three Lazy" in dom_text
+        # Verify no visible watermark DOM element was injected
+        assert "mdwb-watermark-top" not in dom_text
+        assert "__mdwb_capture_watermark" not in dom_text
+
+        # Cross-sweep seam hashes AND pixel overlap SHA256 must match across sweeps!
+        assert result.tiles[0].seam_bottom_hash is not None
+        assert result.tiles[0].seam_bottom_hash == result.tiles[1].seam_top_hash
+        assert result.tiles[0].bottom_overlap_sha256 is not None
+        assert result.tiles[0].bottom_overlap_sha256 == result.tiles[1].top_overlap_sha256
+        assert result.manifest.sweep_stats.overlap_match_ratio == pytest.approx(1.0)
+
+        # Verify viewport-synchronized dom_overlay boxes were harvested and persist via Store
+        assert len(result.dom_overlay) >= 3
+        overlay_texts = {str(item.get("text")) for item in result.dom_overlay}
+        assert "Section One Alpha" in overlay_texts
+        assert "Section Three Lazy" in overlay_texts
+
+        store = Store(StorageConfig(cache_root=tmp_path / "cache", db_path=tmp_path / "runs.db"))
+        store.allocate_run(
+            job_id="job-overlay-1",
+            url=url,
+            started_at=datetime.now(timezone.utc),
+        )
+        overlay_path = store.write_dom_overlay(job_id="job-overlay-1", overlay=result.dom_overlay)
+        assert overlay_path is not None and overlay_path.exists()
+        loaded_overlay = store.read_dom_overlay("job-overlay-1")
+        assert len(loaded_overlay) == len(result.dom_overlay)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.asyncio()
+async def test_adversarial_busy_timeout_and_max_steps_truncation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real browser capture bounds stuck [aria-busy='true'] and flags max_steps truncation."""
+    from dataclasses import replace
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    import threading
+    from app.capture import capture_tiles
+    from app.settings import get_settings
+
+    html_doc = b"""<!doctype html>
+    <html>
+    <body style="margin:0">
+      <div aria-busy="true" style="height: 4000px; background: #eee;">
+        <h1>Stuck Busy Tall Document</h1>
+      </div>
+    </body>
+    </html>"""
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(html_doc)))
+            self.end_headers()
+            self.wfile.write(html_doc)
+
+        def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+            return
+
+    server = HTTPServer(("127.0.0.1", 0), _Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        base_settings = get_settings()
+        browser_cfg = replace(
+            base_settings.browser,
+            scroll_settle_ms=20,
+            max_viewport_sweeps=2,
+        )
+        monkeypatch.setattr(
+            "app.capture.get_settings",
+            lambda: replace(base_settings, browser=browser_cfg),
+        )
+
+        result = await capture_tiles(
+            CaptureConfig(
+                url=f"http://127.0.0.1:{server.server_port}/",
+                viewport_width=800,
+                viewport_height=600,
+                device_scale_factor=1,
+            )
+        )
+        assert result.manifest.sweep_stats.sweep_count == 2
+        assert result.manifest.sweep_stats.truncated_by_max_steps is True
+        assert result.manifest.sweep_stats.busy_timeout_count >= 1
+        warning_codes = {w.code for w in result.manifest.warnings}
+        assert "aria-busy-timeout" in warning_codes
+        assert "max-sweeps-truncated" in warning_codes
+    finally:
+        server.shutdown()
+        server.server_close()
+

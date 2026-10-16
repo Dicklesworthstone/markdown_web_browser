@@ -2,14 +2,16 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+import hashlib
 import io
 import json
 import tarfile
 
 import pytest
+from sqlmodel import select
 import zstandard as zstd
 
-from app.store import StorageConfig, Store, _build_runtime_cache_key
+from app.store import LinkRecord, StorageConfig, Store, _build_runtime_cache_key
 from app.tiler import TileSlice
 from app.schemas import (
     ConcurrencyWindow,
@@ -30,9 +32,20 @@ def _storage(tmp_path: Path) -> Store:
     return Store(config=config)
 
 
-def _allocate_run(store: Store, *, job_id: str = "run-123") -> tuple[str, Path]:
-    started = datetime(2025, 11, 8, 8, 0, tzinfo=timezone.utc)
-    paths = store.allocate_run(job_id=job_id, url="https://example.com", started_at=started)
+def _allocate_run(
+    store: Store,
+    *,
+    job_id: str = "run-123",
+    started_at: datetime | None = None,
+    cache_key: str | None = None,
+) -> tuple[str, Path]:
+    started = started_at or datetime(2025, 11, 8, 8, 0, tzinfo=timezone.utc)
+    paths = store.allocate_run(
+        job_id=job_id,
+        url="https://example.com",
+        started_at=started,
+        cache_key=cache_key,
+    )
     return job_id, paths.root
 
 
@@ -541,3 +554,500 @@ def test_build_bundle_excludes_tiles_when_requested(tmp_path: Path) -> None:
     names = _tar_members(bundle)
     assert not any("tiles" in name for name in names)
     assert any(name.endswith("out.md") for name in names)
+
+
+def test_artifact_inventory_fresh_and_cached_matches_sha_and_bundle_replays_independently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from fastapi.testclient import TestClient
+    import app.main as main_mod
+    from app.dom_links import LinkRecord as DomLink, blend_dom_with_ocr, serialize_links
+    from app.jobs import JobManager
+
+    store = _storage(tmp_path)
+    jm = JobManager(store=store)
+    monkeypatch.setattr(main_mod, "store", store)
+    monkeypatch.setattr(main_mod, "JOB_MANAGER", jm)
+
+    job_id, root = _allocate_run(store, job_id="run-fresh", cache_key="inv-key-1")
+    tile_bytes = b"\x89PNG\r\n\x1a\nfaketile"
+    tile_sha = hashlib.sha256(tile_bytes).hexdigest()
+    store.write_tiles(
+        job_id=job_id,
+        tiles=[
+            TileSlice(
+                index=0,
+                png_bytes=tile_bytes,
+                width=1280,
+                height=1000,
+                scale=1.0,
+                source_y_offset=0,
+                viewport_y_offset=0,
+                overlap_px=120,
+                top_overlap_px=0,
+                bottom_overlap_px=0,
+                sha256=tile_sha,
+                top_overlap_sha256=None,
+                bottom_overlap_sha256=None,
+            )
+        ],
+    )
+    store.write_dom_snapshot(job_id=job_id, html=b"<html><body><a href='https://a.example'>A</a></body></html>")
+    blended = blend_dom_with_ocr(
+        dom_links=[DomLink(text="Alpha", href="https://a.example", source="DOM", delta="✓")],
+        ocr_links=[
+            DomLink(text="Alpha", href="https://a.example", source="OCR", delta="✓"),
+            DomLink(text="Beta", href="https://b.example", source="OCR", delta="OCR only"),
+        ],
+    )
+    store.write_links(job_id=job_id, links=serialize_links(blended))
+    store.write_markdown(job_id=job_id, content="# Overview\n\nBody text with [Alpha](https://a.example).\n")
+    store.write_manifest(
+        job_id=job_id,
+        manifest={
+            "url": "https://example.com/fresh",
+            "cft_label": "Stable-1",
+            "cft_version": "chrome-130.0.6723.69",
+            "playwright_version": "1.55.0",
+            "browser_transport": "cdp",
+            "screenshot_style_hash": "style-hash-1",
+            "long_side_px": 1288,
+            "tiles_total": 1,
+            "capture_ms": 100,
+            "ocr_ms": 200,
+            "stitch_ms": 10,
+        },
+    )
+    store.update_status(job_id=job_id, status="DONE", finished_at=datetime.now(timezone.utc))
+
+    source_rec = store.fetch_run(job_id)
+    assert source_rec is not None
+    store.register_cached_run(job_id="run-cached", source=source_rec)
+
+    client = TestClient(main_mod.app)
+    resp_fresh = client.get("/jobs/run-fresh/artifacts")
+    assert resp_fresh.status_code == 200
+    body_fresh = resp_fresh.json()
+    assert body_fresh["file_count"] >= 5
+    assert body_fresh["artifact_root"] == "/jobs/run-fresh/artifact"
+    assert str(tmp_path) not in json.dumps(body_fresh)
+    assert body_fresh["shared_with_job_ids"] == ["run-cached"]
+    assert body_fresh["purge_at"] is not None
+
+    resp_cached = client.get("/jobs/run-cached/artifacts")
+    assert resp_cached.status_code == 200
+    body_cached = resp_cached.json()
+    assert body_cached["cache_hit"] is True
+    assert body_cached["cache_source_job_id"] == "run-fresh"
+    assert body_cached["shared_with_job_ids"] == ["run-fresh"]
+    assert {f["sha256"] for f in body_fresh["files"]} == {f["sha256"] for f in body_cached["files"]}
+
+    # Verify pagination
+    resp_page = client.get("/jobs/run-fresh/artifacts?limit=2&offset=1")
+    assert resp_page.status_code == 200
+    page_body = resp_page.json()
+    assert page_body["file_count"] == body_fresh["file_count"]
+    assert len(page_body["files"]) == 2
+    assert page_body["has_more"] is True
+
+    # On-demand bundle download and independent bundle inspection
+    bundle_resp = client.get("/jobs/run-fresh/artifact/bundle.tar.zst")
+    assert bundle_resp.status_code == 200
+    bundle_file = tmp_path / "downloaded-bundle.tar.zst"
+    bundle_file.write_bytes(bundle_resp.content)
+    loaded_bundle = Store.load_bundle(bundle_file)
+    assert loaded_bundle["manifest"]["url"] == "https://example.com/fresh"
+    assert "Overview" in loaded_bundle["markdown"]
+    assert len(loaded_bundle["links"]) == 2
+
+
+def test_artifact_inventory_and_bundle_reject_corrupt_files_with_typed_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from fastapi.testclient import TestClient
+    import app.main as main_mod
+    from app.jobs import JobManager
+
+    store = _storage(tmp_path)
+    jm = JobManager(store=store)
+    monkeypatch.setattr(main_mod, "store", store)
+    monkeypatch.setattr(main_mod, "JOB_MANAGER", jm)
+
+    job_id, root = _allocate_run(store, job_id="run-corrupt")
+    _seed_run_files(root)
+    (root / "artifact" / "artifacts.json").write_text(
+        json.dumps([{"index": 0, "path": "artifact/tiles/tile_0000.png", "sha256": "deadbeef"}]),
+        encoding="utf-8",
+    )
+
+    client = TestClient(main_mod.app)
+    # Corrupt tile SHA mismatch -> 422
+    resp = client.get(f"/jobs/{job_id}/artifacts")
+    assert resp.status_code == 422
+    assert "SHA256 mismatch" in resp.json()["detail"]
+
+    bundle_path = store.build_bundle(job_id=job_id)
+    with pytest.raises(ValueError, match="SHA256 mismatch"):
+        Store.load_bundle(bundle_path)
+
+    # Corrupt links.json -> 422
+    (root / "links.json").write_text("{corrupt-json", encoding="utf-8")
+    links_resp = client.get(f"/jobs/{job_id}/links.json")
+    assert links_resp.status_code == 422
+
+    # Corrupt manifest.json -> 422
+    (root / "manifest.json").write_text("{not-valid-json", encoding="utf-8")
+    manifest_resp = client.get(f"/jobs/{job_id}/manifest.json")
+    assert manifest_resp.status_code == 422
+    art_resp = client.get(f"/jobs/{job_id}/artifacts")
+    assert art_resp.status_code == 422
+
+
+def test_all_nine_links_endpoints_and_sqlite_link_records_work_on_list_payloads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from fastapi.testclient import TestClient
+    import app.main as main_mod
+    from app.dom_links import LinkRecord as DomLink, blend_dom_with_ocr, serialize_links
+    from app.jobs import JobManager
+
+    store = _storage(tmp_path)
+    jm = JobManager(store=store)
+    monkeypatch.setattr(main_mod, "store", store)
+    monkeypatch.setattr(main_mod, "JOB_MANAGER", jm)
+
+    job_id, _ = _allocate_run(store, job_id="run-links-1", cache_key="links-key-1")
+    other_id, _ = _allocate_run(store, job_id="run-links-2", cache_key="links-key-2")
+    blended = blend_dom_with_ocr(
+        dom_links=[
+            DomLink(text="Docs", href="https://example.com/docs", source="DOM", delta="✓"),
+            DomLink(text="Shared", href="https://example.com/shared", source="DOM", delta="✓"),
+        ],
+        ocr_links=[
+            DomLink(text="Shared", href="https://example.com/shared", source="OCR", delta="✓"),
+            DomLink(text="OCR Only", href="https://example.com/ocr", source="OCR", delta="OCR only"),
+        ],
+    )
+    store.write_links(job_id=job_id, links=serialize_links(blended))
+    store.write_markdown(job_id=job_id, content="# Guide\n\nSee [Docs](https://example.com/docs).\n")
+    store.write_manifest(job_id=job_id, manifest={"url": "https://example.com"})
+    store.update_status(job_id=job_id, status="DONE", finished_at=datetime.now(timezone.utc))
+
+    store.write_links(
+        job_id=other_id,
+        links=[{"text": "Shared", "href": "https://example.com/shared", "source": "DOM"}],
+    )
+    store.write_markdown(job_id=other_id, content="# Guide\n\nUpdated.\n")
+    store.write_manifest(job_id=other_id, manifest={"url": "https://example.com"})
+    store.update_status(job_id=other_id, status="DONE", finished_at=datetime.now(timezone.utc))
+
+    # Verify LinkRecord rows persisted in SQLite
+    with store.session() as session:
+        rows = list(session.exec(select(LinkRecord).where(LinkRecord.run_id == job_id)))
+        assert len(rows) == 3
+
+    client = TestClient(main_mod.app)
+    # 1. GET /jobs/{id}/result.json (JobManager.get_structured_result)
+    r1 = client.get(f"/jobs/{job_id}/result.json")
+    assert r1.status_code == 200
+    assert len(r1.json()["links"]) == 3
+
+    # 2. POST /jobs/{id}/diff
+    r2 = client.post(f"/jobs/{job_id}/diff", json={"other_job_id": other_id, "include_links": True})
+    assert r2.status_code == 200
+    assert "https://example.com/shared" in r2.json()["links_common"]
+    assert "https://example.com/docs" in r2.json()["links_a_only"]
+
+    # 3. GET /jobs/{id}/headings/{heading}
+    r3 = client.get(f"/jobs/{job_id}/headings/Guide")
+    assert r3.status_code == 200
+    assert "https://example.com/docs" in r3.json()["outbound_links"]
+
+    # 4. POST /jobs/{id}/queries
+    r4 = client.post(f"/jobs/{job_id}/queries", json={"queries": ["links", "toc", "summary"]})
+    assert r4.status_code == 200
+    assert len(r4.json()["results"]["links"]) == 3
+    assert "https://example.com/docs" in r4.json()["results"]["toc"]["outbound_links"]
+
+    # 5. GET /jobs/{id}/extract
+    r5 = client.get(f"/jobs/{job_id}/extract")
+    assert r5.status_code == 200
+    assert len(r5.json()["links"]) == 3
+
+    # 6. GET /jobs/{id}/links/{query}
+    r6 = client.get(f"/jobs/{job_id}/links/docs")
+    assert r6.status_code == 200
+    assert len(r6.json()["matches"]) == 1
+
+    # 7. GET /jobs/{id}/toc
+    r7 = client.get(f"/jobs/{job_id}/toc")
+    assert r7.status_code == 200
+    assert len(r7.json()["outbound_links"]) == 3
+
+    # 8. GET /jobs/{id}/summary
+    r8 = client.get(f"/jobs/{job_id}/summary")
+    assert r8.status_code == 200
+    assert r8.json()["outbound_link_count"] == 3
+
+    # 9. GET /jobs/{id}/links
+    r9 = client.get(f"/jobs/{job_id}/links")
+    assert r9.status_code == 200
+    b9 = r9.json()
+    assert b9["total"] == 3
+    assert b9["counts"]["dom"] == 1
+    assert b9["counts"]["ocr"] == 1
+    assert b9["counts"]["both"] == 1
+
+
+def test_retention_delete_and_admin_prune_preserve_shared_cache_and_cleanup_db_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from datetime import timedelta
+    from fastapi.testclient import TestClient
+    import app.main as main_mod
+    from app.jobs import JobManager
+    from app.store import WebhookRecord
+
+    store = _storage(tmp_path)
+    jm = JobManager(store=store)
+    monkeypatch.setattr(main_mod, "store", store)
+    monkeypatch.setattr(main_mod, "JOB_MANAGER", jm)
+
+    old_dt = datetime.now(timezone.utc) - timedelta(days=15)
+    src_id, src_root = _allocate_run(store, job_id="run-old-src", started_at=old_dt, cache_key="shared-k")
+    _seed_run_files(src_root)
+    store.write_links(job_id=src_id, links=[{"href": "https://example.com/a", "text": "A", "source": "DOM"}])
+    store.write_markdown(job_id=src_id, content="# Shared Heading\n\nShared content body.\n")
+    store.write_manifest(job_id=src_id, manifest={"url": "https://example.com"})
+    store.update_status(job_id=src_id, status="DONE", finished_at=old_dt)
+    with store.session() as session:
+        session.add(WebhookRecord(job_id=src_id, url="https://hooks.example.com/cb", events=["DONE"]))
+        session.commit()
+
+    src_rec = store.fetch_run(src_id)
+    assert src_rec is not None
+    # Register a recent cached alias that shares src_root
+    store.register_cached_run(job_id="run-recent-alias", source=src_rec)
+    store.update_status(
+        job_id="run-recent-alias",
+        status="DONE",
+        finished_at=datetime.now(timezone.utc),
+    )
+
+    client = TestClient(main_mod.app)
+    # 1. Dry-run prune identifies run-old-src and notes it is shared-protected by run-recent-alias
+    prune_dry = client.post("/admin/jobs/prune", json={"older_than_days": 7, "dry_run": True})
+    assert prune_dry.status_code == 200
+    pd_body = prune_dry.json()
+    assert pd_body["candidates"] == 1
+    assert pd_body["deleted"] == 0
+    assert pd_body["candidate_job_ids"] == ["run-old-src"]
+    assert pd_body["shared_protected_job_ids"] == ["run-old-src"]
+
+    # 2. Execute prune (dry_run=False) -> awaits job_delete, cleans up SQLite rows for run-old-src, preserves shared files
+    prune_exec = client.post("/admin/jobs/prune", json={"older_than_days": 7, "dry_run": False})
+    assert prune_exec.status_code == 200
+    pe_body = prune_exec.json()
+    assert pe_body["candidates"] == 1
+    assert pe_body["deleted"] == 1
+
+    assert store.fetch_run("run-old-src") is None
+    with store.session() as session:
+        assert list(session.exec(select(LinkRecord).where(LinkRecord.run_id == "run-old-src"))) == []
+        assert list(session.exec(select(WebhookRecord).where(WebhookRecord.job_id == "run-old-src"))) == []
+
+    # 3. Alias run still has full access to all shared files on disk!
+    alias_art = client.get("/jobs/run-recent-alias/artifacts")
+    assert alias_art.status_code == 200
+    assert alias_art.json()["file_count"] >= 4
+    alias_md = client.get("/jobs/run-recent-alias/result.md")
+    assert alias_md.status_code == 200
+    assert "Shared Heading" in alias_md.text
+
+
+@pytest.mark.asyncio
+async def test_async_session_task_isolation_cancellation_and_engine_disposal(
+    tmp_path: Path,
+) -> None:
+    import asyncio
+    import sqlite3
+    from app.store import RunRecord
+
+    store = _storage(tmp_path)
+    # Verify workload-driven indexes exist in SQLite schema
+    with sqlite3.connect(store.db_path) as conn:
+        idx_rows = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_%'"
+        ).fetchall()
+    idx_names = {r[0] for r in idx_rows}
+    assert {
+        "idx_runs_status_started_at",
+        "idx_runs_owner_started_at",
+        "idx_runs_cache_lookup",
+        "idx_links_run_id",
+        "idx_webhooks_job_id",
+        "idx_section_embedding_meta_model_dim",
+    }.issubset(idx_names)
+
+    seen_session_ids: set[int] = set()
+
+    async def _worker(idx: int) -> str:
+        job_id = f"async-sess-{idx}"
+        await asyncio.to_thread(
+            store.allocate_run,
+            job_id=job_id,
+            url=f"https://example.com/{idx}",
+            started_at=datetime.now(timezone.utc),
+        )
+        async with store.async_session() as session:
+            seen_session_ids.add(id(session))
+            await asyncio.sleep(0.01)
+            rec = await session.get(RunRecord, job_id)
+            assert rec is not None
+            return rec.url
+
+    urls = await asyncio.gather(*(_worker(i) for i in range(8)))
+    assert len(urls) == 8
+    assert len(seen_session_ids) == 8
+    assert store.session_sharing_violations == 0
+    assert len(store._active_task_sessions) == 0
+
+    # Verify task cancellation inside async_session rolls back uncommitted changes and cleans up tracking
+    entered = asyncio.Event()
+
+    async def _cancelled_writer() -> None:
+        async with store.async_session() as session:
+            session.add(
+                RunRecord(
+                    id="cancelled-run",
+                    url="https://example.com/cancelled",
+                    status="PENDING",
+                    started_at=datetime.now(timezone.utc),
+                    manifest_path=str(tmp_path / "m.json"),
+                    cache_path=str(tmp_path),
+                )
+            )
+            await session.flush()
+            entered.set()
+            await asyncio.sleep(10.0)
+
+    task = asyncio.create_task(_cancelled_writer())
+    await entered.wait()
+    assert len(store._active_task_sessions) == 1
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert len(store._active_task_sessions) == 0
+    assert await store.afetch_run("cancelled-run") is None
+
+    await store.aclose()
+
+
+@pytest.mark.asyncio
+async def test_slow_db_writer_and_slow_embedder_do_not_stall_health_or_sse_streams(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+    import sqlite3
+    import threading
+    import time
+    from typing import Any
+    import httpx
+    import app.main as main_mod
+    import app.embedders as embedders_mod
+    from app.jobs import JobManager
+
+    store = _storage(tmp_path)
+    jm = JobManager(store=store)
+    jm.start_watchdog()
+    monkeypatch.setattr(main_mod, "store", store)
+    monkeypatch.setattr(main_mod, "JOB_MANAGER", jm)
+
+    job_id, _ = _allocate_run(store, job_id="run-concurrent")
+    store.write_markdown(
+        job_id=job_id,
+        content="# Concurrency Test\n\n FastAPI event loop stays responsive under load.\n",
+    )
+    store.write_manifest(job_id=job_id, manifest={"url": "https://example.com/concurrent"})
+    store.update_status(job_id=job_id, status="DONE", finished_at=datetime.now(timezone.utc))
+
+    orig_get_embedder = embedders_mod.get_embedder
+
+    class _SlowEmbedder:
+        dim = 1536
+
+        def __init__(self, base: Any) -> None:
+            self._base = base
+
+        def embed(self, text: str) -> list[float]:
+            time.sleep(0.28)
+            return self._base.embed(text)
+
+    monkeypatch.setattr(
+        embedders_mod,
+        "get_embedder",
+        lambda name="hash-bucket-v1": _SlowEmbedder(orig_get_embedder(name)),
+    )
+
+    lock_acquired = threading.Event()
+    release_lock = threading.Event()
+
+    def _hold_write_lock() -> None:
+        conn = sqlite3.connect(store.db_path, timeout=30.0)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "UPDATE runs SET status = 'DONE' WHERE id = ?",
+                (job_id,),
+            )
+            lock_acquired.set()
+            release_lock.wait(timeout=2.0)
+            conn.rollback()
+        finally:
+            conn.close()
+
+    writer_thread = threading.Thread(target=_hold_write_lock, daemon=True)
+    writer_thread.start()
+    assert lock_acquired.wait(timeout=2.0)
+
+    try:
+        transport = httpx.ASGITransport(app=main_mod.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            # Launch slow embedder call in the background while DB write lock is ALSO held
+            slow_embed_task = asyncio.create_task(
+                client.post(
+                    "/embeddings/text",
+                    json={"text": "slow embedding computation", "model": "hash-bucket-v1"},
+                )
+            )
+            await asyncio.sleep(0.02)
+
+            t0 = time.perf_counter()
+            live_resp, ready_resp = await asyncio.gather(
+                client.get("/health/live"),
+                client.get("/health/ready"),
+            )
+            health_elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            assert live_resp.status_code == 200
+            assert ready_resp.status_code == 200
+            assert health_elapsed_ms < 80.0, f"Health probes stalled for {health_elapsed_ms:.1f}ms"
+
+            # Verify SSE /jobs/stream yields its initial subscription frame promptly while lock + slow embedder are active
+            sse_t0 = time.perf_counter()
+            async with client.stream("GET", "/jobs/stream") as sse_resp:
+                assert sse_resp.status_code == 200
+                first_line = await asyncio.wait_for(sse_resp.aiter_lines().__anext__(), timeout=0.5)
+                assert "subscribed" in first_line
+            sse_elapsed_ms = (time.perf_counter() - sse_t0) * 1000.0
+            assert sse_elapsed_ms < 100.0, f"SSE stream stalled for {sse_elapsed_ms:.1f}ms"
+
+            release_lock.set()
+            embed_resp = await slow_embed_task
+            assert embed_resp.status_code == 200
+            assert embed_resp.json()["dim"] == 1536
+    finally:
+        release_lock.set()
+        writer_thread.join(timeout=2.0)
+        await jm.stop_watchdog()
+        await store.aclose()
+

@@ -81,23 +81,49 @@ async def apply_semantic_post(
         )
         return SemanticPostResult(markdown, summary)
 
-    payload = {
-        "job_id": job_id,
-        "markdown": markdown,
-        "model": settings.model,
-        "manifest": _manifest_excerpt(manifest),
-    }
+    endpoint_url = _normalize_semantic_endpoint(settings.endpoint)
+    is_openai_chat = endpoint_url.rstrip("/").endswith("/chat/completions")
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a Markdown post-processor. Clean OCR artifacts, broken words, "
+                "and duplicated seam lines while preserving all factual content, headings, "
+                "links, tables, code blocks, and provenance HTML comments. Return only the "
+                "cleaned Markdown."
+            ),
+        },
+        {"role": "user", "content": markdown},
+    ]
+    if is_openai_chat:
+        payload: dict[str, Any] = {
+            "model": settings.model or "gpt-4o-mini",
+            "messages": messages,
+            "temperature": 0.0,
+        }
+    else:
+        payload = {
+            "job_id": job_id,
+            "markdown": markdown,
+            "model": settings.model,
+            "manifest": _manifest_excerpt(manifest),
+            "messages": messages,
+        }
     headers = {
         "Content-Type": "application/json",
     }
     if settings.api_key:
-        headers["Authorization"] = settings.api_key
+        raw_key = settings.api_key.strip()
+        if raw_key:
+            headers["Authorization"] = (
+                raw_key if raw_key.lower().startswith("bearer ") else f"Bearer {raw_key}"
+            )
 
-    provider = _provider_label(settings.endpoint)
+    provider = _provider_label(endpoint_url)
     start = time.perf_counter()
     try:
         response = await requester(
-            settings.endpoint, payload, headers, settings.timeout_ms / 1000.0
+            endpoint_url, payload, headers, settings.timeout_ms / 1000.0
         )
     except Exception as exc:  # pragma: no cover - network surface
         LOGGER.warning("Semantic post-processing failed for %s: %s", job_id, exc)
@@ -110,7 +136,7 @@ async def apply_semantic_post(
         return SemanticPostResult(markdown, summary)
 
     elapsed_ms = int((time.perf_counter() - start) * 1000)
-    new_markdown = _coerce_markdown(response.get("markdown"))
+    new_markdown = _extract_semantic_markdown(response)
     if new_markdown is None:
         summary = _build_summary(
             status="error",
@@ -137,6 +163,42 @@ async def apply_semantic_post(
         },
     )
     return SemanticPostResult(new_markdown, summary)
+
+
+def _normalize_semantic_endpoint(endpoint: str) -> str:
+    cleaned = endpoint.strip()
+    if cleaned.rstrip("/").endswith("/v1"):
+        return f"{cleaned.rstrip('/')}/chat/completions"
+    return cleaned
+
+
+def _extract_semantic_markdown(response: Mapping[str, Any]) -> str | None:
+    if not isinstance(response, Mapping):
+        return None
+    direct = _coerce_markdown(response.get("markdown"))
+    if direct is not None:
+        return direct
+    choices = response.get("choices")
+    if isinstance(choices, list) and choices:
+        first = choices[0]
+        if isinstance(first, Mapping):
+            msg = first.get("message")
+            if isinstance(msg, Mapping):
+                content = msg.get("content")
+                if isinstance(content, str):
+                    return content
+                if isinstance(content, list):
+                    parts = [
+                        str(item.get("text"))
+                        for item in content
+                        if isinstance(item, Mapping) and isinstance(item.get("text"), str)
+                    ]
+                    if parts:
+                        return "\n".join(parts)
+            text_val = first.get("text")
+            if isinstance(text_val, str):
+                return text_val
+    return None
 
 
 async def _post_semantic_payload(

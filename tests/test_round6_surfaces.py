@@ -270,7 +270,7 @@ def test_replay_404_for_unknown_job(
 def test_delete_purges_artifacts(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, client: TestClient
 ) -> None:
-    """Successful delete returns deleted=True + counts freed artifacts."""
+    """Successful delete removes the DB row, preserves on-disk files, and reports honest candidate vs removed counts."""
     artifact_root = tmp_path / "artifacts"
     artifact_root.mkdir()
     (artifact_root / "manifest.json").write_text("{}")
@@ -278,20 +278,37 @@ def test_delete_purges_artifacts(
 
     def _fetch(self, job_id):
         from types import SimpleNamespace
-        return SimpleNamespace(artifact_root=str(artifact_root))
+        return SimpleNamespace(
+            cache_path=str(artifact_root),
+            manifest_path=str(artifact_root / "manifest.json"),
+        )
 
     def _delete(self, job_id):
         return True
 
     monkeypatch.setattr(type(main_mod.store), "fetch_run", _fetch)
     monkeypatch.setattr(type(main_mod.store), "delete_run", _delete)
+    monkeypatch.setattr(type(main_mod.store), "cache_path_references", lambda self, job_id: [])
+
+    preview = client.delete("/jobs/abc?dry_run=true")
+    assert preview.status_code == 200
+    preview_body = preview.json()
+    assert preview_body["dry_run"] is True
+    assert preview_body["deleted"] is False
+    assert preview_body["candidate_files"] == 2
+    assert preview_body["candidate_bytes"] > 0
+    assert artifact_root.exists()
+
     response = client.delete("/jobs/abc")
     assert response.status_code == 200
     body = response.json()
     assert body["deleted"] is True
-    assert body["artifacts_removed"] == 1  # one directory
-    assert body["bytes_freed"] > 0
-    assert not artifact_root.exists()
+    assert body["artifacts_removed"] == 0
+    assert body["bytes_freed"] == 0
+    assert body["candidate_files"] == 2
+    assert body["candidate_bytes"] > 0
+    assert body["artifacts_preserved"] is True
+    assert artifact_root.exists()
 
 
 def test_delete_idempotent_for_missing_job(
