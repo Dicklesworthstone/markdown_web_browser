@@ -203,12 +203,81 @@ state does not imply the promised clean, self-contained Markdown.
     real-JobManager probe with the capture runner deliberately blocked reproduced
     `KeyError: 'job_id'` before capture. This proves the adapter mismatch, not a
     successful crawl; the replacement runner performed no browser/OCR work.
+    In addition, `CrawlOrchestrator._extract_links` (`app/crawler.py:181-209`) calls
+    nonexistent `self._store.get_run_record(job_id)`, accesses nonexistent
+    `record.artifact_root`, and expects `links.json` to be a `dict` with `"anchors"`
+    rather than the persisted `list[dict]`, so depth-1 link expansion always returns
+    `[]`. Furthermore, `GET /crawl/{crawl_id}` (`app/main.py:664-678`) indexes
+    `snapshot["max_pages"]`, `snapshot["max_depth"]`, and `snapshot["visited"]`,
+    none of which are returned by `CrawlOrchestrator.get_crawl_status()`
+    (`app/crawler.py:365-385`), raising `KeyError` (HTTP 500).
 14. **Deployment/bootstrap is unqualified.** Docker creates a directory at the
-    default DB file path, installs bundled Chromium while capture asks for Chrome,
+    default DB file path (`Dockerfile:84` runs `mkdir -p /app/.cache /app/runs.db /app/ops`),
+    installs bundled Chromium (`Dockerfile:32`) while capture asks for Chrome,
     and omits runtime curl used by Compose healthchecks. K8s cache `emptyDir`
-    volumes are per-pod. The installer rewrites existing `.env` values. README's
+    volumes are per-pod. `.env.example` defines `OCR_SERVER`, `OCR_API_KEY`,
+    `OCR_MODEL`, and port `8000` while `app/settings.py:347-349` reads
+    `OLMOCR_SERVER`, `OLMOCR_API_KEY`, `OLMOCR_MODEL` and `AGENTS.md`/`README.md`
+    specify port `8007`. The installer rewrites existing `.env` values. README's
     `mdwb demo stream` is an API client, not a server launcher. These are source
     findings; no external deployment or destructive installer run was performed.
+15. **Watermark DOM injection pollutes OCR pixels and breaks cross-sweep seam hashes.**
+    `app/capture.py:264-273, 372-406` (`_ensure_watermark_injected` and
+    `_update_watermark`) injects a visible `#__mdwb_capture_watermark` bar
+    (`height: 2px; opacity: 0.55; mix-blend-mode: difference`) into `document.body`
+    before `page.screenshot()`, altering captured screenshot pixels. Worse,
+    `top_hash` of sweep $k$ calls `_seam_hash(y_offset)` (`prev_y + H - overlap`)
+    while `bottom_hash` of sweep $k-1$ calls `_seam_hash(prev_y + H)`. Because
+    `prev_y + H - overlap != prev_y + H`, `seam_bottom_hash == seam_top_hash`
+    (`app/stitch.py:264`) is mathematically unreachable across viewport sweeps, and
+    the moving/recolored watermark bar prevents `bottom_overlap_sha256` from
+    matching `top_overlap_sha256`.
+16. **PNG encode contract omits `palette=False` (`app/tiler.py:23-26`).**
+    `_PNG_ENCODE_ARGS` sets `compression=9, interlace=False, strip=True` without
+    `palette=False` required by `AGENTS.md` (`Q=9, palette off, non-interlaced`).
+17. **OCR batching is unconditionally forced to 1 and local GLM-OCR receives the wrong prompt.**
+    `app/ocr_client.py:961-965` overrides `max_batch_tiles = 1` whenever
+    `backend_mode in {BACKEND_MODE_OPENAI_COMPATIBLE, BACKEND_MODE_MAAS}`, which
+    covers 100% of supported backend modes, rendering `OCR_MAX_BATCH_TILES` inert.
+    Additionally, `_build_payload` (`app/ocr_client.py:1178-1190`) only uses
+    `GLM_DEFAULT_PROMPT` (`L51`) when `backend_mode == "maas"`; when `GLM-OCR` runs
+    under `openai-compatible` local vLLM/SGLang, it sends the olmOCR YAML
+    front-matter prompt instead.
+18. **DOM-assist `"mixed-numeric"` heuristic triggers false positives on normal prose.**
+    `app/stitch.py:478-479` (`_line_issue`) flags any line containing at least one
+    digit and one letter (`any(char.isdigit()) and any(char.isalpha())`) as
+    `"mixed-numeric"` low-confidence OCR, matching ordinary dates, section numbers,
+    and technical prose whenever token overlap with any DOM node is $\ge 0.55$.
+19. **Nine endpoints break on `links.json` list-vs-dict schema mismatch and `links` DB rows are never inserted.**
+    `Store.write_links` / `Store.read_links` (`app/store.py:613-665`) writes and
+    returns `list[dict]`, and `execute_capture_job` (`app/jobs.py:1118`) never calls
+    `store.insert_links` to populate the SQLite `links` (`LinkRecord`) table. Yet
+    `JobManager.get_structured_result` (`app/jobs.py:434`) and eight endpoints in
+    `app/main.py` (`/diff` at `L773`, `/headings/{heading}` at `L1343`, `/queries`
+    at `L1456, 1469`, `/extract` at `L1643`, `/links/{query}` at `L1729`, `/toc` at
+    `L1905`, `/summary` at `L1947`, `/links` at `L2172`) assume `read_links` returns
+    `{"anchors": [...]}`. In `POST /jobs/{id}/queries` (`L1456, 1469`), calling
+    `links_raw.get("anchors", [])` on a non-empty `list` raises
+    `AttributeError: 'list' object has no attribute 'get'` (HTTP 500).
+20. **`POST /admin/jobs/prune` fails to `await` `job_delete` and `Store.delete_run` leaves orphan rows.**
+    `admin_jobs_prune` (`app/main.py:1855-1859`) calls `fake_resp = _jd(jid)`
+    without `await` on `async def job_delete`, raising `AttributeError` on the
+    coroutine object inside `try...except` and pruning zero jobs. `Store.delete_run`
+    (`app/store.py:713-731`) leaves orphan rows in `LinkRecord`, `WebhookRecord`,
+    and `section_embeddings` (`vec0`), and contains unreachable code at `L730-731`.
+    Similarly, `upsert_embeddings` (`app/embeddings.py:66-92`) inserts into `vec0`
+    without deleting prior rows for `(run_id, section_id)`, duplicating rows on
+    re-embedding.
+21. **Control-center UI (`/`) never renders Markdown or tile metadata, and `/browser` depends on external CDNs.**
+    `web/app.js:208-209` waits for SSE events `rendered` and `raw` that
+    `_snapshot_events` (`app/main.py:2393-2462`) never emits, and never fetches
+    `/jobs/{id}/result.md` when `state === "DONE"`, leaving the Rendered and Raw
+    Markdown tabs on `/` permanently on placeholder text. `web/app.js:813-820`
+    (`renderArtifacts`) reads `artifact.id`, `artifact.offset`, and `artifact.sha`
+    instead of `index`, `source_y_offset`, and `sha256` emitted by `Store.write_tiles`.
+    Meanwhile, `web/browser.html:10-12, 132-134` loads `github-markdown-css`,
+    `prism.js`, and `marked.js` from external CDNs (`cdnjs` / `jsdelivr`), breaking
+    offline/airgapped operation.
 
 Playwright's official [browser launcher documentation](https://playwright.dev/python/docs/api/class-browsertype)
 separates browser launch from explicit CDP connection. The official
@@ -303,20 +372,44 @@ must not compete with P0/P1 repairs. No issue in this bridge was marked complete
 
 ### Ambition and refinement record
 
-Two ambition reviews expanded the first repair-only outline. The first added
-independent public E2E proofs and measured corpus/deployment qualification. The
-second retained all Franken goals, replaced assumptions about upstream APIs with
-real capability probes, and required coherent storage/index/event identities,
-bounded cancellation and same-invocation quality/performance comparisons. These
-are concrete acceptance requirements in the beads, not claimed results.
+Three ambition reviews expanded the first repair-only outline:
+1. **Ambition Round 1 (Independent Public Proofs & Live Qualification):** Added
+   independent public E2E proof beads (`.17`–`.20`) and measured corpus/deployment
+   qualification (`.21`–`.22`) separate from unit/fixture repairs.
+2. **Ambition Round 2 (Verified Franken Capabilities & Same-Invocation Incumbent Proofs):**
+   Retained all Franken goals (`.23`–`.31`), replaced assumptions about upstream
+   APIs with real capability probes, and required coherent storage/index/event
+   identities, bounded cancellation, and same-invocation incumbent vs. candidate
+   quality/performance comparisons.
+3. **Ambition Round 3 (Coordinate-Anchored DOM+OCR Fusion, Zero-CDN Provenance UI, and Bounded Browser Pool):**
+   Elevated the core visual-structural pipeline beyond incremental bug fixes:
+   - **Coordinate-anchored DOM+OCR fusion & sub-tile region provenance (`.4`, `.5`, `.6`, `.30`):**
+     Harvest viewport-synchronized block/link/table/code DOM bounding boxes into
+     `dom_overlay.json` with tile-intersection coordinates; restrict DOM-assist
+     patches to matching vertical tile coordinates (`[source_y_offset, source_y_offset + height]`);
+     eliminate DOM-polluting watermark bars (`_ensure_watermark_injected`) and fix
+     cross-sweep seam coordinate math; emit sub-tile vertical crop bands
+     `[y0_px, y1_px]` for `mdwb agent cite` and UI provenance highlights.
+   - **Zero-CDN airgap-ready provenance inspector across `/` and `/browser` (`.2`, `.8`, `.28`):**
+     Bundle local vendor assets (removing external `cdnjs`/`jsdelivr` CDN calls),
+     wire `/` (`web/index.html` + `web/app.js`) to render Markdown and actual tile
+     metadata (`index`, `source_y_offset`, `sha256`), and provide synchronized
+     side-by-side tile-to-Markdown provenance inspection with strict URL/HTML
+     sanitization.
+   - **Bounded browser-context pool & deterministic adversarial corpus (`.3`, `.8`, `.9`, `.18`):**
+     Enforce a bounded browser/context pool (`MAX_CONCURRENT_BROWSERS`) with
+     isolated per-job `BrowserContext` reuse and automatic crash recycling, backed
+     by a deterministic local adversarial corpus covering sticky headers, shrinking
+     SPAs, `[aria-busy]` hydration, wide horizontal layouts, and dense numeric tables.
 
 The exact frozen bead-generation and refinement prompts from the skill are
-embedded in `markdown_web_browser-7ru`. Five subsequent review passes cover
-completeness, dependency/order optimality, test/oracle discrimination, effective
-configuration/data identity, and final coherence. A sixth fresh review checks
-convergence after the crawl-bridge contract refinement. The corrections and
-validation are recorded in the epic's comments. Any still-red product gate stays
-red; plan refinement does not count as implementing it.
+embedded in `markdown_web_browser-7ru`. Subsequent plan-space refinement passes
+updated the beads via `br` to embed all 21 source-level root causes (including the
+9-endpoint `links.json` list-vs-dict mismatch, 4-way `CrawlOrchestrator` failure,
+`admin_jobs_prune` unawaited coroutine, `ocr_client.py` `max_batch_tiles = 1`
+override, `stitch.py` `"mixed-numeric"` false positive, and `web/app.js` dead SSE
+fields) and verified zero dependency cycles via `br dep cycles` and `bv --robot-triage`.
+Any still-red product gate stays red; plan refinement does not count as implementing it.
 
 ## Readiness and next decision
 

@@ -2,14 +2,15 @@
 
 > **Reality check (2026-10-13):** This document specifies an aspiration, not an
 > implemented runtime. The old handoff's 32 IDs are absent from the live graph.
-> Use `PROJECT_STATUS_AUDIT.md` and `markdown_web_browser-7ru.23`–`.31` for the
-> current self-contained implementation/test/qualification contracts. Verify
-> actual upstream APIs and capabilities before adopting the older command,
+> Use `PROJECT_STATUS_AUDIT.md` (including all 21 reproduced/source-verified
+> defects and 3 Ambition Round upgrades) and `markdown_web_browser-7ru` (`.1`–`.32`)
+> for the current self-contained implementation/test/qualification contracts.
+> Verify actual upstream APIs and capabilities before adopting the older command,
 > version, CPU-only, PDF, FFI, or speedup assumptions below. Current AGENTS rules
 > override instructions here to delete files, commit disposable `beads.db`, use
 > pip, or accept self-speedups. Preserve the full vision while requiring real
 > evidence. Python default behavior and the separate core qualification gate
-> remain part of the product.
+> (`.1`–`.22`) remain part of the product.
 
 > **Goal:** Turn `markdown_web_browser` (mdwb) into a vastly more compelling,
 > faster, more agent-intuitive product by re-platforming its hot paths on
