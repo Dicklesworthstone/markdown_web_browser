@@ -15,10 +15,20 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from difflib import SequenceMatcher
-from typing import TYPE_CHECKING
+from typing import Any, Sequence, TYPE_CHECKING
+
+import numpy as np
+
+try:
+    import pyvips as _pyvips
+except Exception:  # pragma: no cover - optional in lightweight test stubs
+    _pyvips = None
 
 if TYPE_CHECKING:
     from app.tiler import TileSlice
+
+_SSIM_MATCH_THRESHOLD = 0.85
+_SSIM_MIN_SEAM_AGREEMENT = 0.70
 
 
 @dataclass(slots=True)
@@ -31,6 +41,171 @@ class DeduplicationResult:
     prev_tile_index: int
     curr_tile_index: int
     overlap_hash: str | None
+    overlap_ssim: float | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "lines_removed": self.lines_removed,
+            "method": self.method,
+            "similarity": self.similarity,
+            "prev_tile_index": self.prev_tile_index,
+            "curr_tile_index": self.curr_tile_index,
+            "overlap_hash": self.overlap_hash,
+        }
+        if self.overlap_ssim is not None:
+            payload["overlap_ssim"] = round(float(self.overlap_ssim), 4)
+        return payload
+
+
+def summarize_dedup_events(events: Sequence[DeduplicationResult]) -> dict[str, Any]:
+    """Aggregate deduplication events into ManifestDeduplicationStats shape."""
+
+    total_events = len(events)
+    lines_removed = sum(max(0, int(e.lines_removed)) for e in events)
+    exact_matches = sum(1 for e in events if e.method == "exact")
+    sequence_matches = sum(1 for e in events if e.method == "sequence")
+    fuzzy_matches = sum(1 for e in events if e.method == "fuzzy")
+    no_matches = sum(
+        1 for e in events if e.method in ("no_match", "insufficient_content")
+    )
+    similarities = [
+        float(e.similarity)
+        for e in events
+        if e.lines_removed > 0 and e.similarity is not None
+    ]
+    avg_similarity = (
+        round(sum(similarities) / len(similarities), 4) if similarities else None
+    )
+    return {
+        "total_events": total_events,
+        "lines_removed": lines_removed,
+        "exact_matches": exact_matches,
+        "sequence_matches": sequence_matches,
+        "fuzzy_matches": fuzzy_matches,
+        "no_matches": no_matches,
+        "avg_similarity": avg_similarity,
+    }
+
+
+def _decode_gray_strip(
+    png_bytes: bytes,
+    *,
+    from_bottom: bool,
+    strip_px: int,
+) -> np.ndarray | None:
+    if not png_bytes or len(png_bytes) < 24:
+        return None
+    if _pyvips is None or not hasattr(_pyvips.Image, "new_from_buffer"):
+        return None
+    try:
+        image = _pyvips.Image.new_from_buffer(png_bytes, "")
+        width = int(image.width)
+        height = int(image.height)
+        if width <= 0 or height <= 0 or strip_px <= 0:
+            return None
+        crop_h = min(int(strip_px), height)
+        top = (height - crop_h) if from_bottom else 0
+        strip = image.crop(0, top, width, crop_h)
+        bands = int(strip.bands)
+        raw = np.frombuffer(strip.write_to_memory(), dtype=np.uint8)
+        arr = raw.reshape(crop_h, width, bands).astype(np.float64)
+        if bands >= 3:
+            # ITU-R BT.601 luma on RGB
+            gray = 0.299 * arr[:, :, 0] + 0.587 * arr[:, :, 1] + 0.114 * arr[:, :, 2]
+        else:
+            gray = arr[:, :, 0]
+        return gray
+    except Exception:
+        return None
+
+
+def compute_overlap_ssim(
+    prev_tile: "TileSlice" | None,
+    curr_tile: "TileSlice" | None,
+) -> float | None:
+    """Compute structural similarity (SSIM in [0, 1]) over adjacent tile overlap strips.
+
+    Returns ``None`` when either tile lacks decodable PNG bytes or positive overlap height.
+    """
+    if prev_tile is None or curr_tile is None:
+        return None
+    prev_overlap_px = int(
+        getattr(prev_tile, "bottom_overlap_px", 0) or getattr(prev_tile, "overlap_px", 0) or 0
+    )
+    curr_overlap_px = int(
+        getattr(curr_tile, "top_overlap_px", 0) or getattr(curr_tile, "overlap_px", 0) or 0
+    )
+    strip_px = min(
+        prev_overlap_px if prev_overlap_px > 0 else curr_overlap_px,
+        curr_overlap_px if curr_overlap_px > 0 else prev_overlap_px,
+    )
+    if strip_px <= 0:
+        return None
+
+    prev_gray = _decode_gray_strip(
+        getattr(prev_tile, "png_bytes", b""),
+        from_bottom=True,
+        strip_px=strip_px,
+    )
+    curr_gray = _decode_gray_strip(
+        getattr(curr_tile, "png_bytes", b""),
+        from_bottom=False,
+        strip_px=strip_px,
+    )
+    if prev_gray is None or curr_gray is None:
+        return None
+
+    h = min(prev_gray.shape[0], curr_gray.shape[0])
+    w = min(prev_gray.shape[1], curr_gray.shape[1])
+    if h <= 0 or w <= 0:
+        return None
+    x = prev_gray[:h, :w]
+    y = curr_gray[:h, :w]
+
+    c1 = (0.01 * 255.0) ** 2
+    c2 = (0.03 * 255.0) ** 2
+
+    block = 8
+    if h >= block and w >= block:
+        bh = (h // block) * block
+        bw = (w // block) * block
+        xb = x[:bh, :bw].reshape(bh // block, block, bw // block, block).transpose(0, 2, 1, 3)
+        yb = y[:bh, :bw].reshape(bh // block, block, bw // block, block).transpose(0, 2, 1, 3)
+        xb_flat = xb.reshape(-1, block * block)
+        yb_flat = yb.reshape(-1, block * block)
+
+        mu_x = xb_flat.mean(axis=1)
+        mu_y = yb_flat.mean(axis=1)
+        dx = xb_flat - mu_x[:, None]
+        dy = yb_flat - mu_y[:, None]
+        var_x = (dx * dx).mean(axis=1)
+        var_y = (dy * dy).mean(axis=1)
+        cov_xy = (dx * dy).mean(axis=1)
+
+        num = (2.0 * mu_x * mu_y + c1) * (2.0 * cov_xy + c2)
+        den = (mu_x * mu_x + mu_y * mu_y + c1) * (var_x + var_y + c2)
+        block_ssim = num / den
+        mean_all = float(np.mean(block_ssim))
+        active_mask = ((var_x + var_y) > 1.0) | (np.abs(mu_x - mu_y) > 2.0)
+        if np.any(active_mask):
+            mean_active = float(np.mean(block_ssim[active_mask]))
+            score = min(mean_all, mean_active)
+        else:
+            score = mean_all
+    else:
+        mu_x = float(x.mean())
+        mu_y = float(y.mean())
+        dx = x - mu_x
+        dy = y - mu_y
+        var_x = float((dx * dx).mean())
+        var_y = float((dy * dy).mean())
+        cov_xy = float((dx * dy).mean())
+        score = float(
+            ((2.0 * mu_x * mu_y + c1) * (2.0 * cov_xy + c2))
+            / ((mu_x * mu_x + mu_y * mu_y + c1) * (var_x + var_y + c2))
+        )
+
+    return float(np.clip(score, 0.0, 1.0))
 
 
 def deduplicate_tile_overlap(
@@ -49,27 +224,11 @@ def deduplicate_tile_overlap(
     Remove duplicate content from overlapping tiles using multi-tier strategy.
 
     This function implements a conservative, research-backed approach:
-    1. Only deduplicates when pixel-level overlap is confirmed
+    1. Only deduplicates when pixel-level overlap is confirmed (SHA256 / SSIM)
     2. Tries exact matching first (fast path)
     3. Falls back to sequence matching for OCR variations
     4. Finally tries fuzzy line-by-line matching
     5. Never removes more than 3x estimated overlap (safety)
-
-    Args:
-        prev_lines: Lines from previous tile's markdown
-        curr_lines: Lines from current tile's markdown
-        prev_tile: Previous tile metadata (for overlap detection)
-        curr_tile: Current tile metadata (for overlap detection)
-        enabled: Whether deduplication is enabled globally
-        min_overlap_lines: Minimum lines required to attempt deduplication
-        sequence_similarity_threshold: Minimum similarity for sequence matching (0.0-1.0)
-        fuzzy_line_threshold: Minimum similarity for fuzzy line matching (0.0-1.0)
-        max_search_window: Maximum lines to search in each tile
-
-    Returns:
-        (deduplicated_lines, deduplication_result)
-        - deduplicated_lines: Current tile lines with duplicates removed
-        - deduplication_result: Metadata about what was removed and how
     """
 
     # Fast exit: deduplication disabled
@@ -81,10 +240,12 @@ def deduplicate_tile_overlap(
             prev_tile_index=prev_tile.index,
             curr_tile_index=curr_tile.index,
             overlap_hash=None,
+            overlap_ssim=None,
         )
 
-    # Tier 1: Check pixel-level overlap
-    overlap_match, _ = _tiles_share_overlap(prev_tile, curr_tile)
+    # Tier 1: Check pixel-level overlap (with SSIM validation when PNG bytes are present)
+    overlap_ssim = compute_overlap_ssim(prev_tile, curr_tile)
+    overlap_match, _ = _tiles_share_overlap(prev_tile, curr_tile, precomputed_ssim=overlap_ssim)
     if not overlap_match:
         return curr_lines, DeduplicationResult(
             lines_removed=0,
@@ -93,9 +254,14 @@ def deduplicate_tile_overlap(
             prev_tile_index=prev_tile.index,
             curr_tile_index=curr_tile.index,
             overlap_hash=None,
+            overlap_ssim=overlap_ssim,
         )
 
-    overlap_hash = prev_tile.bottom_overlap_sha256 or curr_tile.top_overlap_sha256
+    overlap_hash = (
+        prev_tile.bottom_overlap_sha256
+        or curr_tile.top_overlap_sha256
+        or (f"ssim:{overlap_ssim:.3f}" if overlap_ssim is not None else None)
+    )
 
     # Fast exit: not enough content to deduplicate
     if len(prev_lines) < min_overlap_lines or len(curr_lines) < min_overlap_lines:
@@ -106,6 +272,7 @@ def deduplicate_tile_overlap(
             prev_tile_index=prev_tile.index,
             curr_tile_index=curr_tile.index,
             overlap_hash=overlap_hash,
+            overlap_ssim=overlap_ssim,
         )
 
     # Estimate overlap size in lines
@@ -130,6 +297,7 @@ def deduplicate_tile_overlap(
             prev_tile_index=prev_tile.index,
             curr_tile_index=curr_tile.index,
             overlap_hash=overlap_hash,
+            overlap_ssim=overlap_ssim,
         )
 
     # Tier 3: Try sequence matching (main path)
@@ -151,6 +319,7 @@ def deduplicate_tile_overlap(
                 prev_tile_index=prev_tile.index,
                 curr_tile_index=curr_tile.index,
                 overlap_hash=overlap_hash,
+                overlap_ssim=overlap_ssim,
             )
 
     # Tier 4: Try fuzzy line matching (fallback)
@@ -169,6 +338,7 @@ def deduplicate_tile_overlap(
             prev_tile_index=prev_tile.index,
             curr_tile_index=curr_tile.index,
             overlap_hash=overlap_hash,
+            overlap_ssim=overlap_ssim,
         )
 
     # No confident match found - keep everything
@@ -179,24 +349,36 @@ def deduplicate_tile_overlap(
         prev_tile_index=prev_tile.index,
         curr_tile_index=curr_tile.index,
         overlap_hash=overlap_hash,
+        overlap_ssim=overlap_ssim,
     )
 
 
 def _tiles_share_overlap(
-    prev_tile: "TileSlice" | None, tile: "TileSlice" | None
+    prev_tile: "TileSlice" | None,
+    tile: "TileSlice" | None,
+    *,
+    precomputed_ssim: float | None = None,
 ) -> tuple[bool, bool]:
     """
-    Check if tiles share pixel-level overlap via SHA256 hash comparison.
-
-    This is the gate-keeper function - we only deduplicate when pixel hashes
-    confirm that the tiles actually overlap.
+    Check if tiles share pixel-level overlap via SHA256 hash comparison and SSIM.
 
     Returns:
         (has_overlap, used_seam_marker)
         - has_overlap: True if tiles share overlapping pixels
-        - used_seam_marker: True if match was via seam marker (more robust)
+        - used_seam_marker: True if match was via seam marker
     """
     if not prev_tile or not tile:
+        return False, False
+
+    ssim = (
+        precomputed_ssim
+        if precomputed_ssim is not None
+        else compute_overlap_ssim(prev_tile, tile)
+    )
+
+    # If real PNG bytes were decoded and SSIM shows strong visual disagreement,
+    # refuse to merge across this boundary even if a coarse hash collided.
+    if ssim is not None and ssim < _SSIM_MIN_SEAM_AGREEMENT:
         return False, False
 
     # Method 1: Direct pixel hash comparison of overlap regions
@@ -204,10 +386,14 @@ def _tiles_share_overlap(
         if prev_tile.bottom_overlap_sha256 == tile.top_overlap_sha256:
             return True, False
 
-    # Method 2: Seam marker hash comparison (watermark-based, more robust)
+    # Method 2: Seam marker hash comparison
     if prev_tile.seam_bottom_hash and tile.seam_top_hash:
         if prev_tile.seam_bottom_hash == tile.seam_top_hash:
             return True, True
+
+    # Method 3: Real pixel SSIM over overlap strips (handles subpixel/anti-aliasing drift)
+    if ssim is not None and ssim >= _SSIM_MATCH_THRESHOLD:
+        return True, False
 
     return False, False
 

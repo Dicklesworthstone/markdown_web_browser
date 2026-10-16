@@ -110,3 +110,48 @@ def test_serialize_links_includes_metadata() -> None:
     assert payload[0]["target"] == "_blank"
     assert payload[0]["domain"] == "example.com"
     assert payload[0]["markdown"] == "[Docs](https://example.com/docs)"
+
+
+def test_extract_links_from_dom_resolves_relative_urls_and_appends_links_appendix() -> None:
+    from app.dom_links import (
+        append_links_appendix,
+        extract_links_from_dom,
+        resolve_markdown_links,
+    )
+
+    html = """
+    <html>
+      <body>
+        <a href="/docs/getting-started">Getting Started</a>
+        <a href="pricing.html">Pricing</a>
+      </body>
+    </html>
+    """
+    dom_links = extract_links_from_dom(html, base_url="https://example.com/guide/index.html")
+    assert [link.href for link in dom_links] == [
+        "https://example.com/docs/getting-started",
+        "https://example.com/guide/pricing.html",
+    ]
+
+    # OCR emitted placeholder [Getting Started](Getting Started) and relative [Pricing](pricing.html)
+    raw_md = "# Welcome\n\nRead [Getting Started](Getting-Started) or check [Pricing](pricing.html)."
+    resolved_md = resolve_markdown_links(
+        raw_md,
+        base_url="https://example.com/guide/index.html",
+        dom_links=dom_links,
+    )
+    assert "[Getting Started](https://example.com/docs/getting-started)" in resolved_md
+    assert "[Pricing](https://example.com/guide/pricing.html)" in resolved_md
+
+    ocr_links = extract_links_from_markdown(
+        resolved_md,
+        base_url="https://example.com/guide/index.html",
+        dom_links=dom_links,
+    )
+    blended = blend_dom_with_ocr(dom_links=dom_links, ocr_links=ocr_links)
+    final_md = append_links_appendix(resolved_md, blended)
+
+    assert "## Links Appendix" in final_md
+    assert "<!-- links-appendix: total=2, matched=2, mismatched=0, dom_only=0, ocr_only=0 -->" in final_md
+    assert "- [Getting Started](https://example.com/docs/getting-started) — source: DOM+OCR (✓)" in final_md
+

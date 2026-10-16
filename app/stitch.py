@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import difflib
 import re
 from typing import Sequence
 from urllib.parse import quote_plus
 
-from app.dedup import deduplicate_tile_overlap, DeduplicationResult
+from app.dedup import (
+    DeduplicationResult,
+    _tiles_share_overlap as _dedup_tiles_share_overlap,
+    deduplicate_tile_overlap,
+)
 from app.dom_links import DomHeading, DomTextOverlay, normalize_heading_text
 from app.settings import get_settings
 from app.tiler import TileSlice
@@ -22,6 +26,143 @@ _BLOCKQUOTE_PREFIX_RE = re.compile(r"^\s*>+\s*")
 _LEADING_WS_RE = re.compile(r"^\s+")
 _SPACED_LETTERS_RE = re.compile(r"(?:[A-Za-z]\s+){3,}[A-Za-z]")
 _CODE_FENCE_PREFIXES = ("```", "~~~")
+
+_OLMOCR_FRONTMATTER_KEYS = frozenset(
+    {
+        "primary_language",
+        "is_rotation_valid",
+        "rotation_correction",
+        "is_table",
+        "is_diagram",
+        "natural_text",
+    }
+)
+_YAML_KEY_LINE_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.*)$")
+_BLANK_TILE_PROSE_RE = re.compile(
+    r"^(?:"
+    r"(?:this|the)\s+(?:image|page|tile|screenshot|document)\s+"
+    r"(?:appears\s+to\s+be\s+|is\s+|seems\s+to\s+be\s+)?"
+    r"(?:completely\s+|entirely\s+)?(?:blank|empty|white|void)"
+    r"(?:\s+with\s+no\s+visible\s+(?:text|content))?\.?"
+    r"|(?:there\s+is\s+)?no\s+(?:visible\s+)?(?:text|content)\s+"
+    r"(?:is\s+visible\s+|found\s+|present\s+)?in\s+this\s+(?:image|page|tile|screenshot)\.?"
+    r")$",
+    re.IGNORECASE,
+)
+_DELEET_TABLE = str.maketrans(
+    {
+        "0": "o",
+        "1": "l",
+        "3": "e",
+        "4": "a",
+        "5": "s",
+        "7": "t",
+        "8": "b",
+    }
+)
+
+
+def _deleet_text(text: str) -> str:
+    """Normalize common OCR digit-for-letter substitutions inside words."""
+    tokens: list[str] = []
+    for tok in text.split():
+        if any(c.isdigit() for c in tok) and any(c.isalpha() for c in tok):
+            tokens.append(tok.translate(_DELEET_TABLE))
+        else:
+            tokens.append(tok)
+    return " ".join(tokens)
+
+
+def clean_ocr_chunk(chunk: str) -> str:
+    """Strip olmOCR YAML front-matter scaffolding and blank-tile refusal prose.
+
+    Preserves legitimate user YAML front-matter (any block containing keys outside
+    the olmOCR metadata schema), fenced code blocks, and Markdown horizontal rules.
+    """
+    if not chunk or not chunk.strip():
+        return ""
+
+    text = chunk.strip("\r\n")
+    lines = text.splitlines()
+
+    # Check if the entire chunk is wrapped in an outer ```markdown / ```yaml fence
+    # whose inner content starts with olmOCR YAML front-matter.
+    if (
+        len(lines) >= 4
+        and lines[0].strip().lower() in ("```markdown", "```md", "```yaml", "```")
+        and lines[-1].strip() == "```"
+    ):
+        inner_lines = lines[1:-1]
+        if inner_lines and inner_lines[0].strip() == "---":
+            cleaned_inner = clean_ocr_chunk("\n".join(inner_lines))
+            if cleaned_inner != "\n".join(inner_lines):
+                return cleaned_inner
+
+    # Strip leading olmOCR YAML front-matter if present
+    start_idx = 0
+    while start_idx < len(lines) and not lines[start_idx].strip():
+        start_idx += 1
+
+    if start_idx < len(lines) and lines[start_idx].strip() == "---":
+        end_idx: int | None = None
+        keys_seen: list[str] = []
+        all_olmocr_keys = True
+        in_multiline_natural = False
+        natural_lines: list[str] = []
+
+        for i in range(start_idx + 1, len(lines)):
+            raw_line = lines[i]
+            stripped = raw_line.strip()
+            if stripped == "---":
+                end_idx = i
+                break
+            if not stripped:
+                if in_multiline_natural:
+                    natural_lines.append("")
+                continue
+            if in_multiline_natural and (raw_line.startswith(" ") or raw_line.startswith("\t")):
+                natural_lines.append(raw_line.lstrip())
+                continue
+            in_multiline_natural = False
+            match = _YAML_KEY_LINE_RE.match(stripped)
+            if not match:
+                all_olmocr_keys = False
+                break
+            key, val = match.group(1), match.group(2).strip()
+            if key not in _OLMOCR_FRONTMATTER_KEYS:
+                all_olmocr_keys = False
+                break
+            keys_seen.append(key)
+            if key == "natural_text":
+                if val in ("|", ">", "|-", ">-"):
+                    in_multiline_natural = True
+                elif val and val.lower() not in ("null", "none", "~", '""', "''"):
+                    unquoted = val.strip("\"'")
+                    if unquoted:
+                        natural_lines.append(unquoted)
+
+        if end_idx is not None and all_olmocr_keys and keys_seen:
+            remaining = "\n".join(lines[end_idx + 1 :]).strip()
+            if remaining:
+                text = remaining
+            elif natural_lines:
+                text = "\n".join(natural_lines).strip()
+            else:
+                text = ""
+        elif end_idx is None and all_olmocr_keys and keys_seen and set(keys_seen) <= _OLMOCR_FRONTMATTER_KEYS:
+            # Unclosed olmOCR YAML header with no body (e.g. truncated after natural_text: null)
+            if len(keys_seen) >= 2:
+                text = "\n".join(natural_lines).strip() if natural_lines else ""
+
+    stripped_body = text.strip()
+    if not stripped_body:
+        return ""
+    if stripped_body.lower() in ("null", "none"):
+        return ""
+    if "\n" not in stripped_body and _BLANK_TILE_PROSE_RE.match(stripped_body):
+        return ""
+
+    return text
 
 
 @dataclass(slots=True)
@@ -47,11 +188,7 @@ class StitchResult:
     markdown: str
     dom_assists: list[DomAssistEntry]
     seam_marker_events: list[SeamMarkerEvent]
-    dedup_events: list[DeduplicationResult] = None  # type: ignore[assignment]
-
-    def __post_init__(self) -> None:
-        if self.dedup_events is None:
-            object.__setattr__(self, "dedup_events", [])
+    dedup_events: list[DeduplicationResult] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -79,6 +216,30 @@ class HeadingGuide:
         return None
 
 
+def _overlay_matches_tile_bounds(overlay: DomTextOverlay, tile: TileSlice | None) -> bool:
+    """Return True if overlay has no y coordinate or falls within tile's vertical span."""
+    if tile is None or overlay.y is None:
+        return True
+    ov_y0 = float(overlay.y)
+    ov_y1 = ov_y0 + max(0.0, float(overlay.height or 0.0))
+    margin = float(max(60, tile.overlap_px))
+
+    src_y0 = float(tile.source_y_offset) - margin
+    src_span = float(max(tile.source_crop_height, tile.height))
+    src_y1 = float(tile.source_y_offset) + src_span + margin
+    if ov_y1 >= src_y0 and ov_y0 <= src_y1:
+        return True
+
+    if tile.device_scale_factor > 1.0:
+        css_margin = margin / float(tile.device_scale_factor)
+        css_y0 = float(tile.css_y_offset) - css_margin
+        css_y1 = float(tile.css_y_offset + tile.css_height) + css_margin
+        if ov_y1 >= css_y0 and ov_y0 <= css_y1:
+            return True
+
+    return False
+
+
 class DomOverlayIndex:
     def __init__(self, overlays: Sequence[DomTextOverlay] | None) -> None:
         self._map: dict[str, deque[DomTextOverlay]] = {}
@@ -89,16 +250,67 @@ class DomOverlayIndex:
                 queue = self._map.setdefault(entry.normalized, deque())
                 queue.append(entry)
 
-    def lookup(self, normalized: str) -> DomTextOverlay | None:
+    def _pop_matching_from_queue(
+        self,
+        key: str,
+        queue: deque[DomTextOverlay],
+        tile: TileSlice | None,
+    ) -> DomTextOverlay | None:
+        for idx, candidate in enumerate(queue):
+            if _overlay_matches_tile_bounds(candidate, tile):
+                del queue[idx]
+                if not queue:
+                    self._map.pop(key, None)
+                return candidate
+        return None
+
+    def lookup(
+        self,
+        normalized: str,
+        *,
+        tile: TileSlice | None = None,
+        allow_fuzzy: bool = False,
+    ) -> DomTextOverlay | None:
         if not normalized:
             return None
         queue = self._map.get(normalized)
-        if not queue:
+        if queue:
+            hit = self._pop_matching_from_queue(normalized, queue, tile)
+            if hit is not None:
+                return hit
+
+        if not allow_fuzzy:
             return None
-        overlay = queue.popleft()
-        if not queue:
-            self._map.pop(normalized, None)
-        return overlay
+
+        deleet_target = _deleet_text(normalized)
+        if deleet_target != normalized:
+            d_queue = self._map.get(deleet_target)
+            if d_queue:
+                hit = self._pop_matching_from_queue(deleet_target, d_queue, tile)
+                if hit is not None:
+                    return hit
+
+        target_words = deleet_target.split()
+        best_key: str | None = None
+        best_ratio = 0.0
+        for cand_key, cand_queue in list(self._map.items()):
+            if not cand_queue:
+                continue
+            if not any(_overlay_matches_tile_bounds(c, tile) for c in cand_queue):
+                continue
+            cand_words = cand_key.split()
+            if len(cand_words) != len(target_words):
+                continue
+            if abs(len(cand_key) - len(deleet_target)) > 3:
+                continue
+            ratio = difflib.SequenceMatcher(None, deleet_target, cand_key).ratio()
+            if ratio >= 0.84 and ratio > best_ratio:
+                best_ratio = ratio
+                best_key = cand_key
+
+        if best_key is not None:
+            return self._pop_matching_from_queue(best_key, self._map[best_key], tile)
+        return None
 
 
 def stitch_markdown(
@@ -110,19 +322,7 @@ def stitch_markdown(
     job_id: str | None = None,
     deduplicate_overlaps: bool | None = None,
 ) -> StitchResult:
-    """Join OCR-derived Markdown segments with provenance + DOM assists.
-
-    Args:
-        chunks: OCR-derived markdown chunks (one per tile)
-        tiles: Tile metadata for provenance tracking
-        dom_headings: DOM-extracted heading outline for normalization
-        dom_overlays: DOM text overlays for error correction
-        job_id: Job ID for highlight URL generation
-        deduplicate_overlaps: Enable overlap deduplication (defaults to settings value)
-
-    Returns:
-        StitchResult with markdown, dom_assists, seam_marker_events, and dedup_events
-    """
+    """Join OCR-derived Markdown segments with provenance + DOM assists."""
 
     if not chunks:
         return StitchResult(markdown="", dom_assists=[], seam_marker_events=[])
@@ -144,11 +344,12 @@ def stitch_markdown(
     seam_events: list[SeamMarkerEvent] = []
     dedup_events: list[DeduplicationResult] = []
 
-    for idx, chunk in enumerate(chunks):
+    for idx, raw_chunk in enumerate(chunks):
+        chunk = clean_ocr_chunk(raw_chunk)
         lines = _split_lines(chunk)
         tile = tiles[idx] if tiles and idx < len(tiles) else None
 
-        # NEW: Deduplicate overlaps before other processing
+        # Deduplicate overlaps before other processing
         if dedup_enabled and tile and previous_tile and previous_chunk:
             prev_lines = _split_lines(previous_chunk)
             lines, dedup_result = deduplicate_tile_overlap(
@@ -163,11 +364,11 @@ def stitch_markdown(
                 max_search_window=settings.deduplication.max_search_window,
             )
 
-            # Track deduplication events
-            if dedup_result.lines_removed > 0:
+            # Track all overlap deduplication attempts on overlapping tile pairs
+            if dedup_result.method not in ("disabled", "no_overlap"):
                 dedup_events.append(dedup_result)
-                if settings.deduplication.log_events:
-                    processed.append(_format_dedup_comment(dedup_result))
+            if dedup_result.lines_removed > 0 and settings.deduplication.log_events:
+                processed.append(_format_dedup_comment(dedup_result))
 
         lines, last_heading_level, heading_changes = _normalize_headings(
             lines, last_heading_level, heading_guide
@@ -181,7 +382,10 @@ def stitch_markdown(
 
         if overlay_index:
             lines, assists = _apply_dom_overlays(
-                lines, overlay_index, tile_index=tile.index if tile else idx
+                lines,
+                overlay_index,
+                tile_index=tile.index if tile else idx,
+                tile=tile,
             )
             if assists:
                 dom_assists.extend(assists)
@@ -213,7 +417,8 @@ def stitch_markdown(
         if body and body.strip():
             processed.append(body)
         previous_tile = tile if tile else previous_tile
-        previous_chunk = chunk  # Save for next iteration's deduplication
+        if chunk and chunk.strip():
+            previous_chunk = chunk  # Save cleaned chunk for next iteration's deduplication
 
     return StitchResult(
         markdown="\n\n".join(processed),
@@ -342,15 +547,7 @@ def _header_similarity(sig_a: str, sig_b: str) -> float:
 
 
 def _tiles_share_overlap(prev_tile: TileSlice | None, tile: TileSlice | None) -> tuple[bool, bool]:
-    if not prev_tile or not tile:
-        return False, False
-    if prev_tile.bottom_overlap_sha256 and tile.top_overlap_sha256:
-        if prev_tile.bottom_overlap_sha256 == tile.top_overlap_sha256:
-            return True, False
-    if prev_tile.seam_bottom_hash and tile.seam_top_hash:
-        if prev_tile.seam_bottom_hash == tile.seam_top_hash:
-            return True, True
-    return False, False
+    return _dedup_tiles_share_overlap(prev_tile, tile)
 
 
 def _format_seam_marker(prev_tile: TileSlice, tile: TileSlice) -> str:
@@ -376,6 +573,9 @@ def _format_provenance(tile: TileSlice, *, job_id: str | None = None) -> str:
         f"sha256={tile.sha256}",
         f"scale={tile.scale:.2f}",
         f"viewport_y={tile.viewport_y_offset}",
+        f"css_y={tile.css_y_offset}",
+        f"dpr={tile.device_scale_factor:g}",
+        f"crop={tile.source_crop_x},{tile.source_crop_y},{tile.source_crop_width},{tile.source_crop_height}",
         f"overlap_px={tile.overlap_px}",
         f"path={path}",
     ]
@@ -392,11 +592,41 @@ def _build_highlight_url(*, job_id: str, tile_path: str, start: int, end: int) -
     return f"/jobs/{job_id}/artifact/highlight?{query}"
 
 
+_BENIGN_ALNUM_TOKEN_RE = re.compile(
+    r"^(?:"
+    r"\d+(?:[.,:/-]\d+)*(?:st|nd|rd|th|px|ms|ns|us|s|m|h|d|w|y|yr|yrs|k|b|t|kb|mb|gb|tb|pb|hz|khz|mhz|ghz|fps|dpi|ppi|pt|pc|em|rem|vh|vw|vmin|vmax|deg|rad|x|p|c|f|v|a|mah|wh|kwh|bit|bits|byte|bytes|am|pm)?"
+    r"|(?:v|ver|version|q|h|p|s|sec|step|part|ch|fig|tab|col|row|tier|level|lvl|phase|stage|sha|md|utf|iso|rfc|http|ipv|tls|oauth|web|fp|int|uint|bf|float|mp|ec|s3|k8s|i18n|l10n|a11y|x86|arm|b|rc|alpha|beta)\d+(?:[._-]\d+)*"
+    r"|0x[0-9a-f]+"
+    r"|[0-9a-f]{7,64}"
+    r"|[a-z]{1,4}-\d+(?:[._-]\d+)*"
+    r")$",
+    re.IGNORECASE,
+)
+
+
+def _has_mixed_numeric_token(text: str) -> bool:
+    """Return True only when an alphabetic word contains OCR-corrupted inline digits."""
+    # Strip inline code spans and markdown links before checking tokens
+    cleaned = re.sub(r"`[^`]*`", " ", text)
+    cleaned = re.sub(r"https?://\S+", " ", cleaned)
+    for raw_tok in cleaned.split():
+        tok = raw_tok.strip(".,;:!?'\"()[]{}*_~<>|/#+-=$%^&")
+        if len(tok) < 3:
+            continue
+        if not (any(c.isdigit() for c in tok) and any(c.isalpha() for c in tok)):
+            continue
+        if _BENIGN_ALNUM_TOKEN_RE.match(tok):
+            continue
+        return True
+    return False
+
+
 def _apply_dom_overlays(
     lines: list[str],
     overlay_index: DomOverlayIndex,
     *,
     tile_index: int,
+    tile: TileSlice | None = None,
 ) -> tuple[list[str], list[DomAssistEntry]]:
     updated: list[str] = []
     assists: list[DomAssistEntry] = []
@@ -444,9 +674,17 @@ def _apply_dom_overlays(
                     else:
                         normalized = normalize_heading_text(stripped)
             if normalized:
-                overlay = overlay_index.lookup(normalized)
+                allow_fuzzy = reason in ("mixed-numeric", "replacement-char", "low-alpha")
+                overlay = overlay_index.lookup(
+                    normalized,
+                    tile=tile,
+                    allow_fuzzy=allow_fuzzy,
+                )
                 if overlay:
                     replacement = _merge_overlay(line, overlay.text)
+                    if not consume_next and replacement == line:
+                        updated.append(line)
+                        continue
                     updated.append(replacement)
                     assists.append(
                         DomAssistEntry(
@@ -468,14 +706,14 @@ def _line_issue(line: str, next_line: str | None) -> str | None:
     stripped = line.strip()
     if not stripped:
         return None
-    if "�" in stripped:
+    if "\ufffd" in stripped:
         return "replacement-char"
     if _SPACED_LETTERS_RE.search(stripped):
         return "spaced-letters"
     noisy = sum(1 for char in stripped if char in "!?…")
     if noisy >= 3:
         return "punctuation"
-    if any(char.isdigit() for char in stripped) and any(char.isalpha() for char in stripped):
+    if _has_mixed_numeric_token(stripped):
         return "mixed-numeric"
     alpha = sum(1 for char in stripped if char.isalpha())
     ratio = alpha / max(1, len(stripped))

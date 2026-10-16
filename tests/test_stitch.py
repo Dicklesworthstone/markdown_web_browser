@@ -256,3 +256,97 @@ def test_dom_assist_detects_spaced_letters() -> None:
 
     assert "Revenue" in result.markdown
     assert result.dom_assists[0].reason == "spaced-letters"
+
+
+def test_clean_ocr_chunk_strips_olmocr_frontmatter_and_blank_prose() -> None:
+    from app.stitch import clean_ocr_chunk
+
+    olmocr_wrapped = """---
+primary_language: en
+is_rotation_valid: true
+rotation_correction: 0
+is_table: false
+is_diagram: false
+---
+# Quarterly Report
+
+Revenue increased by 18%."""
+    cleaned = clean_ocr_chunk(olmocr_wrapped)
+    assert "primary_language:" not in cleaned
+    assert "is_rotation_valid:" not in cleaned
+    assert cleaned.startswith("# Quarterly Report")
+
+    # Inline or multiline natural_text inside front-matter with empty body
+    inline_nat = """---
+primary_language: en
+is_table: false
+natural_text: |
+  ## Extracted From YAML
+  Body line here.
+---
+"""
+    cleaned_nat = clean_ocr_chunk(inline_nat)
+    assert "## Extracted From YAML" in cleaned_nat
+    assert "Body line here." in cleaned_nat
+
+    # Blank-tile refusal prose is stripped completely
+    blank_chunk = """---
+primary_language: null
+is_rotation_valid: true
+rotation_correction: 0
+is_table: false
+is_diagram: false
+---
+This image appears to be completely blank."""
+    assert clean_ocr_chunk(blank_chunk) == ""
+    assert clean_ocr_chunk("No text is visible in this image.") == ""
+
+    # User YAML front-matter with non-olmOCR keys is preserved!
+    user_yaml = """---
+title: My Blog Post
+author: Ada Lovelace
+---
+# Welcome"""
+    assert clean_ocr_chunk(user_yaml) == user_yaml
+
+
+def test_stitch_does_not_flag_normal_prose_numbers_as_mixed_numeric() -> None:
+    tiles = [_tile(0, 0)]
+    overlays = [
+        DomTextOverlay(
+            text="In 2026 Q4 revenue grew 15% across 3 regions",
+            normalized="in 2026 q4 revenue grew 15 across 3 regions",
+            source="p",
+        )
+    ]
+    chunk = "In 2026 Q4 revenue grew 15% across 3 regions"
+    result = stitch_markdown([chunk], tiles, dom_overlays=overlays)
+    assert result.dom_assists == []
+    assert "dom-assist:" not in result.markdown
+
+
+def test_dom_assist_repairs_mixed_numeric_ocr_corruption_and_respects_tile_coordinates() -> None:
+    tiles = [
+        _tile(0, 0, height=400, source_y=0),
+        _tile(1, 400, height=400, source_y=800),
+    ]
+    overlays = [
+        # Located on tile 1 (y=950), NOT tile 0 (y=0..400)
+        DomTextOverlay(
+            text="Revenue Growth",
+            normalized="revenue growth",
+            source="h2",
+            y=950.0,
+            height=32.0,
+        ),
+    ]
+    # Tile 0 has corrupted text at y=0..400, Tile 1 has corrupted text at y=800..1200
+    chunks = ["## Reven0e Gr0wth", "## Reven0e Gr0wth"]
+    result = stitch_markdown(chunks, tiles, dom_overlays=overlays)
+
+    # Only Tile 1 should receive the coordinate-bounded DOM assist!
+    assert len(result.dom_assists) == 1
+    assert result.dom_assists[0].tile_index == 1
+    assert result.dom_assists[0].reason == "mixed-numeric"
+    assert result.dom_assists[0].dom_text == "Revenue Growth"
+

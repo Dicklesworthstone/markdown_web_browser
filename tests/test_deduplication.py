@@ -420,3 +420,105 @@ class TestTierFallback:
         assert info.lines_removed == 0
         assert info.method == "no_match"
         assert result_lines == curr_lines  # Unchanged
+
+
+class TestOverlapSsimAndDedupSummary:
+    """Tests for real pyvips/numpy SSIM over overlap strips and dedup event aggregation."""
+
+    @staticmethod
+    def _encode_pattern_png(arr) -> bytes:
+        import pyvips
+
+        h, w = arr.shape
+        img = pyvips.Image.new_from_memory(arr.tobytes(), w, h, 1, "uchar")
+        return bytes(img.write_to_buffer(".png"))
+
+    def test_compute_overlap_ssim_recovers_subpixel_drift_and_blocks_false_seam(self):
+        import numpy as np
+        from app.dedup import compute_overlap_ssim, summarize_dedup_events
+
+        rng = np.random.default_rng(42)
+        shared_strip = rng.integers(20, 235, size=(40, 128), dtype=np.uint8)
+        # Minor subpixel / anti-aliasing jitter (+1 gray level in a few pixels)
+        drifted_strip = np.clip(shared_strip.astype(np.int16) + 1, 0, 255).astype(np.uint8)
+        different_strip = 255 - shared_strip
+
+        prev_arr = np.vstack([np.full((80, 128), 240, dtype=np.uint8), shared_strip])
+        curr_good_arr = np.vstack([drifted_strip, np.full((80, 128), 240, dtype=np.uint8)])
+        curr_bad_arr = np.vstack([different_strip, np.full((80, 128), 240, dtype=np.uint8)])
+
+        prev_tile = TileSlice(
+            index=0,
+            png_bytes=self._encode_pattern_png(prev_arr),
+            sha256="sha0",
+            width=128,
+            height=120,
+            scale=1.0,
+            source_y_offset=0,
+            viewport_y_offset=0,
+            overlap_px=40,
+            top_overlap_sha256=None,
+            bottom_overlap_sha256="sha_a",
+            seam_bottom_hash="collided_seam",
+        )
+        curr_good = TileSlice(
+            index=1,
+            png_bytes=self._encode_pattern_png(curr_good_arr),
+            sha256="sha1",
+            width=128,
+            height=120,
+            scale=1.0,
+            source_y_offset=80,
+            viewport_y_offset=0,
+            overlap_px=40,
+            top_overlap_sha256="sha_b_drifted",  # SHA256 differs due to 1-level drift
+            bottom_overlap_sha256=None,
+        )
+        curr_bad = TileSlice(
+            index=1,
+            png_bytes=self._encode_pattern_png(curr_bad_arr),
+            sha256="sha2",
+            width=128,
+            height=120,
+            scale=1.0,
+            source_y_offset=80,
+            viewport_y_offset=0,
+            overlap_px=40,
+            top_overlap_sha256="sha_c",
+            bottom_overlap_sha256=None,
+            seam_top_hash="collided_seam",  # Coarse seam hash collided!
+        )
+
+        good_ssim = compute_overlap_ssim(prev_tile, curr_good)
+        bad_ssim = compute_overlap_ssim(prev_tile, curr_bad)
+        assert good_ssim is not None and good_ssim >= 0.95
+        assert bad_ssim is not None and bad_ssim < 0.30
+
+        # 1. Subpixel drift with high SSIM still deduplicates overlap!
+        lines_good, res_good = deduplicate_tile_overlap(
+            ["Intro", "Overlap 1", "Overlap 2"],
+            ["Overlap 1", "Overlap 2", "Body"],
+            prev_tile,
+            curr_good,
+        )
+        assert res_good.method == "exact"
+        assert res_good.lines_removed == 2
+        assert lines_good == ["Body"]
+
+        # 2. Visually disagreeing strip with collided seam hash is BLOCKED by SSIM!
+        lines_bad, res_bad = deduplicate_tile_overlap(
+            ["Intro", "Overlap 1", "Overlap 2"],
+            ["Overlap 1", "Overlap 2", "Body"],
+            prev_tile,
+            curr_bad,
+        )
+        assert res_bad.method == "no_overlap"
+        assert res_bad.lines_removed == 0
+        assert lines_bad == ["Overlap 1", "Overlap 2", "Body"]
+
+        summary = summarize_dedup_events([res_good])
+        assert summary["total_events"] == 1
+        assert summary["lines_removed"] == 2
+        assert summary["exact_matches"] == 1
+        assert summary["avg_similarity"] == 1.0
+
