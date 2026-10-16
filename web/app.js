@@ -8,8 +8,286 @@ const WARNING_LABELS = {
   'ocr-quota': 'OCR Quota',
 };
 const LOCAL_STORAGE_CRAWLED_KEY = 'mdwb:crawled-links';
+const API_KEY_STORAGE_KEY = 'mdwb_api_key';
 const LINK_ACTION_EVENT = 'mdwb:link-open';
 const crawledLinks = new Set(loadCrawledLinkIds());
+
+function getApiKey() {
+  try {
+    if (typeof window !== 'undefined' && window.location?.search) {
+      const params = new URLSearchParams(window.location.search);
+      const fromQuery = params.get('api_key');
+      if (fromQuery && fromQuery.trim()) {
+        setApiKey(fromQuery.trim());
+        return fromQuery.trim();
+      }
+    }
+    if (typeof localStorage !== 'undefined') {
+      const stored = localStorage.getItem(API_KEY_STORAGE_KEY);
+      if (stored && stored.trim()) {
+        return stored.trim();
+      }
+    }
+  } catch {
+    // Ignore storage errors
+  }
+  return '';
+}
+
+function setApiKey(apiKey) {
+  const normalized = (apiKey || '').trim();
+  try {
+    if (typeof localStorage !== 'undefined') {
+      if (normalized) {
+        localStorage.setItem(API_KEY_STORAGE_KEY, normalized);
+      } else {
+        localStorage.removeItem(API_KEY_STORAGE_KEY);
+      }
+    }
+    if (typeof document !== 'undefined') {
+      if (normalized) {
+        document.cookie = `mdwb_api_key=${encodeURIComponent(normalized)}; path=/; SameSite=Lax`;
+      } else {
+        document.cookie = 'mdwb_api_key=; Max-Age=0; path=/; SameSite=Lax';
+      }
+    }
+  } catch {
+    // Ignore storage/cookie errors
+  }
+}
+
+function authHeaders(extra = {}) {
+  const headers = { ...extra };
+  const apiKey = getApiKey();
+  if (apiKey) {
+    headers['X-API-Key'] = apiKey;
+  }
+  return headers;
+}
+
+function sanitizeUrl(rawUrl, baseUrl = null) {
+  if (!rawUrl || typeof rawUrl !== 'string') {
+    return '';
+  }
+  const cleaned = rawUrl.replace(/[\u0000-\u001F\u007F]+/g, '').trim();
+  if (!cleaned) {
+    return '';
+  }
+  if (cleaned.startsWith('#')) {
+    return cleaned;
+  }
+  const compactSchemeCheck = cleaned.replace(/\s+/g, '').toLowerCase();
+  if (
+    compactSchemeCheck.startsWith('javascript:') ||
+    compactSchemeCheck.startsWith('data:') ||
+    compactSchemeCheck.startsWith('vbscript:') ||
+    compactSchemeCheck.startsWith('file:') ||
+    compactSchemeCheck.startsWith('blob:')
+  ) {
+    return '';
+  }
+  try {
+    const base =
+      baseUrl && /^https?:\/\//i.test(baseUrl)
+        ? baseUrl
+        : typeof window !== 'undefined' && window.location?.origin
+          ? window.location.origin
+          : 'https://example.com';
+    const resolved = new URL(cleaned, base);
+    const protocol = resolved.protocol.toLowerCase();
+    if (protocol === 'http:' || protocol === 'https:' || protocol === 'mailto:') {
+      return resolved.href;
+    }
+    return '';
+  } catch {
+    return '';
+  }
+}
+
+function formatInlineMarkdown(text, baseUrl = null) {
+  if (!text) {
+    return '';
+  }
+  const codeSpans = [];
+  const withPlaceholders = String(text).replace(/`([^`]+)`/g, (_, code) => {
+    const idx = codeSpans.length;
+    codeSpans.push(`<code>${escapeHtml(code)}</code>`);
+    return `\u0000CODE_${idx}\u0000`;
+  });
+
+  let escaped = escapeHtml(withPlaceholders);
+
+  escaped = escaped.replace(/!\[([^\]]*)\]\(([^)\s]+)(?:\s+&quot;([^&]*)&quot;)?\)/g, (_, alt, rawSrc) => {
+    const safeSrc = sanitizeUrl(rawSrc.replace(/&amp;/g, '&'), baseUrl);
+    if (!safeSrc) {
+      return alt ? `[Image: ${alt}]` : '';
+    }
+    return `<img src="${escapeHtml(safeSrc)}" alt="${alt}" loading="lazy">`;
+  });
+
+  escaped = escaped.replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+&quot;([^&]*)&quot;)?\)/g, (_, label, rawHref) => {
+    const safeHref = sanitizeUrl(rawHref.replace(/&amp;/g, '&'), baseUrl);
+    if (!safeHref) {
+      return label;
+    }
+    return `<a href="${escapeHtml(safeHref)}" target="_blank" rel="noopener noreferrer">${label}</a>`;
+  });
+
+  escaped = escaped.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  escaped = escaped.replace(/__([^_]+)__/g, '<strong>$1</strong>');
+  escaped = escaped.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, '$1<em>$2</em>');
+  escaped = escaped.replace(/(^|[^_])_([^_\n]+)_(?!_)/g, '$1<em>$2</em>');
+
+  return escaped.replace(/\u0000CODE_(\d+)\u0000/g, (_, idx) => codeSpans[Number(idx)] || '');
+}
+
+function parseMarkdownSafe(markdown, baseUrl = null) {
+  if (!markdown || typeof markdown !== 'string') {
+    return '';
+  }
+  const cleaned = markdown.replace(/<!--[\s\S]*?-->/g, '');
+  const lines = cleaned.replace(/\r\n/g, '\n').split('\n');
+  const out = [];
+  let i = 0;
+
+  while (i < lines.length) {
+    const line = lines[i];
+
+    const fenceMatch = line.match(/^```([a-zA-Z0-9_-]*)\s*$/);
+    if (fenceMatch) {
+      const lang = fenceMatch[1] ? ` class="language-${escapeHtml(fenceMatch[1])}"` : '';
+      const codeLines = [];
+      i++;
+      while (i < lines.length && !/^```\s*$/.test(lines[i])) {
+        codeLines.push(escapeHtml(lines[i]));
+        i++;
+      }
+      if (i < lines.length) {
+        i++;
+      }
+      out.push(`<pre><code${lang}>${codeLines.join('\n')}</code></pre>`);
+      continue;
+    }
+
+    if (!line.trim()) {
+      i++;
+      continue;
+    }
+
+    if (/^(?:---|\*\*\*|___)\s*$/.test(line.trim())) {
+      out.push('<hr>');
+      i++;
+      continue;
+    }
+
+    const headingMatch = line.match(/^(#{1,6})\s+(.+?)\s*$/);
+    if (headingMatch) {
+      const level = headingMatch[1].length;
+      out.push(`<h${level}>${formatInlineMarkdown(headingMatch[2], baseUrl)}</h${level}>`);
+      i++;
+      continue;
+    }
+
+    if (/^>\s?/.test(line)) {
+      const quoteLines = [];
+      while (i < lines.length && /^>\s?/.test(lines[i])) {
+        quoteLines.push(formatInlineMarkdown(lines[i].replace(/^>\s?/, ''), baseUrl));
+        i++;
+      }
+      out.push(`<blockquote><p>${quoteLines.join('<br>')}</p></blockquote>`);
+      continue;
+    }
+
+    if (
+      line.includes('|') &&
+      i + 1 < lines.length &&
+      /^\s*\|?(?:\s*:?-+:?\s*\|)+\s*:?-+:?\s*\|?\s*$/.test(lines[i + 1])
+    ) {
+      const parseCells = (rowText) =>
+        rowText
+          .trim()
+          .replace(/^\||\|$/g, '')
+          .split('|')
+          .map((cell) => formatInlineMarkdown(cell.trim(), baseUrl));
+      const headers = parseCells(line);
+      i += 2;
+      const bodyRows = [];
+      while (i < lines.length && lines[i].trim() && lines[i].includes('|')) {
+        bodyRows.push(parseCells(lines[i]));
+        i++;
+      }
+      const thead = `<thead><tr>${headers.map((h) => `<th>${h}</th>`).join('')}</tr></thead>`;
+      const tbody = bodyRows.length
+        ? `<tbody>${bodyRows.map((row) => `<tr>${row.map((c) => `<td>${c}</td>`).join('')}</tr>`).join('')}</tbody>`
+        : '';
+      out.push(`<table>${thead}${tbody}</table>`);
+      continue;
+    }
+
+    if (/^\s*[-*+]\s+/.test(line)) {
+      const items = [];
+      while (i < lines.length && /^\s*[-*+]\s+/.test(lines[i])) {
+        items.push(`<li>${formatInlineMarkdown(lines[i].replace(/^\s*[-*+]\s+/, ''), baseUrl)}</li>`);
+        i++;
+      }
+      out.push(`<ul>${items.join('')}</ul>`);
+      continue;
+    }
+
+    if (/^\s*\d+\.\s+/.test(line)) {
+      const items = [];
+      while (i < lines.length && /^\s*\d+\.\s+/.test(lines[i])) {
+        items.push(`<li>${formatInlineMarkdown(lines[i].replace(/^\s*\d+\.\s+/, ''), baseUrl)}</li>`);
+        i++;
+      }
+      out.push(`<ol>${items.join('')}</ol>`);
+      continue;
+    }
+
+    const paraLines = [];
+    while (
+      i < lines.length &&
+      lines[i].trim() &&
+      !/^(#{1,6}\s+|```|>\s?|(?:\s*[-*+]\s+)|(?:\s*\d+\.\s+)|(?:---|\*\*\*|___)\s*$)/.test(lines[i])
+    ) {
+      paraLines.push(formatInlineMarkdown(lines[i], baseUrl));
+      i++;
+    }
+    out.push(`<p>${paraLines.join('<br>')}</p>`);
+  }
+
+  return out.join('\n');
+}
+
+function sanitizeRenderedDom(container, baseUrl = null) {
+  if (!container || typeof container.querySelectorAll !== 'function') {
+    return;
+  }
+  const blockedTags = 'script, iframe, object, embed, style, link, meta, base, form, input, button, textarea, select';
+  container.querySelectorAll(blockedTags).forEach((node) => node.remove());
+
+  container.querySelectorAll('*').forEach((el) => {
+    const attrs = Array.from(el.attributes || []);
+    for (const attr of attrs) {
+      const name = attr.name.toLowerCase();
+      if (name.startsWith('on') || name === 'style' || name === 'srcdoc') {
+        el.removeAttribute(attr.name);
+        continue;
+      }
+      if (name === 'href' || name === 'src' || name === 'xlink:href' || name === 'action') {
+        const safe = sanitizeUrl(attr.value, baseUrl);
+        if (!safe) {
+          el.removeAttribute(attr.name);
+        } else {
+          el.setAttribute(attr.name, safe);
+        }
+      }
+    }
+    if (el.tagName === 'A') {
+      el.setAttribute('rel', 'noopener noreferrer');
+    }
+  });
+}
 
 function setupTabs() {
   const tabButtons = Array.from(document.querySelectorAll('[data-tab-target]'));
@@ -43,6 +321,7 @@ function setupTabs() {
 }
 
 function initSseHandlers() {
+  getApiKey();
   const root = document.querySelector('[data-stream-root]');
   const statusEl = document.getElementById('job-sse-status');
   if (!root || !statusEl) {
@@ -103,22 +382,34 @@ function initSseHandlers() {
         });
         break;
       case 'raw':
-        el.textContent = payload;
+        el.textContent = payload ?? '';
         break;
+      case 'rendered': {
+        const html = parseMarkdownSafe(String(payload ?? ''));
+        el.innerHTML = html || '<p class="placeholder">Rendered Markdown is empty.</p>';
+        sanitizeRenderedDom(el);
+        break;
+      }
       case 'links':
         renderLinks(el, payload);
         break;
       case 'artifacts':
         renderArtifacts(el, payload);
         break;
+      case 'state':
+      case 'progress':
+      case 'runtime':
+      case 'profile':
+        el.textContent = payload ?? '';
+        break;
       default:
-        el.innerHTML = payload;
+        el.textContent = payload ?? '';
     }
   };
 
   const fetchTemplateJson = async (template, jobId) => {
     const target = buildTemplateUrl(template, jobId);
-    const response = await fetch(target);
+    const response = await fetch(target, { headers: authHeaders() });
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}`);
     }
@@ -131,7 +422,9 @@ function initSseHandlers() {
       const data = await fetchTemplateJson(template, jobId);
       updateField('links', JSON.stringify(data));
     } catch (error) {
-      console.error('Failed to refresh links', error);
+      if (!(error?.message || '').includes('404')) {
+        console.error('Failed to refresh links', error);
+      }
     }
   };
 
@@ -144,6 +437,58 @@ function initSseHandlers() {
       if (!(error?.message || '').includes('404')) {
         console.error('Failed to refresh manifest', error);
       }
+    }
+  };
+
+  const refreshMarkdown = async (jobId) => {
+    if (!jobId || jobId === 'demo') {
+      return;
+    }
+    const mdUrl = buildTemplateUrl('/jobs/{job_id}/result.md', jobId);
+    const rawUrl = buildTemplateUrl('/jobs/{job_id}/result.md/raw', jobId);
+    try {
+      const response = await fetch(mdUrl, { headers: authHeaders() });
+      if (!response.ok) {
+        if (response.status !== 404) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        return;
+      }
+      const markdown = await response.text();
+      updateField('rendered', markdown);
+      let rawMarkdown = markdown;
+      try {
+        const rawResp = await fetch(rawUrl, { headers: authHeaders() });
+        if (rawResp.ok) {
+          rawMarkdown = await rawResp.text();
+        }
+      } catch {
+        // Fall back to result.md content
+      }
+      updateField('raw', rawMarkdown);
+    } catch (error) {
+      if (!(error?.message || '').includes('404')) {
+        console.error('Failed to refresh markdown', error);
+      }
+    }
+  };
+
+  const refreshArtifacts = async (jobId) => {
+    if (!jobId || jobId === 'demo') {
+      return;
+    }
+    const artifactsUrl = buildTemplateUrl('/jobs/{job_id}/artifacts', jobId);
+    try {
+      const response = await fetch(artifactsUrl, { headers: authHeaders() });
+      if (!response.ok) {
+        return;
+      }
+      const data = await response.json();
+      if (Array.isArray(data)) {
+        updateField('artifacts', JSON.stringify(data));
+      }
+    } catch (error) {
+      console.error('Failed to refresh artifacts', error);
     }
   };
 
@@ -172,6 +517,8 @@ function initSseHandlers() {
     eventsPanel?.connect(resolved);
     refreshManifest(resolved);
     refreshLinks(resolved);
+    refreshMarkdown(resolved);
+    refreshArtifacts(resolved);
   };
 
   const parseJson = (value) => {
@@ -201,6 +548,10 @@ function initSseHandlers() {
       if (normalized === 'DONE' || normalized === 'FAILED') {
         refreshManifest(state.jobId);
         refreshLinks(state.jobId);
+        refreshArtifacts(state.jobId);
+        if (normalized === 'DONE') {
+          refreshMarkdown(state.jobId);
+        }
       }
     },
     progress: (data) => updateField('progress', data),
@@ -270,7 +621,7 @@ function initSseHandlers() {
 
   connect(state.jobId);
 
-  return { connect, refreshLinks };
+  return { connect, refreshLinks, refreshMarkdown, refreshArtifacts };
 }
 
 function renderManifest(
@@ -433,6 +784,9 @@ function renderLinks(container, raw) {
       rows = null;
     }
   }
+  if (rows && typeof rows === 'object' && !Array.isArray(rows) && Array.isArray(rows.links)) {
+    rows = rows.links;
+  }
 
   if (!Array.isArray(rows)) {
     container.innerHTML = `<p class="placeholder">Invalid links payload</p>`;
@@ -474,9 +828,13 @@ async function handleLinkAction(event) {
     return;
   }
   if (action === 'open') {
+    const safeHref = sanitizeUrl(href);
+    if (!safeHref) {
+      return;
+    }
     document.dispatchEvent(
       new CustomEvent(LINK_ACTION_EVENT, {
-        detail: { href },
+        detail: { href: safeHref },
       }),
     );
     return;
@@ -562,7 +920,8 @@ function createLinkRow(entry) {
   title.textContent = entry.text || '(no text)';
   const href = document.createElement('a');
   href.className = 'link-entry__href';
-  href.href = entry.href || '#';
+  const safeHref = sanitizeUrl(entry.href);
+  href.href = safeHref || '#';
   href.target = '_blank';
   href.rel = 'noreferrer noopener';
   href.textContent = entry.href || '—';
@@ -810,14 +1169,24 @@ function renderArtifacts(container, raw) {
     const li = document.createElement('li');
     const left = document.createElement('div');
     const idEl = document.createElement('strong');
-    idEl.textContent = artifact.id ?? 'tile';
+    const fallbackId =
+      artifact.index !== undefined && artifact.index !== null
+        ? `tile_${String(artifact.index).padStart(4, '0')}`
+        : artifact.path || 'tile';
+    idEl.textContent = artifact.id ?? fallbackId;
     const offsetEl = document.createElement('small');
-    offsetEl.textContent = artifact.offset ?? '';
+    const fallbackOffset =
+      artifact.source_y_offset !== undefined && artifact.source_y_offset !== null
+        ? `y=${artifact.source_y_offset}px`
+        : artifact.viewport_y_offset !== undefined && artifact.viewport_y_offset !== null
+          ? `y=${artifact.viewport_y_offset}px`
+          : '';
+    offsetEl.textContent = artifact.offset ?? fallbackOffset;
     left.append(idEl);
     left.append(document.createElement('br'));
     left.append(offsetEl);
     const right = document.createElement('div');
-    right.textContent = artifact.sha ?? '';
+    right.textContent = artifact.sha ?? artifact.sha256 ?? '';
     li.append(left, right);
     container.appendChild(li);
   });
@@ -1257,7 +1626,7 @@ function initEmbeddingsPanel(streamRoot) {
       const jobId = currentJobId || 'demo';
       const response = await fetch(`/jobs/${encodeURIComponent(jobId)}/embeddings/search`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({ vector, top_k: topK }),
       });
       if (!response.ok) {
@@ -1422,6 +1791,7 @@ function initEventsPanel(root) {
     }
     const template = root.dataset.eventsTemplate || '/jobs/{job_id}/events';
     const response = await fetch(buildTemplateUrl(template, activeJobId, params), {
+      headers: authHeaders(),
       signal: abortController.signal,
     });
     if (response.status === 404) {
@@ -1586,7 +1956,7 @@ function initStreamControls(sse) {
     try {
       const response = await fetch('/jobs', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify(payload),
       });
       if (!response.ok) {
@@ -1635,7 +2005,7 @@ function initStreamControls(sse) {
       const jobId = root.dataset.jobId || jobInput.value.trim() || 'demo';
       const url = buildTemplateUrl(template, jobId);
       try {
-        const response = await fetch(url);
+        const response = await fetch(url, { headers: authHeaders() });
         if (!response.ok) {
           throw new Error(`HTTP ${response.status}`);
         }
@@ -1731,10 +2101,12 @@ function renderDomAssistSummary(summaryEl, tableEl, summary) {
 }
 
 function escapeHtml(value) {
-  return String(value)
+  return String(value ?? '')
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 function formatRatio(value) {

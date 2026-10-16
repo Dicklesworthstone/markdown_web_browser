@@ -7,6 +7,338 @@
 const POLL_INTERVAL_MS = 1000; // Poll job status every second
 const MAX_POLL_ATTEMPTS = 600; // Max 10 minutes (600 seconds)
 const GOOGLE_SEARCH_URL = 'https://www.google.com/search?q=';
+const API_KEY_STORAGE_KEY = 'mdwb_api_key';
+
+// ============================================================================
+// AUTH & SECURITY HELPERS
+// ============================================================================
+
+function getApiKey() {
+    try {
+        if (typeof window !== 'undefined' && window.location?.search) {
+            const params = new URLSearchParams(window.location.search);
+            const fromQuery = params.get('api_key');
+            if (fromQuery && fromQuery.trim()) {
+                setApiKey(fromQuery.trim());
+                return fromQuery.trim();
+            }
+        }
+        if (typeof localStorage !== 'undefined') {
+            const stored = localStorage.getItem(API_KEY_STORAGE_KEY);
+            if (stored && stored.trim()) {
+                return stored.trim();
+            }
+        }
+    } catch {
+        // Ignore storage errors in restricted contexts
+    }
+    return '';
+}
+
+function setApiKey(apiKey) {
+    const normalized = (apiKey || '').trim();
+    try {
+        if (typeof localStorage !== 'undefined') {
+            if (normalized) {
+                localStorage.setItem(API_KEY_STORAGE_KEY, normalized);
+            } else {
+                localStorage.removeItem(API_KEY_STORAGE_KEY);
+            }
+        }
+        if (typeof document !== 'undefined') {
+            if (normalized) {
+                document.cookie = `mdwb_api_key=${encodeURIComponent(normalized)}; path=/; SameSite=Lax`;
+            } else {
+                document.cookie = 'mdwb_api_key=; Max-Age=0; path=/; SameSite=Lax';
+            }
+        }
+    } catch {
+        // Ignore storage/cookie errors
+    }
+}
+
+function authHeaders(extra = {}) {
+    const headers = { ...extra };
+    const apiKey = getApiKey();
+    if (apiKey) {
+        headers['X-API-Key'] = apiKey;
+    }
+    return headers;
+}
+
+function escapeHtml(value) {
+    return String(value ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+function sanitizeUrl(rawUrl, baseUrl = null) {
+    if (!rawUrl || typeof rawUrl !== 'string') {
+        return '';
+    }
+    // Strip ASCII control characters and surrounding whitespace
+    const cleaned = rawUrl.replace(/[\u0000-\u001F\u007F]+/g, '').trim();
+    if (!cleaned) {
+        return '';
+    }
+    if (cleaned.startsWith('#')) {
+        return cleaned;
+    }
+    // Reject dangerous schemes explicitly
+    const compactSchemeCheck = cleaned.replace(/\s+/g, '').toLowerCase();
+    if (
+        compactSchemeCheck.startsWith('javascript:') ||
+        compactSchemeCheck.startsWith('data:') ||
+        compactSchemeCheck.startsWith('vbscript:') ||
+        compactSchemeCheck.startsWith('file:') ||
+        compactSchemeCheck.startsWith('blob:')
+    ) {
+        return '';
+    }
+    try {
+        const base =
+            baseUrl && /^https?:\/\//i.test(baseUrl)
+                ? baseUrl
+                : typeof window !== 'undefined' && window.location?.origin
+                  ? window.location.origin
+                  : 'https://example.com';
+        const resolved = new URL(cleaned, base);
+        const protocol = resolved.protocol.toLowerCase();
+        if (protocol === 'http:' || protocol === 'https:' || protocol === 'mailto:') {
+            return resolved.href;
+        }
+        return '';
+    } catch {
+        return '';
+    }
+}
+
+function formatInlineMarkdown(text, baseUrl = null) {
+    if (!text) {
+        return '';
+    }
+    const codeSpans = [];
+    const withPlaceholders = String(text).replace(/`([^`]+)`/g, (_, code) => {
+        const idx = codeSpans.length;
+        codeSpans.push(`<code>${escapeHtml(code)}</code>`);
+        return `\u0000CODE_${idx}\u0000`;
+    });
+
+    let escaped = escapeHtml(withPlaceholders);
+
+    // Images: ![alt](url)
+    escaped = escaped.replace(/!\[([^\]]*)\]\(([^)\s]+)(?:\s+&quot;([^&]*)&quot;)?\)/g, (_, alt, rawSrc) => {
+        const safeSrc = sanitizeUrl(rawSrc.replace(/&amp;/g, '&'), baseUrl);
+        if (!safeSrc) {
+            return alt ? `[Image: ${alt}]` : '';
+        }
+        return `<img src="${escapeHtml(safeSrc)}" alt="${alt}" loading="lazy">`;
+    });
+
+    // Links: [text](url)
+    escaped = escaped.replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+&quot;([^&]*)&quot;)?\)/g, (_, label, rawHref) => {
+        const safeHref = sanitizeUrl(rawHref.replace(/&amp;/g, '&'), baseUrl);
+        if (!safeHref) {
+            return label;
+        }
+        return `<a href="${escapeHtml(safeHref)}" rel="noopener noreferrer">${label}</a>`;
+    });
+
+    // Bold & italic
+    escaped = escaped.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+    escaped = escaped.replace(/__([^_]+)__/g, '<strong>$1</strong>');
+    escaped = escaped.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, '$1<em>$2</em>');
+    escaped = escaped.replace(/(^|[^_])_([^_\n]+)_(?!_)/g, '$1<em>$2</em>');
+
+    return escaped.replace(/\u0000CODE_(\d+)\u0000/g, (_, idx) => codeSpans[Number(idx)] || '');
+}
+
+function parseMarkdownSafe(markdown, baseUrl = null) {
+    if (!markdown || typeof markdown !== 'string') {
+        return '';
+    }
+    // Strip HTML provenance comments (<!-- source: ... -->) from rendered output while keeping raw text safe
+    const cleaned = markdown.replace(/<!--[\s\S]*?-->/g, '');
+    const lines = cleaned.replace(/\r\n/g, '\n').split('\n');
+    const out = [];
+    let i = 0;
+
+    while (i < lines.length) {
+        const line = lines[i];
+
+        // Fenced code blocks
+        const fenceMatch = line.match(/^```([a-zA-Z0-9_-]*)\s*$/);
+        if (fenceMatch) {
+            const lang = fenceMatch[1] ? ` class="language-${escapeHtml(fenceMatch[1])}"` : '';
+            const codeLines = [];
+            i++;
+            while (i < lines.length && !/^```\s*$/.test(lines[i])) {
+                codeLines.push(escapeHtml(lines[i]));
+                i++;
+            }
+            if (i < lines.length) {
+                i++; // consume closing fence
+            }
+            out.push(`<pre><code${lang}>${codeLines.join('\n')}</code></pre>`);
+            continue;
+        }
+
+        // Blank line
+        if (!line.trim()) {
+            i++;
+            continue;
+        }
+
+        // Horizontal rule
+        if (/^(?:---|\*\*\*|___)\s*$/.test(line.trim())) {
+            out.push('<hr>');
+            i++;
+            continue;
+        }
+
+        // ATX Headings (# .. ######)
+        const headingMatch = line.match(/^(#{1,6})\s+(.+?)\s*$/);
+        if (headingMatch) {
+            const level = headingMatch[1].length;
+            out.push(`<h${level}>${formatInlineMarkdown(headingMatch[2], baseUrl)}</h${level}>`);
+            i++;
+            continue;
+        }
+
+        // Blockquotes
+        if (/^>\s?/.test(line)) {
+            const quoteLines = [];
+            while (i < lines.length && /^>\s?/.test(lines[i])) {
+                quoteLines.push(formatInlineMarkdown(lines[i].replace(/^>\s?/, ''), baseUrl));
+                i++;
+            }
+            out.push(`<blockquote><p>${quoteLines.join('<br>')}</p></blockquote>`);
+            continue;
+        }
+
+        // GFM Tables
+        if (
+            line.includes('|') &&
+            i + 1 < lines.length &&
+            /^\s*\|?(?:\s*:?-+:?\s*\|)+\s*:?-+:?\s*\|?\s*$/.test(lines[i + 1])
+        ) {
+            const parseCells = (rowText) =>
+                rowText
+                    .trim()
+                    .replace(/^\||\|$/g, '')
+                    .split('|')
+                    .map((cell) => formatInlineMarkdown(cell.trim(), baseUrl));
+            const headers = parseCells(line);
+            i += 2; // skip header + separator
+            const bodyRows = [];
+            while (i < lines.length && lines[i].trim() && lines[i].includes('|')) {
+                bodyRows.push(parseCells(lines[i]));
+                i++;
+            }
+            const thead = `<thead><tr>${headers.map((h) => `<th>${h}</th>`).join('')}</tr></thead>`;
+            const tbody = bodyRows.length
+                ? `<tbody>${bodyRows
+                      .map((row) => `<tr>${row.map((c) => `<td>${c}</td>`).join('')}</tr>`)
+                      .join('')}</tbody>`
+                : '';
+            out.push(`<table>${thead}${tbody}</table>`);
+            continue;
+        }
+
+        // Unordered list
+        if (/^\s*[-*+]\s+/.test(line)) {
+            const items = [];
+            while (i < lines.length && /^\s*[-*+]\s+/.test(lines[i])) {
+                items.push(`<li>${formatInlineMarkdown(lines[i].replace(/^\s*[-*+]\s+/, ''), baseUrl)}</li>`);
+                i++;
+            }
+            out.push(`<ul>${items.join('')}</ul>`);
+            continue;
+        }
+
+        // Ordered list
+        if (/^\s*\d+\.\s+/.test(line)) {
+            const items = [];
+            while (i < lines.length && /^\s*\d+\.\s+/.test(lines[i])) {
+                items.push(`<li>${formatInlineMarkdown(lines[i].replace(/^\s*\d+\.\s+/, ''), baseUrl)}</li>`);
+                i++;
+            }
+            out.push(`<ol>${items.join('')}</ol>`);
+            continue;
+        }
+
+        // Paragraph
+        const paraLines = [];
+        while (
+            i < lines.length &&
+            lines[i].trim() &&
+            !/^(#{1,6}\s+|```|>\s?|(?:\s*[-*+]\s+)|(?:\s*\d+\.\s+)|(?:---|\*\*\*|___)\s*$)/.test(lines[i])
+        ) {
+            paraLines.push(formatInlineMarkdown(lines[i], baseUrl));
+            i++;
+        }
+        out.push(`<p>${paraLines.join('<br>')}</p>`);
+    }
+
+    return out.join('\n');
+}
+
+function sanitizeRenderedDom(container, baseUrl = null) {
+    if (!container || typeof container.querySelectorAll !== 'function') {
+        return;
+    }
+    const blockedTags = 'script, iframe, object, embed, style, link, meta, base, form, input, button, textarea, select';
+    container.querySelectorAll(blockedTags).forEach((node) => node.remove());
+
+    container.querySelectorAll('*').forEach((el) => {
+        const attrs = Array.from(el.attributes || []);
+        for (const attr of attrs) {
+            const name = attr.name.toLowerCase();
+            if (name.startsWith('on') || name === 'style' || name === 'srcdoc') {
+                el.removeAttribute(attr.name);
+                continue;
+            }
+            if (name === 'href' || name === 'src' || name === 'xlink:href' || name === 'action') {
+                const safe = sanitizeUrl(attr.value, baseUrl);
+                if (!safe) {
+                    el.removeAttribute(attr.name);
+                } else {
+                    el.setAttribute(attr.name, safe);
+                }
+            }
+        }
+        if (el.tagName === 'A') {
+            el.setAttribute('rel', 'noopener noreferrer');
+        }
+    });
+}
+
+function highlightMarkdownSafe(markdown) {
+    const lines = String(markdown ?? '').replace(/\r\n/g, '\n').split('\n');
+    return lines
+        .map((line) => {
+            const escaped = escapeHtml(line);
+            if (/^&lt;!--[\s\S]*--&gt;$/.test(escaped.trim())) {
+                return `<span class="token comment">${escaped}</span>`;
+            }
+            if (/^#{1,6}\s+/.test(escaped)) {
+                return `<span class="token title important">${escaped}</span>`;
+            }
+            if (/^&gt;\s?/.test(escaped)) {
+                return `<span class="token blockquote">${escaped}</span>`;
+            }
+            if (/^```/.test(escaped)) {
+                return `<span class="token code keyword">${escaped}</span>`;
+            }
+            return escaped
+                .replace(/(`[^`]+`)/g, '<span class="token code">$1</span>')
+                .replace(/(\[[^\]]+\]\([^)]+\))/g, '<span class="token url">$1</span>');
+        })
+        .join('\n');
+}
 
 // ============================================================================
 // STATE MANAGEMENT
@@ -121,19 +453,24 @@ const elements = {
 // ============================================================================
 
 function init() {
-    // Configure marked.js for security - sanitize HTML in markdown
+    // Sync any API key from query string / localStorage to cookie on startup
+    getApiKey();
+
+    // Configure marked.js for security if externally provided
     if (typeof marked !== 'undefined') {
         marked.setOptions({
             breaks: true,
             gfm: true
         });
-        // Use marked's built-in walkTokens to remove potentially dangerous content
         marked.use({
             walkTokens(token) {
-                // Remove HTML tokens for XSS protection
                 if (token.type === 'html') {
                     token.type = 'text';
                     token.raw = token.text;
+                }
+                if ((token.type === 'link' || token.type === 'image') && token.href) {
+                    const safeHref = sanitizeUrl(token.href, state.currentUrl);
+                    token.href = safeHref || '#';
                 }
             }
         });
@@ -195,6 +532,27 @@ function attachEventListeners() {
     // Retry button
     elements.retryBtn.addEventListener('click', handleRetry);
 
+    // Intercept link clicks inside rendered Markdown so navigation stays inside the browser UI
+    elements.renderedContent.addEventListener('click', (e) => {
+        const anchor = e.target.closest?.('a[href]');
+        if (!anchor) {
+            return;
+        }
+        const rawHref = anchor.getAttribute('href') || '';
+        if (rawHref.startsWith('#')) {
+            return;
+        }
+        const safeHref = sanitizeUrl(rawHref, state.currentUrl);
+        if (!safeHref) {
+            e.preventDefault();
+            return;
+        }
+        if (/^https?:\/\//i.test(safeHref)) {
+            e.preventDefault();
+            loadUrl(safeHref);
+        }
+    });
+
     // Keyboard shortcuts
     document.addEventListener('keydown', handleKeyboardShortcuts);
 }
@@ -219,9 +577,9 @@ async function handleForward() {
 
 async function handleRefresh() {
     if (state.currentUrl) {
-        // Clear cache for this URL to force refresh
+        // Clear client cache and instruct backend to bypass server cache (reuse_cache: false)
         state.cache.delete(state.currentUrl);
-        await loadUrl(state.currentUrl, { skipHistory: true });
+        await loadUrl(state.currentUrl, { skipHistory: true, forceRefresh: true });
     }
 }
 
@@ -237,7 +595,7 @@ async function handleGo() {
 
 async function handleRetry() {
     if (state.currentUrl) {
-        await loadUrl(state.currentUrl, { skipHistory: true });
+        await loadUrl(state.currentUrl, { skipHistory: true, forceRefresh: true });
     }
 }
 
@@ -265,7 +623,7 @@ function normalizeInput(input) {
 // ============================================================================
 
 async function loadUrl(url, options = {}) {
-    const { skipHistory = false } = options;
+    const { skipHistory = false, forceRefresh = false } = options;
 
     // Update URL input
     elements.urlInput.value = url;
@@ -282,12 +640,14 @@ async function loadUrl(url, options = {}) {
     // Hide error view
     hideError();
 
-    // Check cache first
-    const cached = state.getCached(url);
-    if (cached) {
-        setStatus(`Loaded from cache: ${url}`);
-        displayMarkdown(cached.markdown);
-        return;
+    // Check cache first (unless forceRefresh was requested)
+    if (!forceRefresh) {
+        const cached = state.getCached(url);
+        if (cached) {
+            setStatus(`Loaded from cache: ${url}`);
+            displayMarkdown(cached.markdown);
+            return;
+        }
     }
 
     // Start loading
@@ -295,14 +655,14 @@ async function loadUrl(url, options = {}) {
         setLoading(true, 'Submitting capture job...');
         setStatus(`Loading: ${url}`);
 
-        // Submit capture job
-        const jobId = await submitCaptureJob(url);
+        // Submit capture job (pass reuseCache: !forceRefresh)
+        const jobId = await submitCaptureJob(url, { reuseCache: !forceRefresh });
         state.currentJobId = jobId;
 
         setStatus(`Job ${jobId} submitted, waiting for completion...`);
 
         // Poll for completion
-        const result = await pollJobCompletion(jobId);
+        await pollJobCompletion(jobId);
 
         // Fetch markdown
         setLoading(true, 'Fetching markdown...');
@@ -327,13 +687,15 @@ async function loadUrl(url, options = {}) {
 // API CALLS
 // ============================================================================
 
-async function submitCaptureJob(url) {
+async function submitCaptureJob(url, options = {}) {
+    const { reuseCache = true } = options;
+    const payload = { url, reuse_cache: Boolean(reuseCache) };
     const response = await fetch('/jobs', {
         method: 'POST',
-        headers: {
+        headers: authHeaders({
             'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({ url })
+        }),
+        body: JSON.stringify(payload)
     });
 
     if (!response.ok) {
@@ -353,14 +715,16 @@ async function pollJobCompletion(jobId) {
     let attempts = 0;
 
     while (attempts < MAX_POLL_ATTEMPTS) {
-        const response = await fetch(`/jobs/${jobId}`);
+        const response = await fetch(`/jobs/${encodeURIComponent(jobId)}`, {
+            headers: authHeaders()
+        });
 
         if (!response.ok) {
             throw new Error(`Failed to fetch job status: HTTP ${response.status}`);
         }
 
         const job = await response.json();
-        const state = job.state?.toUpperCase();
+        const jobState = job.state?.toUpperCase();
 
         // Update progress
         const progress = job.progress || {};
@@ -372,18 +736,18 @@ async function pollJobCompletion(jobId) {
             updateProgress(percentage, `${done}/${total} tiles processed`);
         }
 
-        if (state === 'DONE') {
+        if (jobState === 'DONE') {
             setLoading(true, 'Capture complete!');
             return job;
         }
 
-        if (state === 'FAILED') {
+        if (jobState === 'FAILED') {
             throw new Error(job.error || 'Job failed');
         }
 
         // Update status message based on current state
-        if (state) {
-            setLoading(true, `${state}: ${done}/${total} tiles`);
+        if (jobState) {
+            setLoading(true, `${jobState}: ${done}/${total} tiles`);
         }
 
         // Wait before next poll
@@ -395,7 +759,9 @@ async function pollJobCompletion(jobId) {
 }
 
 async function fetchMarkdown(jobId) {
-    const response = await fetch(`/jobs/${jobId}/result.md`);
+    const response = await fetch(`/jobs/${encodeURIComponent(jobId)}/result.md`, {
+        headers: authHeaders()
+    });
 
     if (!response.ok) {
         // Handle 404 specifically - job might not have markdown yet
@@ -427,25 +793,27 @@ function displayMarkdown(markdown) {
 }
 
 function renderMarkdown(markdown) {
-    // Use marked.js to render markdown to HTML
-    const html = marked.parse(markdown);
+    let html = '';
+    if (typeof marked !== 'undefined' && typeof marked.parse === 'function') {
+        html = marked.parse(markdown);
+    } else {
+        html = parseMarkdownSafe(markdown, state.currentUrl);
+    }
     elements.renderedContent.innerHTML = html;
+    sanitizeRenderedDom(elements.renderedContent, state.currentUrl);
     elements.renderedContent.classList.add('markdown-body');
 }
 
 function renderRawMarkdown(markdown) {
-    // Apply syntax highlighting using Prism.highlight()
     try {
-        if (typeof Prism !== 'undefined' && Prism.languages.markdown) {
+        if (typeof Prism !== 'undefined' && Prism.languages?.markdown) {
             const highlighted = Prism.highlight(markdown, Prism.languages.markdown, 'markdown');
             elements.rawContent.innerHTML = highlighted;
         } else {
-            // Fallback if Prism isn't loaded
-            elements.rawContent.textContent = markdown;
+            elements.rawContent.innerHTML = highlightMarkdownSafe(markdown);
         }
     } catch (error) {
         console.error('Error highlighting markdown:', error);
-        // Fallback to plain text if highlighting fails
         elements.rawContent.textContent = markdown;
     }
 }
@@ -463,7 +831,6 @@ function switchView(viewName) {
         elements.renderedBtn.classList.remove('active');
         elements.rawView.classList.add('active');
         elements.renderedView.classList.remove('active');
-        // Syntax highlighting is already applied in renderRawMarkdown() using Prism.highlight()
     }
 }
 
@@ -582,9 +949,15 @@ if (document.readyState === 'loading') {
     init();
 }
 
-// Export for debugging (optional)
+// Export for debugging and testing
 window.mdwbBrowser = {
     state,
     loadUrl,
-    elements
+    elements,
+    sanitizeUrl,
+    parseMarkdownSafe,
+    sanitizeRenderedDom,
+    setApiKey,
+    getApiKey
 };
+
