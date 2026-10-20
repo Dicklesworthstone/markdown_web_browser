@@ -4,6 +4,13 @@
 
 Render any URL with deterministic Chrome-for-Testing, tile screenshots into OCR-friendly slices, and stream structured Markdown + provenance back to AI agents, web apps, and automation pipelines.
 
+Current qualification limits are tracked in [PROJECT_STATUS_AUDIT.md](PROJECT_STATUS_AUDIT.md).
+The 95% accuracy, protected-site, throughput and rolling production-readiness
+claims below remain goals pending the named live gates. The configured DeepInfra
+endpoint currently reports Gemma for olmOCR requests, matching a
+[recorded deprecation notice](https://github.com/allenai/olmocr/issues/460);
+manifests distinguish requested and served models and flag substitutions.
+
 **Two ways to use it:**
 1. **🌐 Browser UI** (`/browser`) - Interactive web browsing with navigation history, address bar, and dual markdown views
 2. **⚙️ CLI + API** - Programmatic capture for automation, batch processing, and agent workflows
@@ -312,13 +319,14 @@ mdwb fetch https://finviz.com --watch
 1. **Install prerequisites**
    - Python 3.13, uv ≥0.8, and the system deps Playwright requires.
    - Install system dependencies: `sudo apt-get install libvips-dev` (Ubuntu/Debian) or `brew install vips` (macOS).
-   - Install the CfT build Playwright expects: `playwright install chromium --with-deps --channel=cft`.
-   - Create/sync the env: `uv venv --python 3.13 && uv sync`.
+   - Sync the Python3.13 environment: `uv sync --python 3.13 --extra dev`.
+   - Install bundled Chromium/system dependencies with `uv run playwright install chromium --with-deps`. Separately install the exact [Chrome for Testing](https://googlechromelabs.github.io/chrome-for-testing/) build selected by `CFT_VERSION` and set `CFT_EXECUTABLE`; the capture adapter verifies the observed build. On Linux x86_64, `install.sh` does this for the default `chrome-130.0.6723.69` pin (`python -m scripts.install_helpers install-cft`), checking the archive against the same SHA-256 as CI.
    - Optional (GPU/olmOCR power users): run `scripts/setup_olmocr_cuda12.sh` to provision CUDA 12.6 + the local vLLM toolchain described in `docs/olmocr_cli_tool_documentation.md`.
 2. **Configure environment**
-   - Copy `.env.example` → `.env`.
+   - Create `.env` from `.env.example` only if it does not exist; preserve existing configuration.
    - Fill in OCR creds, `API_BASE_URL`, CfT label/build, screenshot style hash overrides, webhook secret, etc.
    - Settings are loaded exclusively via `python-decouple` (`app/settings.py`), so keep `.env` private.
+   - Capture/webhook destinations default to public networks. Private fixtures or intranet sites require server-owned network grants; see [network configuration](docs/config.md#api-access).
 3. **Run the API/UI**
    - `scripts/dev_run.sh` (defaults to uvicorn with reload). Open `http://localhost:8000` for the HTMX/Alpine interface.
    - For production-style smoke, flip to Granian: `SERVER_IMPL=granian UVICORN_RELOAD=false HOST=0.0.0.0 PORT=8000 scripts/dev_run.sh --workers 4 --granian-runtime-threads 2`. This wraps `scripts/run_server.py`, so the same flags work in CI or systemd units.
@@ -375,38 +383,54 @@ The CLI reads `API_BASE_URL` + `MDWB_API_KEY` from `.env`; override with `--api-
 Both helpers reuse the CLI’s auth + HTTP plumbing, accept the same `--api-base/--http2` flags, fall back to existing jobs when you only need post-processing, and now support `--out` so automations can ingest the results directly.
 
 ## Prerequisites & environment
-- **Chrome for Testing pin:** Set `CFT_VERSION` + `CFT_LABEL` in `.env` so manifests and ops dashboards stay consistent. Re-run `playwright install` whenever the label/build changes.
+- **Chrome for Testing pin:** Install the exact `CFT_VERSION` build from [official CfT artifacts](https://github.com/GoogleChromeLabs/chrome-for-testing). Set `CFT_EXECUTABLE` to its executable, or on Linux place it at `~/.cache/mdwb/cft/<four-part-build>/chrome-linux64/chrome`. The capture launcher refuses missing or mismatched builds before OCR; stock Chrome is a separate, explicitly unqualified channel. `.env` remains operator-owned; the installer only removes the colored log lines that installers before 2026-10-14 wrote into it (and resets the `CFT_VERSION` they garbled to the pin), keeping the original as `.env.bak-legacy-cft-<timestamp>`.
 - **Transport + viewport:** Defaults (`PLAYWRIGHT_TRANSPORT=cdp`, viewport 1280×2000, DPR 2) live in `app/settings.py` and must align with PLAN §§3, 19.
 - **OCR credentials:** `OLMOCR_SERVER`, `OLMOCR_API_KEY`, and `OLMOCR_MODEL` are required unless you point at `OCR_LOCAL_URL`.
 - **Warning log + blocklist:** Keep `WARNING_LOG_PATH` and `BLOCKLIST_PATH` writable so scroll/overlay incidents are persisted (`docs/config.md` documents every field).
-- **System packages:** Install libvips 8.15+ so the pyvips-based tiler works (`sudo apt-get install libvips` on Debian/Ubuntu, `brew install vips` on macOS). `scripts/run_checks.sh` checks for `pyvips` and fails fast with install instructions unless you explicitly set `SKIP_LIBVIPS_CHECK=1` (for targeted CLI/unit runs on machines without libvips).
+- **System packages:** Install libvips 8.15+ so the pyvips-based tiler works (`sudo apt-get install libvips` on Debian/Ubuntu, `brew install vips` on macOS). `scripts/run_checks.sh` requires working pyvips and browser installations; its preflight cannot be skipped.
 
 ## Testing & quality gates
 Run these before pushing or shipping capture-facing changes:
 
 ```bash
-uv run ruff check --fix --unsafe-fixes
-uvx ty check
-npx playwright test --config=playwright.config.mjs  # or PLAYWRIGHT_BIN=/path/to/playwright-test …
+uv sync --python 3.13 --group dev
+./scripts/run_checks.sh
 ```
 
-`./scripts/run_checks.sh` wraps the same sequence for CI. Set `PLAYWRIGHT_BIN=/path/to/playwright-test`
-if you need to invoke the Node-based runner; otherwise the script prefers `npx playwright test --config=playwright.config.mjs`
-(which inherits the defaults from PLAN/AGENTS: viewport 1280×2000, DPR 2, reduced motion, light scheme, mask selectors, CDP/BiDi transport via `PLAYWRIGHT_TRANSPORT`). When Node Playwright isn’t installed it falls back to `uv run playwright test` and prints a warning if the Python CLI lacks `test`.
-When you already know libvips isn’t available in a minimal container, export `SKIP_LIBVIPS_CHECK=1` to bypass the preflight warning. Optional toggles inside `scripts/run_checks.sh`:
+The wrapper runs Ruff lint and formatting checks, type-checks against the actual
+project environment, performs real browser/libvips preflight, and runs all of
+`tests/` with a failing exit status on the first failure. Native Python Playwright
+tests exercise capture, animation freezing, masks, viewport sweeps, and both
+Markdown viewers. Python Playwright has no `test` subcommand; the old fallback
+did not execute a smoke test.
+
+For focused capture checks:
+
+```bash
+uv run --python 3.13 pytest tests/test_full_capture.py tests/test_scroll_policy.py tests/test_browser_ui.py -x
+```
+
+Observed browser versions are recorded separately from configured pins. These
+checks do not establish CfT pin, BiDi, hosted OCR quality, or production readiness.
+The generated Markdown guard runs fresh captures through the configured OCR
+provider when explicitly enabled. It preserves the original2% maximum Markdown
+diff budget, verifies frozen input/baseline digests, actual capture/model identity
+and tile SSIM, and retains the candidate bundle. A passing default run with this
+suite disabled supplies no generated-quality qualification.
+Optional configuration:
 
 - `MDWB_CHECK_METRICS=1` (optionally `CHECK_METRICS_TIMEOUT=<seconds>`) appends the Prometheus health check after pytest/Playwright.
-- `MDWB_RUN_E2E=1` runs the lightweight placeholder suite in `tests/test_e2e_small.py` so CI can keep a fast E2E sentinel without invoking FlowLogger.
-- `MDWB_RUN_E2E_RICH=1` runs the full FlowLogger scenarios in `tests/test_e2e_cli.py`; transcript artifacts are copied to `tmp/rich_e2e_cli/` (override via `RICH_E2E_ARTIFACT_DIR=/path/to/dir`) so operators can review the panels/tables/progress output without hunting through pytest temp dirs.
-- `MDWB_RUN_E2E_GENERATED=1` runs the generative guardrail suite (`tests/test_e2e_generated.py`). Point `MDWB_GENERATED_E2E_CASES=/path/to/cases.json` at a bespoke cases file when you need to refresh or extend the Markdown baselines.
+- `MDWB_RUN_E2E_GENERATED=1 MDWB_GENERATED_E2E_CASES=/path/to/cases.json ./scripts/run_checks.sh` enables the fresh generated guardrail within the full required suite. Missing/empty cases fail instead of skipping. See [the case contract](docs/config.md#generated-capture-cases); saved expected output is never accepted as a fresh candidate.
+- `PYTEST_JUNIT_PATH` and `PYTEST_SUMMARY_PATH` choose the report destinations.
 
-Grab the resulting `tmp/rich_e2e_cli/*.log|*.html` files in CI for postmortems.
+The small E2E suite now exercises real API/SQLite cached artifacts and a forbidden-capture
+negative control. It proves that path's integration contract, without a hosted OCR claim.
 
 - The bundled pytest targets now include the store/manifest persistence suite (`tests/test_store_manifest.py`, `tests/test_manifest_contract.py`),
   the Prometheus CLI health checks (`tests/test_check_metrics.py`), and the ops regressions for `show_latest_smoke`/`update_smoke_pointers` in addition
   to the CLI coverage. This keeps RunRecord fields, smoke pointer tooling, and metrics hooks under CI without needing a live API server.
 
-- Playwright defaults to the Chrome for Testing build. Leave `PLAYWRIGHT_CHANNEL` unset (or set it to `cft`) so local smoke runs match the capture pipeline; if you have to fall back to stock Chromium, set `PLAYWRIGHT_CHANNEL=chromium` or use a comma-separated preference such as `PLAYWRIGHT_CHANNEL="chromium,cft"`. Likewise, keep `PLAYWRIGHT_TRANSPORT=cdp` unless you are explicitly exercising WebDriver BiDi—when you do, a value like `PLAYWRIGHT_TRANSPORT="bidi,cdp"` makes the preferred/fallback order obvious to anyone reading CI metadata.
+- The launcher records the observed build, channel and transport. `bidi` alone is refused; `bidi,cdp` uses CDP. Native-channel fallbacks cannot reuse artifacts under an unexercised CfT build identity; native fallback cache reuse remains part of the cache work. Complete browser/transport qualification is tracked in `markdown_web_browser-7ru.3`.
 
 - Every `run_checks` invocation now emits `tmp/pytest_report.xml` and `tmp/pytest_summary.json`
   (override with `PYTEST_JUNIT_PATH`/`PYTEST_SUMMARY_PATH`). The JSON digest lists totals and the first few

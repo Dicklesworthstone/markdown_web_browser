@@ -5,14 +5,13 @@ from __future__ import annotations
 
 import argparse
 import json
-import random
 import re
 import shutil
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from scripts import olmocr_cli, compute_slo
 
@@ -77,7 +76,7 @@ def _ensure_date_dir(date_str: str) -> Path:
     return target
 
 
-def _percentile(values: list[float], pct: float) -> float | None:
+def _percentile(values: Sequence[float], pct: float) -> float | None:
     if not values:
         return None
     sequence = sorted(values)
@@ -214,65 +213,28 @@ def run_category(
     return results
 
 
-def run_category_dry(category: Category, out_dir: Path, seed: int | None = None) -> list[RunRecord]:
-    rng = random.Random(seed)
-    results: list[RunRecord] = []
-    category_dir = out_dir / category.name
-    category_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(timezone.utc).strftime("%H%M%S")
-
-    for url_entry in category.urls:
-        slug = _slug_from_url(url_entry)
-        url = url_entry["url"]
-        job_id = f"dry-{category.name}-{slug}-{stamp}"
-        job_dir = category_dir / f"{slug}-{stamp}"
-        job_dir.mkdir(parents=True, exist_ok=True)
-
-        capture_ms = int(rng.uniform(6_000, 18_000))
-        ocr_ms = int(rng.uniform(8_000, 22_000))
-        stitch_ms = int(rng.uniform(500, 2_000))
-        manifest: dict[str, Any] = {
-            "job_id": job_id,
-            "url": url,
-            "timings": {
-                "capture_ms": capture_ms,
-                "ocr_ms": ocr_ms,
-                "stitch_ms": stitch_ms,
-                "total_ms": capture_ms + ocr_ms + stitch_ms,
-            },
-            "environment": {
-                "cft_version": "dry-run",
-                "playwright_channel": "cft",
-            },
-            "warnings": [],
-            "blocklist_hits": {},
-        }
-        (job_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-        (job_dir / "out.md").write_text(
-            "# Dry Run\n\nNo real capture was executed.", encoding="utf-8"
-        )
-        (job_dir / "links.json").write_text("[]", encoding="utf-8")
-
-        timings_value = manifest.get("timings")
-        if not isinstance(timings_value, dict):
-            timings_value = None
-
-        results.append(
-            RunRecord(
-                category=category.name,
-                budget_ms=category.budget_ms,
-                slug=slug,
-                url=url,
-                job_id=job_id,
-                run_dir=job_dir,
-                manifest_path=job_dir / "manifest.json",
-                capture_ms=capture_ms,
-                total_ms=capture_ms + ocr_ms + stitch_ms,
-                timings=timings_value,
-            )
-        )
-
-    return results
+def _production_entries(raw: object) -> list[dict[str, Any]]:
+    """Exclude explicitly synthetic records, preserving their existing artifacts."""
+    if not isinstance(raw, list) or not all(isinstance(entry, dict) for entry in raw):
+        raise ValueError("Smoke manifest index must be an object list")
+    entries: list[dict[str, Any]] = []
+    for entry in raw:
+        job_id = entry.get("job_id")
+        if isinstance(job_id, str) and job_id.startswith("dry-"):
+            continue
+        if entry.get("dry_run") is True or entry.get("synthetic") is True:
+            continue
+        manifest_name = entry.get("manifest")
+        if isinstance(manifest_name, str) and Path(manifest_name).is_file():
+            manifest = json.loads(Path(manifest_name).read_text(encoding="utf-8"))
+            if isinstance(manifest, dict):
+                environment = manifest.get("environment")
+                if manifest.get("dry_run") is True or manifest.get("synthetic") is True:
+                    continue
+                if isinstance(environment, dict) and environment.get("cft_version") == "dry-run":
+                    continue
+        entries.append(entry)
+    return entries
 
 
 def write_manifest_index(date_dir: Path, records: list[RunRecord]) -> Path:
@@ -310,7 +272,9 @@ def write_slo_outputs(
 ) -> tuple[Path, Path]:
     if not manifest_index.exists():
         raise FileNotFoundError(f"Manifest index not found: {manifest_index}")
-    entries: list[dict[str, Any]] = json.loads(manifest_index.read_text(encoding="utf-8"))
+    entries = _production_entries(json.loads(manifest_index.read_text(encoding="utf-8")))
+    if not entries:
+        raise ValueError("Smoke SLO output requires real capture records")
     summary = compute_slo.compute_slo_summary(entries, budget_map=budget_map)
     payload = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -401,6 +365,11 @@ def write_latest_metrics(date_dir: Path, stats: list[dict[str, Any]]) -> Path:
 
 
 def update_latest_markers(date_dir: Path) -> None:
+    index_path = date_dir / "manifest_index.json"
+    raw = json.loads(index_path.read_text(encoding="utf-8"))
+    entries = _production_entries(raw)
+    if not entries or len(entries) != len(raw):
+        raise ValueError("Latest smoke pointers require only real capture records")
     marker = PRODUCTION_ROOT / "latest.txt"
     marker.write_text(f"{date_dir.name}\n", encoding="utf-8")
     copies = {
@@ -442,7 +411,7 @@ def update_weekly_summary(config: dict[str, Any], window_days: int = 7) -> None:
         index_path = history_dir / "manifest_index.json"
         if not index_path.exists():
             continue
-        entries: list[dict[str, Any]] = json.loads(index_path.read_text(encoding="utf-8"))
+        entries = _production_entries(json.loads(index_path.read_text(encoding="utf-8")))
         for entry in entries:
             metrics.setdefault(entry["category"], []).append(entry)
 
@@ -460,20 +429,20 @@ def update_weekly_summary(config: dict[str, Any], window_days: int = 7) -> None:
         ]
         total_values = [entry["total_ms"] for entry in entries if entry.get("total_ms") is not None]
         seam_counts = [
-            entry.get("seam_marker_count")
+            count
             for entry in entries
-            if isinstance(entry.get("seam_marker_count"), (int, float))
+            if isinstance(count := entry.get("seam_marker_count"), (int, float))
         ]
         seam_hash_counts = [
-            entry.get("seam_hash_count")
+            count
             for entry in entries
-            if isinstance(entry.get("seam_hash_count"), (int, float))
+            if isinstance(count := entry.get("seam_hash_count"), (int, float))
         ]
         seam_event_counts: list[float] = []
         for entry in entries:
-            summary = entry.get("seam_markers_summary")
-            if isinstance(summary, dict):
-                event_value = summary.get("event_count")
+            seam_summary = entry.get("seam_markers_summary")
+            if isinstance(seam_summary, dict):
+                event_value = seam_summary.get("event_count")
                 if isinstance(event_value, (int, float)):
                     seam_event_counts.append(float(event_value))
                     continue
@@ -565,11 +534,7 @@ def update_weekly_slo_summary(budget_map: Mapping[str, int], window_days: int = 
         manifest_path = history_dir / "manifest_index.json"
         if not manifest_path.exists():
             continue
-        records = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if isinstance(records, list):
-            entries.extend(records)
-    if not entries:
-        return
+        entries.extend(_production_entries(json.loads(manifest_path.read_text(encoding="utf-8"))))
     summary = compute_slo.compute_slo_summary(entries, budget_map=dict(budget_map))
     payload = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -592,10 +557,7 @@ def main() -> None:
         "--dry-run",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="Skip API calls and emit synthetic records.",
-    )
-    parser.add_argument(
-        "--seed", type=int, help="Optional RNG seed for --dry-run mode (default deterministic)"
+        help="Preview selected URLs and budgets without API calls or filesystem changes.",
     )
     parser.add_argument(
         "--category",
@@ -615,22 +577,25 @@ def main() -> None:
         if missing:
             raise SystemExit(f"Unknown categories requested: {', '.join(sorted(missing))}")
     budget_map = {cat.name: cat.budget_ms for cat in categories}
+    if args.dry_run:
+        print(f"Dry-run preview for {run_date}; no capture or qualification was performed.")
+        for category in categories:
+            for url_entry in category.urls:
+                print(f"{category.name}: {url_entry['url']} (p95 budget {category.budget_ms} ms)")
+        return
     settings = olmocr_cli.load_settings()
     date_dir = _ensure_date_dir(run_date)
 
     all_records: list[RunRecord] = []
     for category in categories:
-        if args.dry_run:
-            records = run_category_dry(category, date_dir, seed=args.seed or 0)
-        else:
-            records = run_category(
-                category,
-                date_dir,
-                settings=settings,
-                http2=args.http2,
-                poll_interval=args.poll_interval,
-                timeout_s=args.timeout,
-            )
+        records = run_category(
+            category,
+            date_dir,
+            settings=settings,
+            http2=args.http2,
+            poll_interval=args.poll_interval,
+            timeout_s=args.timeout,
+        )
         all_records.extend(records)
 
     manifest_index = write_manifest_index(date_dir, all_records)

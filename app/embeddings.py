@@ -77,14 +77,13 @@ def _validate_top_k(top_k: int) -> None:
 
 
 def _validate_finite_nonzero(vector: Sequence[float], *, expected_dim: int | None = None) -> list[float]:
-    if not vector:
-        raise ValueError("Embedding vector must not be empty")
-    if expected_dim is not None and len(vector) != expected_dim:
-        raise ValueError(f"Expected embedding length {expected_dim}, received {len(vector)}")
-    if expected_dim is None and len(vector) not in SUPPORTED_EMBEDDING_DIMS:
+    length = len(vector)
+    if expected_dim is not None and length != expected_dim:
+        raise ValueError(f"Expected embedding length {expected_dim}, received {length}")
+    if expected_dim is None and length not in SUPPORTED_EMBEDDING_DIMS:
         raise ValueError(
-            f"section embedding length must match EMBEDDING_DIM ({EMBEDDING_DIM}) "
-            f"or supported dimension {SUPPORTED_EMBEDDING_DIMS}; got {len(vector)}"
+            f"Expected embedding length {EMBEDDING_DIM} or supported dimension "
+            f"{SUPPORTED_EMBEDDING_DIMS}; got {length}"
         )
     floats: list[float] = []
     sq_sum = 0.0

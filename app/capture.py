@@ -3,34 +3,43 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import asynccontextmanager
 import hashlib
 import json
 import logging
+import os
 import re
+import sys
 import time
 from dataclasses import dataclass, field
+from html import escape
 from importlib import metadata
 from pathlib import Path
-from typing import Any, AsyncGenerator, Callable, List, Optional, Sequence
+from typing import Any, Callable, List, Optional, Sequence
 
 from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 
+from app.auth import current_owner
 from app.blocklist import BlocklistConfig, apply_blocklist, cached_blocklist
 from app.capture_warnings import (
     CaptureWarningEntry,
     build_sweep_warning,
     collect_capture_warnings,
 )
+from app.egress import EgressDenied, EgressProxy, network_policy, validate_network_url
 from app.schemas import validate_profile_id
-from app.settings import WarningSettings, get_settings
-from app.tiler import TileSlice, align_cross_sweep_overlap, slice_into_tiles, validate_tiles
+from app.settings import BrowserSettings, WarningSettings, get_settings
+from app.tiler import (
+    TileSlice,
+    align_cross_sweep_overlap,
+    set_tile_overlap,
+    slice_into_tiles,
+    validate_tiles,
+)
 
 LOGGER = logging.getLogger(__name__)
+CAPTURE_PIPELINE_VERSION = "uniform-tiles-css-fonts-egress-v4"
 
-_DEFAULT_ASYNC_PLAYWRIGHT = async_playwright
 _VERSION_NUM_RE = re.compile(r"(\d+\.\d+\.\d+(?:\.\d+)?)")
-_KNOWN_TRANSPORTS = frozenset({"cdp", "bidi", "webdriverbidi"})
 
 
 class BrowserPinMismatchError(RuntimeError, ValueError):
@@ -39,15 +48,6 @@ class BrowserPinMismatchError(RuntimeError, ValueError):
 
 class UnsupportedTransportError(RuntimeError, ValueError):
     """Raised when a requested browser transport protocol is unsupported or unavailable."""
-
-
-def _emit_stage(config: CaptureConfig, stage: str, info: dict[str, Any] | None = None) -> None:
-    callback = getattr(config, "on_stage", None)
-    if callable(callback):
-        try:
-            callback(stage, info)
-        except Exception:
-            pass
 
 
 @dataclass(slots=True)
@@ -76,10 +76,11 @@ class CaptureConfig:
     cft_label: str | None = None
     executable_path: Path | str | None = None
     enforce_version_pin: bool | None = None
-    use_browser_pool: bool = True
-    on_stage: Callable[[str, dict[str, Any] | None], None] | None = field(
-        default=None, repr=False, compare=False
-    )
+    stage_callback: Callable[[str, int | None, int | None], None] | None = None
+
+    def report_stage(self, stage: str, done: int | None = None, total: int | None = None) -> None:
+        if self.stage_callback:
+            self.stage_callback(stage, done, total)
 
 
 @dataclass(slots=True)
@@ -154,6 +155,16 @@ class CaptureManifest:
     fallback_chain: list[str] = field(default_factory=list)
     hardware_capabilities: dict[str, object] | None = None
     ocr_ms: int | None = None
+    selected_ocr_model: str | None = None
+    served_ocr_models: list[str] = field(default_factory=list)
+    request_options: dict[str, object] = field(default_factory=dict)
+    capture_pipeline_version: str = CAPTURE_PIPELINE_VERSION
+    configured_cft_version: str | None = None
+    cft_pin_verified: bool = False
+    configured_screenshot_style_hash: str | None = None
+    requested_browser_transport: str | None = None
+    requested_browser_channels: str | None = None
+    fontconfig_sha256: str | None = None
     stitch_ms: int | None = None
     ocr_batches: list[dict[str, object]] = field(default_factory=list)
     ocr_quota: dict[str, object] | None = None
@@ -171,6 +182,7 @@ class CaptureManifest:
     embedding_model: str | None = None
     embedding_dim: int | None = None
     sections_embedded: int | None = None
+    network_policy: dict[str, object] = field(default_factory=dict)
 
     def metadata_checklist(self) -> dict[str, Any]:
         """Return the mandatory 6-item capture metadata checklist."""
@@ -206,56 +218,23 @@ class CaptureResult:
     dom_overlay: list[dict[str, object]] = field(default_factory=list)
 
 
-def resolve_browser_transport(
-    requested: str | None,
-    *,
-    supported: Sequence[str] = ("cdp",),
-) -> str:
-    """Resolve and validate browser transport from a single name or fallback preference list.
+def resolve_browser_transport(transport: str) -> str:
+    """Report the transport the launcher will actually exercise.
 
-    Never silently reports an unexercised transport: if the requested transport(s)
-    are unknown or none is supported by the active browser launcher, raises
-    :class:`UnsupportedTransportError`.
+    BiDi-only requests are rejected. A preference list may name bidi only when cdp
+    is also present, and the exercised transport is then cdp.
     """
-    raw = (requested or "cdp").strip()
-    if not raw:
-        raise UnsupportedTransportError("browser_transport cannot be empty")
-    candidates: list[str] = []
-    for part in raw.split(","):
-        token = part.strip().lower()
-        if not token:
-            continue
-        if token == "webdriverbidi":
-            token = "bidi"
-        if token not in _KNOWN_TRANSPORTS:
-            raise UnsupportedTransportError(
-                f"Unsupported browser_transport {part.strip()!r}; supported protocols: cdp, bidi"
-            )
-        if token not in candidates:
-            candidates.append(token)
-    if not candidates:
-        raise UnsupportedTransportError(f"Unsupported browser_transport {requested!r}")
 
-    supported_norm = {
-        ("bidi" if s.strip().lower() == "webdriverbidi" else s.strip().lower())
-        for s in supported
-        if s and s.strip()
-    }
-    for idx, candidate in enumerate(candidates):
-        if candidate in supported_norm:
-            if idx > 0:
-                LOGGER.warning(
-                    "Browser transport %r unavailable; falling back to %r from preference list %r",
-                    candidates[0],
-                    candidate,
-                    raw,
-                )
-            return candidate
-
-    raise UnsupportedTransportError(
-        f"Requested browser_transport {raw!r} is not supported by the active Playwright launcher "
-        f"(supported: {sorted(supported_norm)}). Specify 'cdp' or a fallback list such as 'bidi,cdp'."
-    )
+    preferences = [value.strip().lower() for value in transport.split(",") if value.strip()]
+    if not preferences or any(value not in {"cdp", "bidi"} for value in preferences):
+        raise UnsupportedTransportError(
+            "Browser transport must be cdp or a cdp/bidi preference list"
+        )
+    if "cdp" not in preferences:
+        raise UnsupportedTransportError(
+            "BiDi is unsupported by this Python capture adapter; select cdp"
+        )
+    return "cdp"
 
 
 def format_cft_version(raw_version: str | None, fallback: str = "") -> str:
@@ -306,11 +285,17 @@ def verify_browser_build(
 
 
 def build_user_agent_for_version(browser_version: str | None) -> str:
-    """Build a realistic User-Agent string matching the actual launched Chrome build."""
+    """User-Agent for the browser that was actually launched, including its platform."""
     match = _VERSION_NUM_RE.search(str(browser_version or ""))
     version_token = match.group(1) if match else "130.0.0.0"
+    if sys.platform == "linux":
+        platform_token = "X11; Linux x86_64"
+    elif sys.platform == "darwin":
+        platform_token = "Macintosh; Intel Mac OS X 10_15_7"
+    else:
+        platform_token = "Windows NT 10.0; Win64; x64"
     return (
-        "Mozilla/5.0 (X11; Linux x86_64) "
+        f"Mozilla/5.0 ({platform_token}) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         f"Chrome/{version_token} Safari/537.36"
     )
@@ -356,375 +341,96 @@ def compute_effective_style_hash(
     return f"{base_hash}-{digest[:8]}"
 
 
-class BrowserPool:
-    """Bounded browser/context pool enforcing MAX_CONCURRENT_BROWSERS and crash recycling."""
-
-    def __init__(self, max_concurrent: int = 4) -> None:
-        self._max_concurrent = max(1, int(max_concurrent))
-        self._loop_locks: dict[int, asyncio.Lock] = {}
-        self._loop_semaphores: dict[int, tuple[int, asyncio.Semaphore]] = {}
-        self._entries: dict[tuple[int, str, str, int, int], tuple[Any, Browser]] = {}
-        self._launch_count = 0
-        self._recycle_count = 0
-
-    @property
-    def max_concurrent(self) -> int:
-        return self._max_concurrent
-
-    @property
-    def launch_count(self) -> int:
-        return self._launch_count
-
-    @property
-    def recycle_count(self) -> int:
-        return self._recycle_count
-
-    def configure(self, max_concurrent: int) -> None:
-        self._max_concurrent = max(1, int(max_concurrent))
-
-    def _get_lock(self, loop_id: int) -> asyncio.Lock:
-        lock = self._loop_locks.get(loop_id)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._loop_locks[loop_id] = lock
-        return lock
-
-    def _get_semaphore(self, loop_id: int, limit: int) -> asyncio.Semaphore:
-        target = max(1, int(limit))
-        existing = self._loop_semaphores.get(loop_id)
-        if existing is None or existing[0] != target:
-            sem = asyncio.Semaphore(target)
-            self._loop_semaphores[loop_id] = (target, sem)
-            return sem
-        return existing[1]
-
-    @staticmethod
-    def _is_browser_healthy(browser: Browser | None) -> bool:
-        if browser is None:
-            return False
-        is_connected = getattr(browser, "is_connected", None)
-        if callable(is_connected):
-            try:
-                return bool(is_connected())
-            except Exception:
-                return False
-        return True
-
-    async def _discard_entry(self, key: tuple[int, str, str, int, int]) -> None:
-        entry = self._entries.pop(key, None)
-        if entry is None:
-            return
-        pw_instance, browser = entry
-        try:
-            await asyncio.shield(browser.close())
-        except BaseException:
-            pass
-        stop_fn = getattr(pw_instance, "stop", None)
-        if callable(stop_fn):
-            try:
-                await asyncio.shield(stop_fn())
-            except BaseException:
-                pass
-
-    @asynccontextmanager
-    async def acquire_browser(
-        self,
-        *,
-        channel: str,
-        executable_path: Path | str | None = None,
-        viewport_width: int = 1280,
-        viewport_height: int = 2000,
-        max_concurrent: int | None = None,
-    ) -> AsyncGenerator[Browser, None]:
-        loop = asyncio.get_running_loop()
-        loop_id = id(loop)
-        limit = max(1, int(max_concurrent or self._max_concurrent))
-        sem = self._get_semaphore(loop_id, limit)
-        lock = self._get_lock(loop_id)
-        key = (
-            loop_id,
-            _normalize_channel(channel),
-            str(executable_path or ""),
-            int(viewport_width),
-            int(viewport_height),
-        )
-
-        async with sem:
-            async with lock:
-                existing = self._entries.get(key)
-                if existing is not None:
-                    _, cached_browser = existing
-                    if not self._is_browser_healthy(cached_browser):
-                        self._recycle_count += 1
-                        await self._discard_entry(key)
-                        existing = None
-                if existing is None:
-                    pw_cm = async_playwright()
-                    pw_instance = await pw_cm.start()
-                    try:
-                        try:
-                            browser = await _launch_browser(
-                                pw_instance,
-                                channel,
-                                viewport_width=viewport_width,
-                                viewport_height=viewport_height,
-                                executable_path=executable_path,
-                            )
-                        except TypeError:
-                            browser = await _launch_browser(pw_instance, channel)
-                    except BaseException:
-                        stop_fn = getattr(pw_instance, "stop", None)
-                        if callable(stop_fn):
-                            try:
-                                await stop_fn()
-                            except BaseException:
-                                pass
-                        raise
-                    self._launch_count += 1
-                    self._entries[key] = (pw_instance, browser)
-                else:
-                    browser = existing[1]
-
-            try:
-                yield browser
-            finally:
-                if not self._is_browser_healthy(browser):
-                    async with lock:
-                        self._recycle_count += 1
-                        await self._discard_entry(key)
-
-    async def close_all(self) -> None:
-        for key in list(self._entries.keys()):
-            await self._discard_entry(key)
-
-
-_BROWSER_POOL = BrowserPool()
-
-
-def get_browser_pool() -> BrowserPool:
-    """Return the process-wide bounded BrowserPool instance."""
-    return _BROWSER_POOL
+def _pinned_executable(settings_browser: Any) -> Path | None:
+    executable = getattr(settings_browser, "cft_executable", None)
+    if executable is None:
+        executable = getattr(settings_browser, "executable_path", None)
+    return executable
 
 
 async def capture_tiles(config: CaptureConfig) -> CaptureResult:
     """Run a deterministic viewport sweep and return OCR-ready tiles."""
 
     settings = get_settings()
+    validate_network_url(config.url)
     start = time.perf_counter()
-
-    playwright_ver = _validate_playwright_version()
-    requested_transport = config.browser_transport or settings.browser.browser_transport
-    effective_transport = resolve_browser_transport(requested_transport)
-
-    configured_cft_version = config.cft_version or settings.browser.cft_version
-    configured_cft_label = config.cft_label or settings.browser.cft_label
-    enforce_pin = (
-        config.enforce_version_pin
-        if config.enforce_version_pin is not None
-        else getattr(settings.browser, "enforce_version_pin", False)
-    )
-    executable_path = (
-        config.executable_path
-        if config.executable_path is not None
-        else getattr(settings.browser, "executable_path", None)
-    )
-    max_concurrent = getattr(settings.browser, "max_concurrent_browsers", 4)
 
     blocklist_cfg = cached_blocklist(str(settings.browser.blocklist_path))
     warning_cfg = settings.warnings
-
-    _emit_stage(config, "BROWSER_STARTING", {"done": 0, "total": 0})
-
     extra_artifacts: dict[str, Any] = {"abandoned_tiles": [], "dom_overlay": []}
 
-    async def _execute_with_browser(browser: Browser) -> tuple[
-        List[TileSlice],
-        SweepStats,
-        str,
-        dict[str, int],
-        list[CaptureWarningEntry],
-        bytes | None,
-        list[str],
-        list[dict[str, object]],
-        str,
-    ]:
-        raw_browser_ver = getattr(browser, "version", None)
-        observed_ver_str = str(raw_browser_ver) if isinstance(raw_browser_ver, str) else ""
-        effective_cft_version = verify_browser_build(
-            observed_version=observed_ver_str,
-            configured_version=configured_cft_version,
-            enforce_pin=bool(enforce_pin),
+    async with (
+        EgressProxy(network_policy(settings, owner=current_owner())) as egress,
+        async_playwright() as playwright,
+    ):
+        config.report_stage("BROWSER_STARTING")
+        browser, actual_channel, actual_transport = await _launch_browser(
+            playwright,
+            settings.browser.playwright_channel,
+            expected_build=settings.browser.cft_version,
+            transport=settings.browser.browser_transport,
+            executable=_pinned_executable(settings.browser),
+            fontconfig_file=getattr(settings.browser, "fontconfig_file", None),
+            proxy_url=egress.url,
         )
-        context: BrowserContext | None = None
-        storage_state_path: Path | None = None
-        extra_artifacts["abandoned_tiles"] = []
-        extra_artifacts["dom_overlay"] = []
+        actual_build = browser.version
+        context = None
+        storage_state_path = None
         try:
             context, storage_state_path = await _build_context(
                 browser,
                 config,
                 profiles_root=settings.storage.profiles_root,
             )
-            try:
-                (
-                    tiles_out,
-                    sweep_stats_out,
-                    user_agent_out,
-                    blocklist_hits_out,
-                    warnings_out,
-                    dom_snapshot_out,
-                    validation_failures_out,
-                    seam_markers_out,
-                ) = await _perform_viewport_sweeps(
-                    context,
-                    config,
-                    viewport_overlap_px=settings.browser.viewport_overlap_px,
-                    tile_overlap_px=settings.browser.tile_overlap_px,
-                    target_long_side_px=config.long_side_px or settings.browser.long_side_px,
-                    settle_ms=settings.browser.scroll_settle_ms,
-                    max_steps=settings.browser.max_viewport_sweeps,
-                    mask_selectors=settings.browser.screenshot_mask_selectors,
-                    shrink_retry_limit=settings.browser.shrink_retry_limit,
-                    blocklist_config=blocklist_cfg,
-                    warning_settings=warning_cfg,
-                    _artifacts_out=extra_artifacts,
-                )
-            except TypeError:
-                (
-                    tiles_out,
-                    sweep_stats_out,
-                    user_agent_out,
-                    blocklist_hits_out,
-                    warnings_out,
-                    dom_snapshot_out,
-                    validation_failures_out,
-                    seam_markers_out,
-                ) = await _perform_viewport_sweeps(
-                    context,
-                    config,
-                    viewport_overlap_px=settings.browser.viewport_overlap_px,
-                    tile_overlap_px=settings.browser.tile_overlap_px,
-                    target_long_side_px=config.long_side_px or settings.browser.long_side_px,
-                    settle_ms=settings.browser.scroll_settle_ms,
-                    max_steps=settings.browser.max_viewport_sweeps,
-                    mask_selectors=settings.browser.screenshot_mask_selectors,
-                    shrink_retry_limit=settings.browser.shrink_retry_limit,
-                    blocklist_config=blocklist_cfg,
-                    warning_settings=warning_cfg,
-                )
-            return (
-                tiles_out,
-                sweep_stats_out,
-                user_agent_out,
-                blocklist_hits_out,
-                warnings_out,
-                dom_snapshot_out,
-                validation_failures_out,
-                seam_markers_out,
-                effective_cft_version,
+            (
+                tiles,
+                sweep_stats,
+                user_agent,
+                blocklist_hits,
+                warnings,
+                dom_snapshot,
+                validation_failures,
+                seam_markers,
+            ) = await _perform_viewport_sweeps(
+                context,
+                config,
+                viewport_overlap_px=settings.browser.viewport_overlap_px,
+                tile_overlap_px=settings.browser.tile_overlap_px,
+                target_long_side_px=config.long_side_px or settings.browser.long_side_px,
+                settle_ms=settings.browser.scroll_settle_ms,
+                max_steps=settings.browser.max_viewport_sweeps,
+                mask_selectors=settings.browser.screenshot_mask_selectors,
+                shrink_retry_limit=settings.browser.shrink_retry_limit,
+                blocklist_config=blocklist_cfg,
+                warning_settings=warning_cfg,
+                _artifacts_out=extra_artifacts,
             )
         finally:
-            if context is not None and storage_state_path is not None:
-                try:
-                    storage_state_path.parent.mkdir(parents=True, exist_ok=True)
-                    await asyncio.shield(context.storage_state(path=str(storage_state_path)))
-                except BaseException:
-                    pass
-            if context is not None:
-                try:
-                    await asyncio.shield(context.close())
-                except BaseException:
-                    pass
-
-    use_pool = bool(config.use_browser_pool) and (async_playwright is _DEFAULT_ASYNC_PLAYWRIGHT)
-    if use_pool:
-        try:
-            async with _BROWSER_POOL.acquire_browser(
-                channel=settings.browser.playwright_channel,
-                executable_path=executable_path,
-                viewport_width=config.viewport_width,
-                viewport_height=config.viewport_height,
-                max_concurrent=max_concurrent,
-            ) as browser:
-                (
-                    tiles,
-                    sweep_stats,
-                    user_agent,
-                    blocklist_hits,
-                    warnings,
-                    dom_snapshot,
-                    validation_failures,
-                    seam_markers,
-                    effective_cft_version,
-                ) = await _execute_with_browser(browser)
-        except (BrowserPinMismatchError, UnsupportedTransportError):
-            raise
-        except Exception:
-            # If a pooled browser crashed mid-context creation, recycle and retry once cleanly
-            await _BROWSER_POOL.close_all()
-            async with _BROWSER_POOL.acquire_browser(
-                channel=settings.browser.playwright_channel,
-                executable_path=executable_path,
-                viewport_width=config.viewport_width,
-                viewport_height=config.viewport_height,
-                max_concurrent=max_concurrent,
-            ) as browser:
-                (
-                    tiles,
-                    sweep_stats,
-                    user_agent,
-                    blocklist_hits,
-                    warnings,
-                    dom_snapshot,
-                    validation_failures,
-                    seam_markers,
-                    effective_cft_version,
-                ) = await _execute_with_browser(browser)
-    else:
-        async with async_playwright() as playwright:
             try:
-                browser = await _launch_browser(
-                    playwright,
-                    settings.browser.playwright_channel,
-                    viewport_width=config.viewport_width,
-                    viewport_height=config.viewport_height,
-                    executable_path=executable_path,
-                )
-            except TypeError:
-                browser = await _launch_browser(playwright, settings.browser.playwright_channel)
-            try:
-                (
-                    tiles,
-                    sweep_stats,
-                    user_agent,
-                    blocklist_hits,
-                    warnings,
-                    dom_snapshot,
-                    validation_failures,
-                    seam_markers,
-                    effective_cft_version,
-                ) = await _execute_with_browser(browser)
+                if context is not None:
+                    try:
+                        if storage_state_path is not None:
+                            storage_state_path.parent.mkdir(parents=True, exist_ok=True)
+                            await context.storage_state(path=str(storage_state_path))
+                    finally:
+                        await context.close()
             finally:
-                try:
-                    await asyncio.shield(browser.close())
-                except BaseException:
-                    pass
+                await browser.close()
 
     capture_ms = int((time.perf_counter() - start) * 1000)
-    effective_style_hash = compute_effective_style_hash(
-        settings_browser=settings.browser,
-        config=config,
-        blocklist_version=blocklist_cfg.version,
-    )
+    ocr_cfg = getattr(settings, "ocr", None)
+    default_model = getattr(ocr_cfg, "model", None) if ocr_cfg is not None else None
+    default_fp8 = getattr(ocr_cfg, "use_fp8", None) if ocr_cfg is not None else None
+    selected_model = config.ocr_model or default_model
 
     manifest_payload = CaptureManifest(
         url=config.url,
-        cft_label=configured_cft_label,
-        cft_version=effective_cft_version,
-        playwright_channel=_normalize_channel(settings.browser.playwright_channel),
-        playwright_version=playwright_ver,
-        browser_transport=effective_transport,
-        screenshot_style_hash=effective_style_hash,
+        cft_label=settings.browser.cft_label if actual_channel == "cft" else "unqualified-stock",
+        cft_version=f"chrome-{actual_build}",
+        playwright_channel=actual_channel,
+        playwright_version=_playwright_version(),
+        browser_transport=actual_transport,
+        screenshot_style_hash=effective_screenshot_hash(config, settings.browser),
         viewport_width=config.viewport_width,
         viewport_height=config.viewport_height,
         device_scale_factor=config.device_scale_factor,
@@ -749,10 +455,17 @@ async def capture_tiles(config: CaptureConfig) -> CaptureResult:
         cache_seed=config.cache_seed,
         cache_key=config.cache_key,
         requested_ocr_policy=config.ocr_policy,
-        selected_ocr_policy=config.ocr_policy or config.ocr_model or settings.ocr.model,
-        ocr_model=config.ocr_model or settings.ocr.model,
-        ocr_use_fp8=config.ocr_use_fp8 if config.ocr_use_fp8 is not None else settings.ocr.use_fp8,
+        selected_ocr_policy=config.ocr_policy or selected_model,
+        ocr_model=selected_model,
+        ocr_use_fp8=config.ocr_use_fp8 if config.ocr_use_fp8 is not None else default_fp8,
         ocr_max_tiles_in_flight=config.ocr_max_tiles_in_flight,
+        configured_cft_version=settings.browser.cft_version,
+        cft_pin_verified=actual_channel == "cft",
+        configured_screenshot_style_hash=settings.browser.screenshot_style_hash,
+        requested_browser_transport=settings.browser.browser_transport,
+        requested_browser_channels=settings.browser.playwright_channel,
+        fontconfig_sha256=fontconfig_digest(getattr(settings.browser, "fontconfig_file", None)),
+        network_policy=egress.summary(),
     )
 
     manifest_payload.seam_markers = seam_markers
@@ -793,17 +506,15 @@ async def _perform_viewport_sweeps(
     await _mask_automation(page)
     mask_locators = [page.locator(selector) for selector in mask_selectors]
 
-    # Use 'domcontentloaded' for fastest reliable page load
-    # This fires when HTML is parsed, before all resources load
-    # Works better with Cloudflare challenge pages that may have delayed resources
-    _emit_stage(config, "NAVIGATING", {"done": 0, "total": 0, "url": config.url})
-    await page.goto(config.url, wait_until="domcontentloaded", timeout=30000)
+    config.report_stage("NAVIGATING")
+    response = await page.goto(config.url, wait_until="domcontentloaded", timeout=30000)
+    if response is not None and "x-mdwb-egress-denied" in response.headers:
+        raise EgressDenied("Capture navigation refused by the network policy")
     blocklist_hits = await apply_blocklist(page, url=config.url, config=blocklist_config)
     await _ensure_watermark_injected(page)
     warning_entries: list[CaptureWarningEntry] = await collect_capture_warnings(
         page, warning_settings
     )
-    _emit_stage(config, "SCROLLING", {"done": 0, "total": 0})
     await page.evaluate("window.scrollTo(0, 0)")
     busy_timeout_count = 0
     emitted_busy_warning = False
@@ -853,7 +564,6 @@ async def _perform_viewport_sweeps(
             show_bottom=True,
         )
 
-        # Harvest viewport-synchronized DOM bounding boxes before screenshot
         step_boxes = await _harvest_viewport_dom_overlay(
             page,
             y_offset=y_offset,
@@ -872,11 +582,7 @@ async def _perform_viewport_sweeps(
                 seen_overlay_keys.add(dedup_key)
                 dom_overlay_entries.append(box_entry)
 
-        _emit_stage(
-            config,
-            "CAPTURING",
-            {"done": 0, "total": len(tiles), "sweep": sweep_count, "y_offset": y_offset},
-        )
+        config.report_stage("CAPTURING")
         screenshot = await page.screenshot(
             type="png",
             full_page=False,
@@ -884,23 +590,15 @@ async def _perform_viewport_sweeps(
             caret="hide",
             mask=mask_locators if mask_locators else None,
         )
-        try:
-            new_tiles = await slice_into_tiles(
-                screenshot,
-                overlap_px=tile_overlap_px,
-                tile_index_offset=tile_index,
-                viewport_y_offset=y_offset,
-                target_long_side_px=target_long_side_px,
-                device_scale_factor=config.device_scale_factor,
-            )
-        except TypeError:
-            new_tiles = await slice_into_tiles(
-                screenshot,
-                overlap_px=tile_overlap_px,
-                tile_index_offset=tile_index,
-                viewport_y_offset=y_offset,
-                target_long_side_px=target_long_side_px,
-            )
+        config.report_stage("TILING")
+        new_tiles = await slice_into_tiles(
+            screenshot,
+            overlap_px=tile_overlap_px,
+            tile_index_offset=tile_index,
+            viewport_y_offset=y_offset,
+            target_long_side_px=target_long_side_px,
+            device_scale_factor=config.device_scale_factor,
+        )
         try:
             validate_tiles(new_tiles)
         except ValueError as exc:
@@ -912,7 +610,6 @@ async def _perform_viewport_sweeps(
             if top_hash:
                 new_tiles[0].seam_top_hash = top_hash
                 if previous_tile is not None:
-                    # Align previous sweep's bottom seam hash to the exact shared seam coordinate y_offset
                     previous_tile.seam_bottom_hash = top_hash
             for intra_idx in range(len(new_tiles) - 1):
                 intra_seam = _seam_hash(new_tiles[intra_idx + 1].css_y_offset)
@@ -923,6 +620,8 @@ async def _perform_viewport_sweeps(
 
         for tile in new_tiles:
             if previous_tile:
+                await asyncio.to_thread(set_tile_overlap, previous_tile, tile)
+                # Does not rehash when set_tile_overlap already stored strip evidence.
                 align_cross_sweep_overlap(previous_tile, tile)
                 match = _overlap_match(previous_tile, tile)
                 if match is not None:
@@ -934,11 +633,6 @@ async def _perform_viewport_sweeps(
         tiles.extend(new_tiles)
         tile_index += len(new_tiles)
         sweep_count += 1
-        _emit_stage(
-            config,
-            "TILING",
-            {"done": 0, "total": len(tiles), "sweep": sweep_count, "tiles_total": len(tiles)},
-        )
 
         new_height = await _scroll_height(page)
         height_shrank = new_height < scroll_height
@@ -987,6 +681,7 @@ async def _perform_viewport_sweeps(
             reached_bottom = True
             break
 
+        config.report_stage("SCROLLING")
         await page.evaluate(f"window.scrollTo(0, {next_offset})")
         step_busy = await _stabilize_viewport(page, settle_ms=settle_ms)
         if step_busy.get("busy_timed_out"):
@@ -1001,7 +696,6 @@ async def _perform_viewport_sweeps(
                         threshold=0.0,
                     )
                 )
-        # Re-read scrollHeight in case lazy-loaded content expanded the document after scrolling
         grown_height = await _scroll_height_if_grown(page, scroll_height)
         if grown_height > scroll_height:
             scroll_height = grown_height
@@ -1073,21 +767,102 @@ async def _perform_viewport_sweeps(
     )
 
 
+_WATERMARK_STYLE = """
+#mdwb-watermark-top,#mdwb-watermark-bottom {
+  position: fixed;
+  left: 0;
+  right: 0;
+  height: 2px;
+  z-index: 2147483647;
+  pointer-events: none;
+  mix-blend-mode: difference;
+  opacity: 0.55;
+  background-size: 24px 2px;
+}
+#mdwb-watermark-top { top: 0; }
+#mdwb-watermark-bottom { bottom: 0; }
+"""
+
+
+def effective_screenshot_hash(config: CaptureConfig, browser: BrowserSettings) -> str:
+    """Bind effective viewport, mask selectors and actual injected style bytes."""
+    payload = {
+        "configured_style_hash": browser.screenshot_style_hash,
+        "watermark_css": _WATERMARK_STYLE,
+        "masks": list(browser.screenshot_mask_selectors),
+        "viewport": [config.viewport_width, config.viewport_height, config.device_scale_factor],
+        "color_scheme": config.color_scheme,
+        "reduced_motion": config.reduced_motion,
+        "animations": "disabled",
+        "caret": "hide",
+        "full_page": False,
+        "capture_pipeline_version": CAPTURE_PIPELINE_VERSION,
+        "fontconfig_sha256": fontconfig_digest(getattr(browser, "fontconfig_file", None)),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
+def _system_fontconfig_bytes() -> bytes:
+    cache = escape(str(Path.home() / ".cache/mdwb/fontcache"), quote=False)
+    return (
+        '<?xml version="1.0"?><!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">'
+        "<fontconfig><dir>/usr/share/fonts</dir><dir>/usr/local/share/fonts</dir>"
+        f"<cachedir>{cache}</cachedir></fontconfig>"
+    ).encode()
+
+
+def fontconfig_digest(path: Path | None) -> str | None:
+    if sys.platform != "linux":
+        if path is not None:
+            raise ValueError("Fontconfig overrides are supported only on Linux")
+        return None
+    content = path.read_bytes() if path else _system_fontconfig_bytes()
+    return hashlib.sha256(content).hexdigest()
+
+
+def _browser_font_environment(path: Path | None) -> dict[str, str] | None:
+    """Isolate Linux capture fonts from user aliases; preserve the host config."""
+    if sys.platform != "linux":
+        fontconfig_digest(path)
+        return None
+    if path is None:
+        content = _system_fontconfig_bytes()
+        digest = hashlib.sha256(content).hexdigest()
+        path = Path.home() / ".cache/mdwb/fonts" / f"{digest}.conf"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with path.open("xb") as stream:
+                stream.write(content)
+        except FileExistsError:
+            if path.read_bytes() != content:
+                raise ValueError("Generated browser font configuration has unexpected bytes")
+    if not path.is_file():
+        raise ValueError("Browser font configuration is unavailable")
+    return {**os.environ, "FONTCONFIG_FILE": str(path.resolve())}
+
+
 async def _ensure_watermark_injected(page: Page) -> None:
-    """Install non-visual IntersectionObserver/MutationObserver tracking and strip any legacy watermark DOM."""
+    await page.add_style_tag(content=_WATERMARK_STYLE)
     await page.evaluate(
         """
 (() => {
-  // Remove any legacy visual watermark elements so they never pollute screenshot pixels
-  for (const id of ['mdwb-watermark-top', 'mdwb-watermark-bottom', '__mdwb_capture_watermark']) {
-    const existing = document.getElementById(id);
-    if (existing && existing.parentNode) {
-      existing.parentNode.removeChild(existing);
-    }
-  }
+  if (window.__mdwbWatermarkReady) return;
+  const top = document.getElementById('mdwb-watermark-top') || document.createElement('div');
+  top.id = 'mdwb-watermark-top';
+  const bottom = document.getElementById('mdwb-watermark-bottom') || document.createElement('div');
+  bottom.id = 'mdwb-watermark-bottom';
+  if (!top.isConnected) document.body.appendChild(top);
+  if (!bottom.isConnected) document.body.appendChild(bottom);
+  window.__mdwbWatermarkTop = top;
+  window.__mdwbWatermarkBottom = bottom;
   window.__mdwbWatermarkReady = true;
   window.__mdwbSeamState = { topHash: null, bottomHash: null, showTop: false, showBottom: false };
-
+})();
+        """
+    )
+    await page.evaluate(
+        """
+(() => {
   if (window.__mdwbObserverState) return;
   const state = {
     lastMutationTs: performance.now(),
@@ -1095,7 +870,6 @@ async def _ensure_watermark_injected(page: Page) -> None:
     intersectedCount: 0,
   };
   window.__mdwbObserverState = state;
-
   try {
     if (typeof IntersectionObserver !== 'undefined') {
       const io = new IntersectionObserver((entries) => {
@@ -1127,9 +901,7 @@ async def _ensure_watermark_injected(page: Page) -> None:
       });
       mo.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['aria-busy', 'style', 'class', 'hidden'] });
     }
-  } catch (_err) {
-    // Ignore observer errors on restricted pages
-  }
+  } catch (_err) {}
 })();
         """
     )
@@ -1143,11 +915,25 @@ async def _update_watermark_overlay(
     show_top: bool,
     show_bottom: bool,
 ) -> None:
-    """Record seam hashes in window metadata without injecting visible bars into screenshot pixels."""
     await page.evaluate(
         """
 ({ topHash, bottomHash, showTop, showBottom }) => {
   window.__mdwbSeamState = { topHash, bottomHash, showTop, showBottom };
+  if (!window.__mdwbWatermarkReady) {
+    return;
+  }
+  const apply = (el, hash, visible) => {
+    if (!el) return;
+    if (!visible || !hash) {
+      el.style.display = 'none';
+      return;
+    }
+    const color = `#${hash}`;
+    el.style.display = 'block';
+    el.style.backgroundImage = `repeating-linear-gradient(90deg, ${color} 0 12px, transparent 12px 24px)`;
+  };
+  apply(window.__mdwbWatermarkTop, topHash, showTop);
+  apply(window.__mdwbWatermarkBottom, bottomHash, showBottom);
 };
         """,
         {
@@ -1309,8 +1095,6 @@ async def _harvest_viewport_dom_overlay(
 
 
 def _seam_hash(value: int) -> str:
-    import hashlib
-
     digest = hashlib.sha1(str(value).encode("utf-8")).hexdigest()
     return digest[:6]
 
@@ -1338,8 +1122,7 @@ def _collect_seam_markers(tiles: Sequence[TileSlice]) -> list[dict[str, object]]
 
 
 _CHANNEL_ALIASES = {
-    "cft": "chrome",
-    "chrome-for-testing": "chrome",
+    "chrome-for-testing": "cft",
 }
 
 
@@ -1347,17 +1130,33 @@ async def _launch_browser(
     playwright,
     channel: str,
     *,
-    viewport_width: int = 1280,
-    viewport_height: int = 2000,
-    executable_path: Path | str | None = None,
-) -> Browser:
-    normalized = _normalize_channel(channel)
-    if normalized != channel:
-        LOGGER.debug(
-            "Mapped Playwright channel alias '%s' to '%s'",
-            channel,
-            normalized,
-        )
+    expected_build: str | None = None,
+    transport: str = "cdp",
+    executable: Path | None = None,
+    fontconfig_file: Path | None = None,
+    proxy_url: str | None = None,
+) -> tuple[Browser, str, str]:
+    actual_transport = resolve_browser_transport(transport)
+    version = _playwright_version()
+    parts = re.match(r"^(\d+)\.(\d+)", version)
+    if parts is None or (int(parts[1]), int(parts[2])) < (1, 50):
+        raise ValueError(f"Playwright >=1.50 is required; found {version}")
+    preferences = [_normalize_channel(value) for value in channel.split(",") if value.strip()]
+    allowed = {
+        "cft",
+        "chromium",
+        "chrome",
+        "chrome-beta",
+        "chrome-dev",
+        "chrome-canary",
+        "msedge",
+        "msedge-beta",
+        "msedge-dev",
+        "msedge-canary",
+    }
+    if not preferences or any(value not in allowed for value in preferences):
+        raise ValueError("Unsupported browser channel or empty preference list")
+    browser_env = _browser_font_environment(fontconfig_file)
 
     launch_args = [
         "--headless=new",
@@ -1365,25 +1164,78 @@ async def _launch_browser(
         "--disable-dev-shm-usage",
         "--no-sandbox",
         "--disable-setuid-sandbox",
-        f"--window-size={max(1, int(viewport_width))},{max(1, int(viewport_height))}",
+        "--window-size=1920,1080",
     ]
+    if proxy_url:
+        launch_args.extend(
+            [
+                "--disable-quic",
+                "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+            ]
+        )
+    proxy = {"server": proxy_url, "bypass": "<-loopback>"} if proxy_url else None
 
-    launch_kwargs: dict[str, Any] = {
-        "headless": True,
-        "args": launch_args,
-    }
-    if executable_path is not None and str(executable_path).strip():
-        exec_path = Path(str(executable_path).strip())
-        if not exec_path.exists():
-            raise BrowserPinMismatchError(
-                f"Configured browser executable_path does not exist: {exec_path}"
+    failures = []
+    for selected in preferences:
+        browser: Browser | None = None
+        try:
+            if selected == "cft":
+                build = (expected_build or "").removeprefix("chrome-")
+                if not re.fullmatch(r"\d+\.\d+\.\d+\.\d+", build):
+                    raise ValueError("CFT_VERSION must name an exact four-part Chrome build")
+                path = (
+                    executable or Path.home() / ".cache/mdwb/cft" / build / "chrome-linux64/chrome"
+                )
+                if not path.is_file():
+                    raise ValueError(
+                        f"Pinned CfT executable is missing: {path}. Install that build or set CFT_EXECUTABLE."
+                    )
+                browser = await playwright.chromium.launch(
+                    executable_path=str(path),
+                    headless=True,
+                    args=launch_args,
+                    env=browser_env,
+                    proxy=proxy,
+                )
+                if browser.version != build:
+                    observed = browser.version
+                    raise ValueError(f"CfT pin mismatch: expected {build}, launched {observed}")
+            else:
+                browser = await playwright.chromium.launch(
+                    channel=selected,
+                    headless=True,
+                    args=launch_args,
+                    env=browser_env,
+                    proxy=proxy,
+                )
+            probe = await browser.new_page()
+            try:
+                width = await probe.evaluate("""() => {
+                    const context = document.createElement('canvas').getContext('2d');
+                    context.font = '16px sans-serif';
+                    return context.measureText('Capture text 7319').width;
+                }""")
+            finally:
+                await probe.close()
+            if not isinstance(width, (int, float)) or width <= 0:
+                raise ValueError(
+                    "Browser fonts cannot render text; configure PLAYWRIGHT_FONTCONFIG_FILE"
+                )
+            LOGGER.info(
+                "Launched browser build=%s channel=%s transport=%s",
+                browser.version,
+                selected,
+                actual_transport,
             )
-        launch_kwargs["executable_path"] = str(exec_path)
-    else:
-        launch_kwargs["channel"] = normalized
-
-    LOGGER.debug("launching chromium", extra={"channel": normalized, "args": launch_args})
-    return await playwright.chromium.launch(**launch_kwargs)
+            return browser, selected, actual_transport
+        except BaseException as exc:
+            if browser is not None:
+                await browser.close()
+            if not isinstance(exc, Exception):
+                raise
+            failures.append(f"{selected}: {exc}")
+            LOGGER.warning("Browser candidate failed: %s", failures[-1])
+    raise ValueError("Browser launch failed: " + "; ".join(failures))
 
 
 async def _build_context(
@@ -1407,9 +1259,7 @@ async def _build_context(
     }
     storage_state_path: Path | None = None
     if config.profile_id and profiles_root is not None:
-        storage_state_path = _profile_storage_state_path(
-            profiles_root, config.profile_id, owner=config.owner
-        )
+        storage_state_path = _profile_storage_state_path(profiles_root, config.profile_id)
         storage_state_path.parent.mkdir(parents=True, exist_ok=True)
         if storage_state_path.exists():
             options["storage_state"] = storage_state_path
@@ -1517,28 +1367,15 @@ def _normalize_channel(channel: str) -> str:
     return _CHANNEL_ALIASES.get(lowered, lowered)
 
 
-def _profile_storage_state_path(
-    base: Path,
-    profile_id: str,
-    *,
-    owner: str | None = None,
-) -> Path:
-    safe_profile = validate_profile_id(profile_id)
-    base_resolved = base.resolve()
-    if owner is not None and str(owner).strip():
-        owner_clean = str(owner).strip()
-        try:
-            owner_segment = validate_profile_id(owner_clean)
-        except ValueError as exc:
-            raise ValueError(f"Invalid profile owner {owner!r}") from exc
-        relative_dir = Path("owners") / owner_segment / safe_profile
-    else:
-        relative_dir = Path(safe_profile)
-    candidate = base / relative_dir / "storage_state.json"
-    candidate_resolved = (base_resolved / relative_dir / "storage_state.json").resolve()
-    if not candidate_resolved.is_relative_to(base_resolved):
-        raise ValueError(f"Profile path for {profile_id!r} escapes profiles_root")
-    return candidate
+def _profile_storage_state_path(base: Path, profile_id: str) -> Path:
+    safe = validate_profile_id(profile_id)
+    root = base.resolve()
+    owner = current_owner()
+    namespace = hashlib.sha256(owner.encode()).hexdigest() if owner else "anonymous"
+    target = (root / namespace / safe / "storage_state.json").resolve()
+    if not target.is_relative_to(root):
+        raise ValueError("Profile storage path escapes profiles root")
+    return target
 
 
 def _overlap_match(previous_tile: TileSlice, current_tile: TileSlice) -> Optional[bool]:

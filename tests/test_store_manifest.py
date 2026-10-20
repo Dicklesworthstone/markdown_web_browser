@@ -25,6 +25,177 @@ from app.schemas import (
 )
 
 
+def test_event_journal_is_atomic_durable_and_owner_scoped(tmp_path):
+    from app.auth import AUTH_CONTEXT, AuthContext, claim_resource
+
+    store = Store(StorageConfig(tmp_path / "cache", tmp_path / "runs.db"))
+    owner = AuthContext(
+        api_key_id=1, api_key_name="Alice", api_key_prefix="a", owner="alice", rate_limit=100
+    )
+    token = AUTH_CONTEXT.set(owner)
+    try:
+        claim_resource(store, "job:journal")
+        store.allocate_run(
+            job_id="journal",
+            url="https://example.com/journal",
+            started_at=datetime.now(timezone.utc),
+        )
+        first = store.append_job_event(
+            job_id="journal",
+            owner=owner.owner_key,
+            entry={"event": "snapshot", "snapshot": {"state": "NAVIGATING"}},
+        )
+        second = store.append_job_event(
+            job_id="journal",
+            owner=owner.owner_key,
+            entry={"event": "probe", "data": {"invoice": 7319}},
+        )
+        assert first["sequence"] == first["snapshot"]["sequence"] == 0
+        assert second["sequence"] == 1
+        assert first["cursor"].split(":")[0] == second["cursor"].split(":")[0]
+        assert second["cursor"].endswith(":1")
+        reopened = Store(store.config)
+        try:
+            assert reopened.read_job_events("journal", owner=owner.owner_key) == [first, second]
+            epoch, sequence, events = reopened.read_global_events(owner=owner.owner_key)
+            assert sequence == 2 and events == [first, second] and second["cursor"] == f"{epoch}:1"
+            assert reopened.read_job_events("journal", owner="owner:bob") == []
+            with pytest.raises(PermissionError):
+                reopened.append_job_event(
+                    job_id="journal", owner="owner:bob", entry={"event": "forged"}
+                )
+            with pytest.raises(ValueError):
+                reopened.append_job_event(
+                    job_id="journal",
+                    owner=owner.owner_key,
+                    entry={"event": "invalid", "value": float("nan")},
+                )
+            for limit in (0, 501):
+                with pytest.raises(ValueError):
+                    reopened.read_job_events("journal", owner=owner.owner_key, limit=limit)
+                with pytest.raises(ValueError):
+                    reopened.read_global_events(owner=owner.owner_key, limit=limit)
+            assert reopened.read_global_events(owner=owner.owner_key) == (epoch, sequence, events)
+        finally:
+            reopened.engine.dispose()
+    finally:
+        AUTH_CONTEXT.reset(token)
+        store.engine.dispose()
+
+
+def test_competing_journal_writers_allocate_unique_dense_sequences(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    config = StorageConfig(tmp_path / "cache", tmp_path / "runs.db")
+    store = Store(config)
+    store.allocate_run(
+        job_id="shared", url="https://example.com/shared", started_at=datetime.now(timezone.utc)
+    )
+    writers = [Store(config) for _ in range(4)]
+    barrier = Barrier(4)
+
+    def append(worker):
+        barrier.wait(timeout=5)
+        return [
+            writers[worker].append_job_event(
+                job_id="shared",
+                owner=None,
+                entry={"event": "probe", "data": {"worker": worker, "value": index}},
+            )
+            for index in range(12)
+        ]
+
+    try:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            results = list(pool.map(append, range(4)))
+        records = [entry for group in results for entry in group]
+        assert sorted(entry["sequence"] for entry in records) == list(range(48))
+        assert sorted(int(entry["cursor"].split(":")[1]) for entry in records) == list(range(48))
+        assert len({entry["cursor"].split(":")[0] for entry in records}) == 1
+        persisted = store.read_job_events("shared", owner=None)
+        assert [entry["sequence"] for entry in persisted] == list(range(48))
+        assert {(entry["data"]["worker"], entry["data"]["value"]) for entry in persisted} == {
+            (worker, value) for worker in range(4) for value in range(12)
+        }
+    finally:
+        for writer in writers:
+            writer.engine.dispose()
+        store.engine.dispose()
+
+
+@pytest.mark.parametrize("terminal", ["DONE", "FAILED", "CANCELLED"])
+def test_terminal_crash_recovery_appends_one_current_observation(tmp_path, terminal):
+    from concurrent.futures import ThreadPoolExecutor
+
+    store = Store(StorageConfig(tmp_path / "cache", tmp_path / "runs.db"))
+    store.allocate_run(
+        job_id="crash", url="https://example.com/crash", started_at=datetime.now(timezone.utc)
+    )
+    previous = store.append_job_event(
+        job_id="crash",
+        owner=None,
+        entry={
+            "event": "snapshot",
+            "snapshot": {
+                "id": "crash",
+                "url": "https://example.com/crash",
+                "state": "PERSISTING",
+                "progress": {"done": 1, "total": 1},
+            },
+        },
+    )
+    store.update_status(job_id="crash", status=terminal, finished_at=datetime.now(timezone.utc))
+    peers = [Store(store.config) for _ in range(2)]
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(
+                pool.map(
+                    lambda peer: peer.recover_terminal_event(job_id="crash", owner=None), peers
+                )
+            )
+        recovered = [result for result in results if result is not None]
+        assert len(recovered) == 1
+        event = recovered[0]
+        assert event["sequence"] == previous["sequence"] + 1
+        assert event["snapshot"]["state"] == terminal
+        assert event["data"] == {
+            "reason": "terminal-record-recovery",
+            "previous_sequence": previous["sequence"],
+        }
+        assert store.read_job_events("crash", owner=None) == [previous, event]
+        assert store.recover_terminal_event(job_id="crash", owner=None) is None
+        assert store.recover_terminal_event(job_id="crash", owner="owner:foreign") is None
+    finally:
+        for peer in peers:
+            peer.engine.dispose()
+        store.engine.dispose()
+
+
+def test_acknowledged_cancellation_recovery_updates_run_without_duplicate_event(tmp_path):
+    store = Store(StorageConfig(tmp_path / "cache", tmp_path / "runs.db"))
+    store.allocate_run(
+        job_id="cancel-window",
+        url="https://example.com/cancel",
+        started_at=datetime.now(timezone.utc),
+    )
+    store.update_status(job_id="cancel-window", status="CAPTURING")
+    cancelled = store.append_job_event(
+        job_id="cancel-window",
+        owner=None,
+        entry={"event": "snapshot", "snapshot": {"state": "CANCELLED"}},
+    )
+    try:
+        assert store.recover_terminal_event(job_id="cancel-window", owner=None) is None
+        record = store.fetch_run("cancel-window")
+        assert (
+            record is not None and record.status == "CANCELLED" and record.finished_at is not None
+        )
+        assert store.read_job_events("cancel-window", owner=None) == [cancelled]
+    finally:
+        store.engine.dispose()
+
+
 def _storage(tmp_path: Path) -> Store:
     cache_root = tmp_path / "cache"
     db_path = tmp_path / "runs.db"
@@ -1051,3 +1222,40 @@ async def test_slow_db_writer_and_slow_embedder_do_not_stall_health_or_sse_strea
         await jm.stop_watchdog()
         await store.aclose()
 
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [{"href": "https://example.com/guide", "text": "Guide"}],
+        {"anchors": [{"href": "https://example.com/guide", "text": "Guide"}], "total": 1},
+    ],
+)
+def test_links_roundtrip_shapes_survive_store_reopen(tmp_path, payload):
+    store = _storage(tmp_path)
+    job_id, _ = _allocate_run(store)
+    path = store.write_links(job_id=job_id, links=payload)
+    assert json.loads(path.read_text()) == payload
+    reopened = Store(store.config)
+    assert reopened.read_links(job_id) == payload
+    reopened.engine.dispose()
+    store.engine.dispose()
+
+
+@pytest.mark.parametrize("payload", [None, 1, "wrong", ["wrong"], [None]])
+def test_invalid_links_document_refuses(tmp_path, payload):
+    store = _storage(tmp_path)
+    job_id, root = _allocate_run(store)
+    (root / "links.json").write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="Invalid links payload"):
+        store.read_links(job_id)
+
+
+def test_read_paths_dont_create_directories_or_follow_outside_links(tmp_path):
+    store = _storage(tmp_path)
+    job_id, root = _allocate_run(store)
+    outside = tmp_path / "secret.md"
+    outside.write_text("private")
+    (root / "out.md").symlink_to(outside)
+    with pytest.raises(FileNotFoundError, match="escapes"):
+        store.read_markdown(job_id)
+    assert outside.read_text() == "private"

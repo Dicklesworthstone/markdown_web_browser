@@ -8,15 +8,21 @@ Skipped automatically when:
 This is the only test in the suite that hits a real network; it is the closest
 thing we have to a "smoke test against reality."
 """
+
 from __future__ import annotations
 
 import os
 import socket
+import json
+from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
 from app.capture import CaptureConfig, capture_tiles
+from app.settings import get_settings
+from app.store import StorageConfig, Store
 
 
 def _network_reachable(host: str = "example.com", port: int = 443, timeout: float = 3.0) -> bool:
@@ -39,6 +45,7 @@ def _playwright_browser_available() -> bool:
     # launch probe is too expensive (it spawns a process) and flaky in CI.
     from pathlib import Path
     import os
+
     candidates = [
         # Default Playwright cache
         Path.home() / ".cache" / "ms-playwright",
@@ -68,47 +75,49 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.mark.asyncio
-async def test_live_capture_of_example_com(tmp_path: Path) -> None:
+async def test_live_capture_of_example_com(tmp_path: Path, monkeypatch) -> None:
     """Drive a real capture against example.com and assert the artifacts exist.
 
     The test is environment-sensitive (network, browser binary, model host).
     It is auto-skipped when the environment can't satisfy all three so it
     doesn't break local development.
     """
-    # Settings is frozen; route a tmp cache root by env-var.
+    # Bind the actual immutable settings before capture, without mutating .env.
+    settings = get_settings()
+    isolated_settings = replace(
+        settings,
+        storage=replace(settings.storage, cache_root=tmp_path, profiles_root=tmp_path / "profiles"),
+    )
+    monkeypatch.setattr("app.capture.get_settings", lambda: isolated_settings)
     config = CaptureConfig(
         url="https://example.com",
         cache_seed="r5-live-capture-test",
     )
 
-    old_cache = os.environ.get("CACHE_ROOT")
-    os.environ["CACHE_ROOT"] = str(tmp_path)
-    # Also force the chromium channel so the test doesn't try to launch cft.
-    old_channel = os.environ.get("PLAYWRIGHT_CHANNEL")
-    os.environ["PLAYWRIGHT_CHANNEL"] = "chromium"
-    try:
-        result = await capture_tiles(config)
-    except Exception as exc:  # pragma: no cover - env-specific
-        pytest.skip(f"live capture failed at runtime: {exc}")
-        return  # unreachable
-    finally:
-        if old_cache is None:
-            os.environ.pop("CACHE_ROOT", None)
-        else:
-            os.environ["CACHE_ROOT"] = old_cache
-        if old_channel is None:
-            os.environ.pop("PLAYWRIGHT_CHANNEL", None)
-        else:
-            os.environ["PLAYWRIGHT_CHANNEL"] = old_channel
+    result = await capture_tiles(config)
 
     # Manifest should have a URL + a sweep count
     assert result.manifest.url == "https://example.com"
     assert result.manifest.screenshot_style_hash
-    assert result.manifest.tiles_total >= 0
-    # At least the manifest file should be present in the artifact root
-    assert result.manifest.artifact_root
-    artifact_root = Path(result.manifest.artifact_root)
-    assert artifact_root.exists(), f"artifact_root not created: {artifact_root}"
+    assert result.manifest.tiles_total == len(result.tiles) > 0
+    assert result.dom_snapshot and "Example Domain" in result.dom_snapshot.decode()
+    # Capture returns pixels; Store owns persisted paths. Exercise both real
+    # components rather than asserting a nonexistent CaptureManifest field.
+    store = Store(StorageConfig(tmp_path / "artifacts", tmp_path / "runs.db"))
+    paths = store.allocate_run(
+        job_id="live-example", url=config.url, started_at=datetime.now(timezone.utc)
+    )
+    artifacts = store.write_tiles(job_id="live-example", tiles=result.tiles)
+    manifest_path = store.write_manifest(job_id="live-example", manifest=result.manifest)
+    dom_path = store.write_dom_snapshot(job_id="live-example", html=result.dom_snapshot)
+    assert paths.root.is_dir()
+    assert manifest_path == paths.manifest_path and manifest_path.is_file()
+    assert json.loads(manifest_path.read_text())["url"] == config.url
+    assert dom_path == paths.dom_snapshot_path and dom_path.is_file()
+    assert len(artifacts) == len(result.tiles)
+    for tile, artifact in zip(result.tiles, artifacts, strict=True):
+        assert (paths.root / artifact["path"]).read_bytes() == tile.png_bytes
+    store.engine.dispose()
 
 
 def test_live_capture_skipped_when_env_set() -> None:

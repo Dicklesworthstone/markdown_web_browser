@@ -1,18 +1,57 @@
 """R6 tests: agent ergonomics + observability + operational polish."""
+
 from __future__ import annotations
 
+import asyncio
 import pathlib
+import shutil
+from datetime import datetime, timezone
+from typing import Iterator
 
 import pytest
 from fastapi.testclient import TestClient
 
 import app.main as main_mod
 from app.main import app
+from app.jobs import JobManager
+from app.store import RunPaths, RunRecord, StorageConfig, Store
 
 
 @pytest.fixture
 def client() -> TestClient:
     return TestClient(app)
+
+
+@pytest.fixture
+def delete_store(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Store]:
+    store = Store(StorageConfig(tmp_path / "cache", tmp_path / "runs.db"))
+    monkeypatch.setattr(main_mod, "store", store)
+    monkeypatch.setattr(main_mod, "JOB_MANAGER", JobManager(store=store))
+    try:
+        yield store
+    finally:
+        store.engine.dispose()
+
+
+@pytest.fixture
+def purge_calls(monkeypatch: pytest.MonkeyPatch):
+    """Record dispatch at the destructive boundary; never remove fixture files."""
+    calls: list[tuple[pathlib.Path, tuple[object, ...], dict[str, object]]] = []
+
+    def record(path: str | pathlib.Path, *args: object, **kwargs: object) -> None:
+        calls.append((pathlib.Path(path), args, kwargs))
+
+    monkeypatch.setattr(shutil, "rmtree", record)
+    return calls
+
+
+def _seed_delete_run(store: Store, job_id: str = "abc") -> RunPaths:
+    now = datetime.now(timezone.utc)
+    paths = store.allocate_run(job_id=job_id, url=f"https://example.com/{job_id}", started_at=now)
+    paths.manifest_path.write_text("{}", encoding="utf-8")
+    paths.markdown_path.write_text("# hi", encoding="utf-8")
+    store.update_status(job_id=job_id, status="DONE", finished_at=now)
+    return paths
 
 
 # ---------------------------------------------------------------------------
@@ -67,7 +106,13 @@ def test_summary_composes_natural_language(
         return {"url": "https://example.com", "embedding_model": "hash-bucket-v1"}
 
     def _links(self, jid):
-        return {"anchors": [{"href": "https://a.com"}, {"href": "https://b.com"}, {"href": "https://c.com"}]}
+        return {
+            "anchors": [
+                {"href": "https://a.com"},
+                {"href": "https://b.com"},
+                {"href": "https://c.com"},
+            ]
+        }
 
     monkeypatch.setattr(main_mod.JOB_MANAGER, "get_structured_result", _structured)
     monkeypatch.setattr(type(main_mod.store), "read_manifest", _manifest)
@@ -114,18 +159,14 @@ def test_search_text_alias_matches_search(
     """Two routes, same payload."""
 
     def _list(**kwargs):
-        return [
-            {"id": "abc", "url": "https://x.com", "state": "DONE", "tags": []}
-        ], 1
+        return [{"id": "abc", "url": "https://x.com", "state": "DONE", "tags": []}], 1
 
     def _read(self, jid):
         return "hello world"
 
     monkeypatch.setattr(main_mod.JOB_MANAGER, "list_jobs", _list)
     monkeypatch.setattr(type(main_mod.store), "read_markdown", _read)
-    response = client.post(
-        "/jobs/search/text", json={"query": "hello", "limit": 5}
-    )
+    response = client.post("/jobs/search/text", json={"query": "hello", "limit": 5})
     assert response.status_code == 200
     body = response.json()
     assert body["returned"] == 1
@@ -237,8 +278,8 @@ def test_replay_creates_new_job_with_same_url(
         }
 
     fake_jm = main_mod.JobManager.__new__(main_mod.JobManager)
-    fake_jm.create_job = _create
-    fake_jm.get_snapshot = _get_snap
+    monkeypatch.setattr(fake_jm, "create_job", _create)
+    monkeypatch.setattr(fake_jm, "get_snapshot", _get_snap)
     monkeypatch.setattr(main_mod, "JOB_MANAGER", fake_jm)
 
     response = client.post(
@@ -252,11 +293,9 @@ def test_replay_creates_new_job_with_same_url(
     assert body["url"] == "https://example.com"
 
 
-def test_replay_404_for_unknown_job(
-    monkeypatch: pytest.MonkeyPatch, client: TestClient
-) -> None:
+def test_replay_404_for_unknown_job(monkeypatch: pytest.MonkeyPatch, client: TestClient) -> None:
     fake_jm = main_mod.JobManager.__new__(main_mod.JobManager)
-    fake_jm.get_snapshot = lambda job_id: None
+    monkeypatch.setattr(fake_jm, "get_snapshot", lambda job_id: None)
     monkeypatch.setattr(main_mod, "JOB_MANAGER", fake_jm)
     response = client.post("/jobs/abc/replay", json={"reuse_cache": True})
     assert response.status_code == 404
@@ -267,10 +306,50 @@ def test_replay_404_for_unknown_job(
 # ---------------------------------------------------------------------------
 
 
+def test_delete_dispatches_explicit_purge_without_deleting_fixture_files(
+    client: TestClient, delete_store: Store, purge_calls
+) -> None:
+    """Prove purge authorization/dispatch/counts; physical deletion is prohibited."""
+    paths = _seed_delete_run(delete_store)
+    response = client.delete("/jobs/abc", params={"purge_artifacts": "true"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["deleted"] is True
+    assert body["artifacts_removed"] == 1  # one directory
+    assert body["bytes_freed"] > 0
+    assert body["bytes_freed"] == 6
+    assert purge_calls == [(paths.root.resolve(), (), {})]
+    assert delete_store.fetch_run("abc") is None
+    # The destructive boundary double intentionally retains these bytes.
+    # This replaces the old physical-absence oracle to honor NO FILE DELETION.
+    assert paths.root.is_dir()
+    assert paths.manifest_path.read_bytes() == b"{}"
+    assert paths.markdown_path.read_bytes() == b"# hi"
+
+
+def test_delete_retains_artifacts_by_default(
+    client: TestClient, delete_store: Store, purge_calls
+) -> None:
+    paths = _seed_delete_run(delete_store)
+    response = client.delete("/jobs/abc")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["deleted"] is True
+    assert body["artifacts_removed"] == 0
+    assert body["bytes_freed"] == 0
+    assert purge_calls == []
+    assert delete_store.fetch_run("abc") is None
+    assert paths.manifest_path.read_bytes() == b"{}"
+    assert paths.markdown_path.read_bytes() == b"# hi"
+
+
 def test_delete_purges_artifacts(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, client: TestClient
 ) -> None:
-    """Successful delete removes the DB row, preserves on-disk files, and reports honest candidate vs removed counts."""
+    """Default delete retains on-disk files and reports preserved candidates.
+
+    Explicit purge is covered by test_delete_dispatches_explicit_purge_without_deleting_fixture_files.
+    """
     artifact_root = tmp_path / "artifacts"
     artifact_root.mkdir()
     (artifact_root / "manifest.json").write_text("{}")
@@ -278,6 +357,7 @@ def test_delete_purges_artifacts(
 
     def _fetch(self, job_id):
         from types import SimpleNamespace
+
         return SimpleNamespace(
             cache_path=str(artifact_root),
             manifest_path=str(artifact_root / "manifest.json"),
@@ -312,17 +392,101 @@ def test_delete_purges_artifacts(
 
 
 def test_delete_idempotent_for_missing_job(
-    monkeypatch: pytest.MonkeyPatch, client: TestClient
+    client: TestClient, delete_store: Store, purge_calls
 ) -> None:
-    def _fetch_none(self, job_id):
-        return None
-
-    monkeypatch.setattr(type(main_mod.store), "fetch_run", _fetch_none)
+    assert delete_store.fetch_run("missing") is None
     response = client.delete("/jobs/missing")
     assert response.status_code == 200
     body = response.json()
     assert body["deleted"] is False
     assert body["artifacts_removed"] == 0
+    assert body["bytes_freed"] == 0
+    assert purge_calls == []
+
+
+def test_explicit_purge_refuses_shared_roots(
+    client: TestClient, delete_store: Store, purge_calls
+) -> None:
+    paths = _seed_delete_run(delete_store)
+    source = delete_store.fetch_run("abc")
+    assert source is not None
+    delete_store.register_cached_run(job_id="alias", source=source)
+    assert delete_store.path_reference_count(str(paths.root)) == 2
+    response = client.delete("/jobs/abc", params={"purge_artifacts": "true"})
+    assert response.status_code == 409
+    assert purge_calls == []
+    assert delete_store.fetch_run("abc") is not None
+    assert delete_store.fetch_run("alias") is not None
+    assert paths.manifest_path.read_bytes() == b"{}"
+    assert paths.markdown_path.read_bytes() == b"# hi"
+
+
+def test_explicit_purge_refuses_roots_outside_cache(
+    client: TestClient, delete_store: Store, purge_calls, tmp_path: pathlib.Path
+) -> None:
+    paths = _seed_delete_run(delete_store)
+    outside = tmp_path / "outside-cache"
+    outside.mkdir()
+    sentinel = outside / "retained.txt"
+    sentinel.write_text("outside-sentinel", encoding="utf-8")
+    with delete_store.session() as session:
+        record = session.get(RunRecord, "abc")
+        assert record is not None
+        record.cache_path = str(outside)
+        session.add(record)
+        session.commit()
+    response = client.delete("/jobs/abc", params={"purge_artifacts": "true"})
+    assert response.status_code == 409
+    assert purge_calls == []
+    assert delete_store.fetch_run("abc") is not None
+    assert sentinel.read_text("utf-8") == "outside-sentinel"
+    assert paths.manifest_path.read_bytes() == b"{}"
+    assert paths.markdown_path.read_bytes() == b"# hi"
+
+
+async def test_delete_refuses_active_job(
+    client: TestClient, delete_store: Store, purge_calls
+) -> None:
+    paths = _seed_delete_run(delete_store)
+    delete_store.update_status(job_id="abc", status="BROWSER_STARTING")
+
+    async def wait_for_cancel() -> None:
+        await asyncio.Event().wait()
+
+    task = asyncio.create_task(wait_for_cancel())
+    main_mod.JOB_MANAGER._tasks["abc"] = task
+    try:
+        await asyncio.sleep(0)
+        assert not task.done()
+        for params in ({}, {"purge_artifacts": "true"}):
+            response = client.delete("/jobs/abc", params=params)
+            assert response.status_code == 409
+        assert purge_calls == []
+        assert delete_store.fetch_run("abc") is not None
+        assert paths.manifest_path.read_bytes() == b"{}"
+        assert paths.markdown_path.read_bytes() == b"# hi"
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+def test_purge_failure_keeps_metadata_and_files(
+    client: TestClient, delete_store: Store, purge_calls, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _seed_delete_run(delete_store)
+
+    def fail(path: str | pathlib.Path, *args: object, **kwargs: object) -> None:
+        purge_calls.append((pathlib.Path(path), args, kwargs))
+        raise PermissionError("fixture purge denied")
+
+    monkeypatch.setattr(shutil, "rmtree", fail)
+    response = client.delete("/jobs/abc", params={"purge_artifacts": "true"})
+    assert response.status_code == 500
+    assert purge_calls == [(paths.root.resolve(), (), {})]
+    assert delete_store.fetch_run("abc") is not None
+    assert paths.manifest_path.read_bytes() == b"{}"
+    assert paths.markdown_path.read_bytes() == b"# hi"
 
 
 # ---------------------------------------------------------------------------
@@ -356,7 +520,7 @@ def test_health_ready_200_when_watchdog_running(
             return False
 
     fake_jm = main_mod.JobManager.__new__(main_mod.JobManager)
-    fake_jm._watchdog_task = _FakeTask()
+    monkeypatch.setattr(fake_jm, "_watchdog_task", _FakeTask(), raising=False)
     monkeypatch.setattr(main_mod, "JOB_MANAGER", fake_jm)
     response = client.get("/health/ready")
     assert response.status_code == 200
@@ -391,7 +555,7 @@ def test_r6_cli_subcommands_registered(cmd) -> None:
     assert result.exit_code == 0, f"{' '.join(cmd)} --help failed: {result.output}"
 
 
-def test_r6_cli_jobs_toc_invokes_endpoint() -> None:
+def test_r6_cli_jobs_toc_invokes_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
     from typer.testing import CliRunner
 
     from scripts import mdwb_cli
@@ -425,16 +589,14 @@ def test_r6_cli_jobs_toc_invokes_endpoint() -> None:
                 json={
                     "job_id": "abc",
                     "url": "https://x.com",
-                    "sections": [
-                        {"level": 1, "heading": "Top", "anchor": "top", "body_chars": 50}
-                    ],
+                    "sections": [{"level": 1, "heading": "Top", "anchor": "top", "body_chars": 50}],
                     "outbound_links": ["https://a.com"],
                 },
                 request=_hx.Request("GET", url),
             )
 
-    mdwb_cli.httpx.Client = _StubClient
-    mdwb_cli._resolve_settings = _fake_settings
+    monkeypatch.setattr(mdwb_cli.httpx, "Client", _StubClient)
+    monkeypatch.setattr(mdwb_cli, "_resolve_settings", _fake_settings)
 
     runner = CliRunner()
     result = runner.invoke(mdwb_cli.cli, ["jobs", "toc", "abc"])
@@ -444,7 +606,7 @@ def test_r6_cli_jobs_toc_invokes_endpoint() -> None:
     assert "/jobs/abc/toc" in captured["url"]
 
 
-def test_r6_cli_metrics_combines_two_endpoints() -> None:
+def test_r6_cli_metrics_combines_two_endpoints(monkeypatch: pytest.MonkeyPatch) -> None:
     """`mdwb metrics` should hit /metrics/job-counts AND /metrics/embedders."""
     from typer.testing import CliRunner
 
@@ -497,8 +659,8 @@ def test_r6_cli_metrics_combines_two_endpoints() -> None:
                 )
             return _hx.Response(404, json={"detail": "not found"}, request=_hx.Request("GET", url))
 
-    mdwb_cli.httpx.Client = _StubClient
-    mdwb_cli._resolve_settings = _fake_settings
+    monkeypatch.setattr(mdwb_cli.httpx, "Client", _StubClient)
+    monkeypatch.setattr(mdwb_cli, "_resolve_settings", _fake_settings)
 
     runner = CliRunner()
     result = runner.invoke(mdwb_cli.cli, ["metrics"])

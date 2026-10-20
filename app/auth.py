@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import secrets
 import threading
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Iterator, Optional
@@ -13,7 +15,7 @@ if TYPE_CHECKING:
     from app.store import Store
 
 import sys
-from fastapi import Depends, Header, HTTPException, Request, status
+from fastapi import HTTPException, Request, status
 from sqlmodel import Field, Session, SQLModel, select
 
 from app.settings import (
@@ -38,6 +40,14 @@ class APIKey(SQLModel, table=True):
     is_active: bool = Field(default=True)
     rate_limit: int | None = Field(default=None)  # Requests per minute, None = no limit
     owner: str | None = None  # Optional owner identifier
+    is_admin: bool = Field(default=False)
+
+
+class ResourceOwner(SQLModel, table=True):
+    """Durable access grants available before capture artifacts exist."""
+
+    resource: str = Field(primary_key=True)
+    owner_key: str = Field(index=True)
 
 
 @dataclass
@@ -49,6 +59,62 @@ class AuthContext:
     api_key_prefix: str
     rate_limit: int | None
     owner: str | None
+    is_admin: bool = False
+
+    @property
+    def owner_key(self) -> str | None:
+        if not self.api_key_id:
+            return None
+        return f"owner:{self.owner}" if self.owner else f"key:{self.api_key_id}"
+
+
+AUTH_CONTEXT: ContextVar[AuthContext | None] = ContextVar("mdwb_auth", default=None)
+
+
+def current_owner() -> str | None:
+    context = AUTH_CONTEXT.get()
+    return context.owner_key if context else None
+
+
+def claim_resource(store: Store, resource: str) -> None:
+    owner = current_owner()
+    if owner is not None:
+        with store.session() as session:
+            session.add(ResourceOwner(resource=resource, owner_key=owner))
+            session.commit()
+
+
+def owns_resource(store: Store, resource: str, owner: str) -> bool:
+    with store.session() as session:
+        grant = session.get(ResourceOwner, resource)
+        return grant is not None and grant.owner_key == owner
+
+
+def authenticate(api_key: str | None, store: Store, settings: Settings) -> AuthContext:
+    if not settings.REQUIRE_API_KEY:
+        return AuthContext(0, "anonymous", "none", None, None)
+    if not api_key or not re.fullmatch(r"mdwb_[0-9a-f]{32}", api_key):
+        raise HTTPException(
+            status_code=401,
+            detail=f"Provide a valid API key in {settings.API_KEY_HEADER}.",
+            headers={"WWW-Authenticate": "ApiKey"},
+        )
+    with store.session() as session:
+        record = verify_api_key(session, api_key)
+        if record is None or record.id is None:
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid or revoked API key",
+                headers={"WWW-Authenticate": "ApiKey"},
+            )
+        return AuthContext(
+            record.id,
+            record.name,
+            record.key_prefix,
+            record.rate_limit,
+            record.owner,
+            record.is_admin,
+        )
 
 
 def hash_api_key(api_key: str) -> str:
@@ -71,6 +137,8 @@ def create_api_key(
     name: str,
     rate_limit: int | None = None,
     owner: str | None = None,
+    *,
+    is_admin: bool = False,
 ) -> tuple[str, APIKey]:
     """Create a new API key and store it in the database.
 
@@ -80,6 +148,8 @@ def create_api_key(
     Note: The plain text key is returned only once during creation.
     It cannot be retrieved later, only the hash is stored.
     """
+    if rate_limit is not None and rate_limit <= 0:
+        raise ValueError("rate_limit must be positive")
     plain_key = generate_api_key()
     key_hash = hash_api_key(plain_key)
     key_prefix = plain_key[:12]  # mdwb_<first 7 hex chars>
@@ -90,6 +160,7 @@ def create_api_key(
         name=name,
         rate_limit=rate_limit,
         owner=owner,
+        is_admin=is_admin,
     )
 
     session.add(api_key)
@@ -118,7 +189,7 @@ def verify_api_key(
     Returns:
         APIKey if valid and active, None otherwise
     """
-    if not api_key or not api_key.startswith("mdwb_"):
+    if not api_key or not re.fullmatch(r"mdwb_[0-9a-f]{32}", api_key):
         return None
 
     key_hash = hash_api_key(api_key)
@@ -400,18 +471,23 @@ def resolve_request_auth(
 
 async def get_auth_context(
     request: Request,
-    session: Session = Depends(get_db_session),
-    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
-    settings: Settings | None = None,
 ) -> AuthContext:
-    """FastAPI dependency to get authentication context from request."""
-    explicit = x_api_key if isinstance(x_api_key, str) else None
-    return resolve_request_auth(
-        request,
-        session=session,
-        x_api_key=explicit,
-        settings=settings,
-    )
+    """FastAPI dependency to get authentication context from request.
+
+    Validates API key and returns authentication context.
+    Raises HTTPException if authentication fails.
+
+    Usage:
+        @app.get("/protected")
+        async def protected_endpoint(auth: AuthContext = Depends(get_auth_context)):
+            return {"message": f"Authenticated as {auth.api_key_name}"}
+    """
+    context = getattr(request.state, "auth_context", None)
+    if context is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required"
+        )
+    return context
 
 
 def get_request_owner(request: Request) -> str | None:
@@ -483,7 +559,13 @@ def check_job_owner_access(request: Request, job_id: str) -> None:
 
 
 # CLI helper function for generating keys
-def cli_generate_key(name: str, rate_limit: int | None = None, owner: str | None = None) -> None:
+def cli_generate_key(
+    name: str,
+    rate_limit: int | None = None,
+    owner: str | None = None,
+    *,
+    is_admin: bool = False,
+) -> None:
     """CLI function to generate a new API key.
 
     Usage:
@@ -492,14 +574,16 @@ def cli_generate_key(name: str, rate_limit: int | None = None, owner: str | None
     store = get_store()  # Use global store instance
 
     with store.session() as session:
-        plain_key, api_key = create_api_key(session, name, rate_limit, owner)
+        plain_key, api_key = create_api_key(session, name, rate_limit, owner, is_admin=is_admin)
 
         print("\n✅ API Key created successfully!")
         print(f"\nKey ID: {api_key.id}")
         print(f"Name: {api_key.name}")
         print(f"Prefix: {api_key.key_prefix}")
-        print(f"Rate Limit: {api_key.rate_limit or 'None (unlimited)'}")
+        print(f"Rate Limit: {api_key.rate_limit or global_settings.RATE_LIMIT_PER_MINUTE}")
         print(f"Owner: {api_key.owner or 'None'}")
         print("\n🔑 API Key (save this, it won't be shown again):")
         print(f"\n  {plain_key}\n")
-        print(f"Use this key in requests with header: X-API-Key: {plain_key}\n")
+        print(
+            f"Use this key in requests with header: {global_settings.API_KEY_HEADER}: {plain_key}\n"
+        )

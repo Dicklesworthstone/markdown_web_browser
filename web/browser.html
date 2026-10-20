@@ -124,7 +124,13 @@
         </div>
     </div>
 
-    <!-- Browser logic (self-contained offline-ready Markdown + syntax rendering) -->
+    <!-- Vendored DOMPurify, marked, and Prism. Offline fallbacks live in browser.js. -->
+    <script src="/static/purify.min.js"></script>
+    <script src="/static/marked.min.js"></script>
+    <script src="/static/prism.min.js"></script>
+    <script src="/static/prism-markdown.min.js"></script>
+
+    <!-- Browser logic -->
     <script src="/static/browser.js" type="module"></script>
 </body>
 </html>

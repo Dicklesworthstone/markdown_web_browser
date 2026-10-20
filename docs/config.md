@@ -40,8 +40,10 @@ print(settings.ocr.server_url)
 | `RUNS_DB_PATH` | `runs.db` | SQLite file storing `runs`, `links`, and sqlite-vec embeddings. |
 | `CFT_VERSION` | `chrome-130.0.6723.69` | Chrome for Testing label/build pinned for Playwright; log in every manifest. |
 | `CFT_LABEL` | `Stable-1` | CfT channel label surfaced in `environment.cft_label`. |
+| `CFT_EXECUTABLE` | unset | Exact installed CfT executable. The Linux default is `~/.cache/mdwb/cft/<four-part-build>/chrome-linux64/chrome`. A missing executable or observed build mismatch fails before OCR; this never silently selects the installed stock Chrome. |
+| `PLAYWRIGHT_FONTCONFIG_FILE` | unset | Linux fontconfig override for captures. By default the browser uses an isolated configuration scanning system font directories, without user aliases. The configuration digest enters the manifest/cache identity; a zero-width glyph probe fails before OCR. Host font configuration is untouched. |
 | `PLAYWRIGHT_CHANNEL` | `cft` | Browser channel launched by Playwright. Accepts a comma-separated preference list (e.g., `cft,chromium`) so operators can note the fallback order when CfT isn’t available locally. |
-| `PLAYWRIGHT_TRANSPORT` | `cdp` | Transport used to drive Chromium (`cdp` or `bidi`). Also accepts comma-separated preferences (e.g., `bidi,cdp`) so CI metadata clarifies the intended fallback. |
+| `PLAYWRIGHT_TRANSPORT` | `cdp` | The installed Python Chromium adapter exercises CDP. A `bidi,cdp` preference selects and reports CDP; BiDi-only and unknown transports fail before OCR. |
 | `CAPTURE_VIEWPORT_WIDTH` | `1280` | Pixel width for captures + manifest `viewport.width`. |
 | `CAPTURE_VIEWPORT_HEIGHT` | `2000` | Pixel height for captures + manifest `viewport.height`. |
 | `CAPTURE_DEVICE_SCALE_FACTOR` | `2` | DSF used for capture; feeds screenshot style hash + manifest viewport block. |
@@ -55,6 +57,8 @@ print(settings.ocr.server_url)
 | `BLOCKLIST_PATH` | `config/blocklist.json` | JSON selectors injected during capture; recorded via `manifest.blocklist_version`. |
 | `WARNING_LOG_PATH` | `ops/warnings.jsonl` | JSONL file that stores capture warning/blocklist incidents. |
 | `MDWB_SMOKE_ROOT` | `benchmarks/production` | Optional override for the smoke pointer directory consumed by `scripts/show_latest_smoke.py`; set when the latest summary/manifest/weekly files live elsewhere (e.g., CI artifacts). |
+| `MDWB_RUN_E2E_GENERATED` | `false` | Enable fresh authored-fixture capture/OCR/stitch/persistence tests. Disabled mode is explicitly skipped and supplies no quality qualification. Enabled runs fail on missing/empty/invalid cases or absent evidence. |
+| `MDWB_GENERATED_E2E_CASES` | `tests/fixtures/e2e_generated/cases.json` | Hash-bound case list for the generated guardrail. Paths resolve relative to this file. No saved candidate is accepted; the suite creates fresh retained candidates with cache disabled. |
 | `VIEWPORT_OVERLAP_PX` | `120` | Pixels of overlap between viewport sweeps (Plan §19.2). |
 | `CAPTURE_LONG_SIDE_PX` | `1288` | Tile longest side enforced by pyvips tiler + CLI defaults. |
 | `TILE_OVERLAP_PX` | `120` | Overlap inside the pyvips tiler; must match SSIM stitching heuristics. |
@@ -82,6 +86,93 @@ print(settings.ocr.server_url)
 
 Add any new variables to `.env.example`, document them here, and update the
 manifest schema if they need to be echoed downstream.
+
+### Hosted model identity
+
+The selected model is a request, not proof of the provider's deployed model.
+Each manifest batch records `requested_model`, `served_model` and `request_id`.
+An `ocr-model-substitution` warning identifies a different reported model.
+Missing provider model metadata leaves served identity unverified.
+
+On 2026-10-13, the configured DeepInfra endpoint returned
+`google/gemma-4-31B-it` for `allenai/olmOCR-2-7B-1025` requests, consistent
+with the [deprecation notice recorded in the olmOCR repository](https://github.com/allenai/olmocr/issues/460).
+A successful extraction through that endpoint does not qualify olmOCR quality
+or availability. To exercise olmOCR, configure a provider or local deployment
+that actually serves the selected model; verify its reported identity and the
+resulting content before advertising availability. Existing `.env` is preserved.
+
+### Generated capture cases
+
+Enable `MDWB_RUN_E2E_GENERATED=1` and set `MDWB_GENERATED_E2E_CASES` to a
+nonempty JSON array. Each case names an authored HTML fixture, immutable expected
+Markdown, the corresponding capture manifest and ordered expected PNG tiles.
+Every file descriptor contains `path` and its actual64-character lowercase
+`sha256`. Relative paths resolve against the cases file's directory. For example
+(replace each digest placeholder with the reviewed file's actual digest):
+
+```json
+[
+  {
+    "name": "long-table",
+    "scenario_author": "author/model and date of the authored scenario",
+    "fixture": {"path": "long-table.html", "sha256": "REAL_64_HEX_SHA256"},
+    "baseline": {"path": "expected/out.md", "sha256": "REAL_64_HEX_SHA256"},
+    "baseline_manifest": {"path": "expected/manifest.json", "sha256": "REAL_64_HEX_SHA256"},
+    "baseline_job_id": "RECORDED_32_HEX_JOB_ID",
+    "baseline_tiles": [
+      {"path": "expected/tile_0000.png", "sha256": "REAL_64_HEX_SHA256"},
+      {"path": "expected/tile_0001.png", "sha256": "REAL_64_HEX_SHA256"}
+    ],
+    "request": {"viewport_width": 1280, "viewport_height": 2000, "device_scale_factor": 2},
+    "tolerance": 0.02,
+    "ssim_min": 0.99,
+    "min_sweeps": 2,
+    "timeout_seconds": 300.0
+  }
+]
+```
+
+Expected captures must have verified CfT/CDP and actual Playwright/style/font/
+viewport/model/backend identity. The suite checks that identity against the new
+candidate, requires genuine scrolling and pipeline stages/timings/OCR request IDs,
+and refuses cache reuse. `request` accepts supported `JobCreateRequest` options;
+it cannot provide a URL or cache flag. The fixture runs on an isolated local HTTP
+listener; the actual configured OCR service processes its captured PNGs.
+
+Each invocation retains its candidate database, Markdown, manifest, PNGs, DOM and
+`candidate-evidence.json` beneath pytest's unique retained temporary root (shown
+in failures). Supply a new `--basetemp` path for a predictable retained directory;
+an existing path is refused. Expected files are never rewritten. To refresh a
+baseline, inspect the fresh artifacts against the independently expected content
+and approve a new immutable baseline separately; do not copy failures into expected
+output merely to obtain a passing result. To generate a new candidate for review
+without an existing baseline:
+
+```bash
+uv run --python 3.13 python -m tests.test_e2e_generated \
+  --fixture path/to/authored.html --out path/to/new-candidate \
+  --viewport-height 500 --scenario-author "author/model and date"
+```
+
+This development tool requires the dev dependency group, uses the real configured
+OCR service and refuses an existing output path. It creates fresh candidate data;
+it never approves or rewrites a baseline. Default local checks skip this real-
+provider suite explicitly; enabled missing/invalid evidence fails. Production
+corpus accuracy, hosted-model availability and48-hour smoke remain separate gates.
+
+The Markdown limit remains at most2%. The comparison validates provenance
+highlight ownership against `baseline_job_id`/the actual candidate ID and
+neutralizes only that execution nonce inside producer provenance comments. Raw
+and compared differences are both reported. Text, body links, fenced code,
+geometry, hashes and all other provenance remain unchanged and count toward the
+limit. This addresses the observed false loss from a fresh random job ID; it does
+not excuse content changes or provenance pointing at another job.
+
+Tile comparisons require SSIM≥0.99 without
+resampling: valid Gaussian windows are11×11 or the largest odd window fitting a
+short final tile; strips under3px require exact decoded pixels. Mismatched tile
+cardinality/geometry or unverified identities fail before quality can pass.
 
 ### GLM-OCR Contract Notes (bd-361.1.2)
 - No new environment keys are required for contract validation work.
@@ -220,3 +311,85 @@ in `app/schemas.py` (see `ManifestEnvironment`, `ManifestTimings`, and
 * OCR runtime hysteresis defaults are currently fixed in policy code: cooldown `45s`, flap window `180s`, threshold `3` switches/window. Suppression reason codes use `policy.reeval.suppressed.cooldown` and `policy.reeval.suppressed.flapping`.
 * Persistent Chromium profiles live under `CACHE_ROOT/profiles/<id>/storage_state.json`. The UI dropdown and CLI `--profile` flag reuse these directories, and manifests/RunRecords echo `profile_id` so audits can trace which persona captured a run.
 * OCR manifests now include `ocr_autotune` (initial/final/peak concurrency plus the most recent adjustments). The CLI + UI render this block so operators know when the controller scaled up/down; set `OCR_MIN_CONCURRENCY`/`OCR_MAX_CONCURRENCY` to shape the window and override via env when debugging throttling.
+# API access
+
+Set `REQUIRE_API_KEY=true` to require a stored API key for API routes. Health,
+static UI shells and signed public shares remain public. `API_KEY_HEADER`
+defaults to `X-API-Key`; the CLI's `Authorization: Bearer` header is also accepted.
+`RATE_LIMIT_PER_MINUTE` defaults to 60 and must be positive. A key's explicit
+positive rate overrides the default. Quotas are atomic SQLite token buckets
+shared by API workers; exhausted buckets return 429 with `Retry-After`.
+
+Create keys locally with `uv run python -c "from app.auth import cli_generate_key;
+cli_generate_key('research', owner='research-team')"`. Add `is_admin=True` only
+for keys that need `/admin/` operations. Keys sharing an owner can access that
+owner's jobs; unowned keys have separate namespaces. Existing keys have no
+administrator privilege after migration. Existing anonymous jobs remain outside
+authenticated namespaces. Profiles, cache identity, listing and artifact access
+are scoped to the authenticated owner. Profile IDs use 1–128 ASCII letters,
+digits, periods, underscores or hyphens and cannot start with a period.
+
+Both browser pages offer a password field when authentication is required.
+Sign-in uses the configured header and sets a session cookie marked HttpOnly
+and SameSite=Strict (Secure over HTTPS); the key is not written to browser
+storage or URLs. The cookie is verified on every request, so revocation applies
+to API calls and new SSE connections immediately. Cookie-authenticated writes
+require the same Origin. Sign out clears the session and rendered content.
+
+Signed public views omit profile IDs, tags, URL credentials/query strings and
+private manifest fields. Authenticated deployments must configure a private
+`WEBHOOK_SECRET` of at least 32 characters before minting shares.
+
+Capture connections use an ephemeral fixed HTTP proxy. It resolves
+the target once, checks every IPv4/IPv6 answer, then connects to a validated
+numeric address and verifies the actual peer. Browser redirects, subresources
+and WebSockets use the same proxy, with loopback bypass and QUIC disabled.
+Webhook delivery uses HTTPcore's public network-backend interface with the same
+all-answer validation and numeric connection pinning, preserving the original
+HTTP Host and TLS SNI. It ignores ambient proxy variables and refuses redirects; configured
+OCR and embedding endpoints remain separate operator-owned service clients.
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `NETWORK_PRIVATE_CIDRS` | empty | Strict, comma-separated CIDRs available only to explicitly trusted subjects. |
+| `NETWORK_TRUSTED_OWNERS` | empty | Exact server-owned identities such as `owner:research-team` or `key:12` eligible for those CIDRs. Administrator role alone grants no network access. |
+| `NETWORK_TRUST_LOCAL_OPERATOR` | false | Enables the same CIDRs for anonymous local operation only when `REQUIRE_API_KEY=false`. |
+
+For a controlled local fixture, set `NETWORK_PRIVATE_CIDRS=127.0.0.1/32` and
+explicitly trust its stored owner, or enable local operator access in an
+unauthenticated local deployment. Tenant request/profile fields cannot grant
+network access. Link-local and cloud metadata destinations, mapped IPv6 and
+transition addresses stay denied even with grants. Mixed allowed/disallowed DNS
+answers are refused together before any target connection. URL credentials are
+refused; use owner-scoped browser profiles for intentional authenticated sites.
+
+The capture manifest records policy mode, grant count, policy digest, connection
+count and destination-free denial reasons. Policy identity participates in the
+cache key, so withdrawing a grant cannot reuse a previously granted capture.
+Webhook events use the stored job owner's policy; logs omit destination URLs and
+resolved addresses. Proxy headers are limited to64KiB, concurrent connections
+to64, establishment to15s and relay lifetime to120s. Capture connection-boundary
+tests do not establish container isolation or protection from a compromised
+browser process; broader deployment qualification remains open.
+
+`DELETE /jobs/{id}` removes a stopped run's metadata and retains files by
+default. Filesystem purging requires `?purge_artifacts=true`; it refuses paths
+outside the configured cache and artifacts shared with another run.
+
+Request `ocr_policy` selects an enabled entry from `docs/models.yaml` (names are
+case insensitive). It controls the provider model, FP8 preference, tile limit
+and maximum concurrency. Disabled/unknown policies and unsupported request
+fields are rejected. `long_side_px` may lower a policy's size limit. Manifests
+record requested policy, selected model and any served model reported by the
+provider; an omitted provider model remains unknown.
+
+The optional embedding backend reads `OPENAI_BASE_URL`, `OPENAI_API_KEY` and
+`OPENAI_EMBEDDING_MODEL` (default `text-embedding-3-small`). Semantic processing
+uses `SEMANTIC_POST_ENDPOINT`, `SEMANTIC_POST_MODEL`, and `SEMANTIC_POST_API_KEY`.
+These use the same python-decouple loader as the application.
+
+Queue configuration reads `REDIS_URL` and `QUEUE_MAX_JOBS` (10),
+`QUEUE_JOB_TIMEOUT` (3600 seconds), `QUEUE_KEEP_RESULT` (3600 seconds),
+`QUEUE_MAX_RETRIES` (3), and `QUEUE_RETRY_DELAY` (60 seconds). Concurrency and
+timeout must be positive; retention/retry counts/delay must be nonnegative.
+Durable API-to-worker integration remains tracked separately from these settings.

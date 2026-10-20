@@ -8,11 +8,13 @@ Three backends ship:
 The dispatcher exposes ``embed(text) -> list[float]`` and is consumed by both
 ``/embeddings/text`` and the on-capture section embedder in JobManager.
 """
+
 from __future__ import annotations
 
 import hashlib
 import math
 import re
+from importlib import import_module
 from typing import Protocol
 
 
@@ -22,8 +24,7 @@ class Embedder(Protocol):
     name: str
     dim: int
 
-    def embed(self, text: str) -> list[float]:
-        ...
+    def embed(self, text: str) -> list[float]: ...
 
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
@@ -488,20 +489,24 @@ class OpenAICompatibleEmbedder:
         model: str | None = None,
         timeout_s: float = 30.0,
     ) -> None:
-        from app.settings import resolve_openai_embedder_settings
+        from app.settings import load_config
 
-        emb_cfg = resolve_openai_embedder_settings()
-        self.base_url = (base_url or emb_cfg.openai_base_url or "").rstrip("/")
-        self.api_key = api_key if api_key is not None else emb_cfg.openai_api_key
-        self.model = model or emb_cfg.openai_embedding_model or "text-embedding-3-small"
+        config = load_config()
+        self.base_url = (
+            base_url if base_url is not None else config("OPENAI_BASE_URL", default="")
+        ).rstrip("/")
+        self.api_key = api_key if api_key is not None else config("OPENAI_API_KEY", default="")
+        self.model = (
+            model
+            if model is not None
+            else config("OPENAI_EMBEDDING_MODEL", default="text-embedding-3-small")
+        )
         self.timeout_s = timeout_s
         self.dim = 1536  # default; refreshed after first call
 
     def embed(self, text: str) -> list[float]:
         if not self.base_url:
-            raise RuntimeError(
-                "OPENAI_BASE_URL is not set; cannot use openai-compatible embedder"
-            )
+            raise RuntimeError("OPENAI_BASE_URL is not set; cannot use openai-compatible embedder")
         import httpx
 
         if self.base_url.endswith("/v1"):
@@ -536,14 +541,11 @@ class SentenceTransformersEmbedder:
     name = "sentence-transformers"
 
     def __init__(self, model_name: str | None = None) -> None:
-        import importlib
-
         try:
-            st_mod = importlib.import_module("sentence_transformers")
-            SentenceTransformer = getattr(st_mod, "SentenceTransformer")
+            SentenceTransformer = import_module("sentence_transformers").SentenceTransformer
         except Exception as exc:  # pragma: no cover - optional dep
             raise RuntimeError(
-                "sentence-transformers is not installed; pip install '.[local-ocr]'"
+                "sentence-transformers is not installed; install the optional backend with uv"
             ) from exc
         self.model_name = model_name or "sentence-transformers/all-MiniLM-L6-v2"
         self._model = SentenceTransformer(self.model_name)

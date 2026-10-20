@@ -23,8 +23,8 @@ from typing import (
     Any,
     Callable,
     ContextManager,
+    Generator,
     Iterable,
-    Iterator,
     Mapping,
     Literal,
     Optional,
@@ -36,12 +36,17 @@ from typing import (
 import httpx
 import sys
 import typer
-from decouple import Config as DecoupleConfig, RepositoryEnv
+from decouple import Config as DecoupleConfig, RepositoryEmpty, RepositoryEnv
 from rich.console import Console
 from rich.table import Table
 import zstandard as zstd
 
-_DEFAULT_TIMEOUT = object()
+
+class _DefaultTimeout:
+    """Distinguish an omitted timeout from explicitly disabling timeouts."""
+
+
+_DEFAULT_TIMEOUT = _DefaultTimeout()
 
 _TyperOptionInfo: Any | None
 _TyperOptionInfo: Any = None
@@ -94,7 +99,7 @@ def _resolve_output_format(
     if format_option is not None:
         normalized = format_option.strip().lower()
         if normalized in {"json", "toon"}:
-            return normalized  # type: ignore[return-value]
+            return "json" if normalized == "json" else "toon"
         raise typer.BadParameter("format must be 'json' or 'toon'")
 
     # --json flag
@@ -102,13 +107,14 @@ def _resolve_output_format(
         return "json"
 
     # Check environment variables in order of precedence
-    env_format = os.environ.get("MWB_OUTPUT_FORMAT", "").strip().lower()
+    config = _load_cli_config()
+    env_format = config("MWB_OUTPUT_FORMAT", default="").strip().lower()
     if env_format in {"json", "toon"}:
-        return env_format  # type: ignore[return-value]
+        return "json" if env_format == "json" else "toon"
 
-    env_format = os.environ.get("TOON_DEFAULT_FORMAT", "").strip().lower()
+    env_format = config("TOON_DEFAULT_FORMAT", default="").strip().lower()
     if env_format in {"json", "toon"}:
-        return env_format  # type: ignore[return-value]
+        return "json" if env_format == "json" else "toon"
 
     return None
 
@@ -149,9 +155,14 @@ def _emit_machine_payload(
                     err=True,
                 )
             except subprocess.CalledProcessError:
-                typer.echo(f"[mdwb-toon] JSON: {json_bytes} bytes (TOON unavailable for comparison)", err=True)
+                typer.echo(
+                    f"[mdwb-toon] JSON: {json_bytes} bytes (TOON unavailable for comparison)",
+                    err=True,
+                )
         elif show_stats:
-            typer.echo(f"[mdwb-toon] JSON: {json_bytes} bytes (TOON unavailable for comparison)", err=True)
+            typer.echo(
+                f"[mdwb-toon] JSON: {json_bytes} bytes (TOON unavailable for comparison)", err=True
+            )
         console.print_json(data=data)
         return
 
@@ -175,7 +186,10 @@ def _emit_machine_payload(
     if show_stats:
         toon_bytes = len(toon_payload.encode("utf-8"))
         savings = 100 - (toon_bytes * 100 // json_bytes) if json_bytes > 0 else 0
-        typer.echo(f"[mdwb-toon] JSON: {json_bytes} bytes, TOON: {toon_bytes} bytes ({savings}% savings)", err=True)
+        typer.echo(
+            f"[mdwb-toon] JSON: {json_bytes} bytes, TOON: {toon_bytes} bytes ({savings}% savings)",
+            err=True,
+        )
 
     if not toon_payload.endswith("\n"):
         toon_payload += "\n"
@@ -189,16 +203,19 @@ class APISettings:
     warning_log_path: Path
 
 
-def _load_env_settings() -> APISettings:
+def _load_cli_config() -> DecoupleConfig:
+    """Read CLI configuration through decouple, including environment-only use."""
     env_path = Path(".env")
-    if env_path.exists():
-        config = DecoupleConfig(RepositoryEnv(str(env_path)))
-        base_url = config("API_BASE_URL", default="http://localhost:8000")
-        api_key = config("MDWB_API_KEY", default=None)
-        warning_log = Path(config("WARNING_LOG_PATH", default="ops/warnings.jsonl"))
-        return APISettings(base_url=base_url, api_key=api_key, warning_log_path=warning_log)
+    repository = RepositoryEnv(str(env_path)) if env_path.is_file() else RepositoryEmpty()
+    return DecoupleConfig(repository)
+
+
+def _load_env_settings() -> APISettings:
+    config = _load_cli_config()
     return APISettings(
-        base_url="http://localhost:8000", api_key=None, warning_log_path=Path("ops/warnings.jsonl")
+        base_url=config("API_BASE_URL", default="http://localhost:8000"),
+        api_key=config("MDWB_API_KEY", default=None),
+        warning_log_path=Path(config("WARNING_LOG_PATH", default="ops/warnings.jsonl")),
     )
 
 
@@ -210,7 +227,7 @@ def _resolve_settings(override_base: Optional[str]) -> APISettings:
 
 
 def _auth_headers(settings: APISettings) -> dict[str, str]:
-    headers: dict[str, str] = {}
+    headers: dict[str, str] = {"User-Agent": "mdwb (+https://github.com/Dicklesworthstone/markdown_web_browser)"}
     if settings.api_key:
         headers["Authorization"] = f"Bearer {settings.api_key}"
         headers["X-API-Key"] = settings.api_key
@@ -221,9 +238,9 @@ def _client(
     settings: APISettings,
     http2: bool = True,
     *,
-    timeout: httpx.Timeout | float | None | object = _DEFAULT_TIMEOUT,
+    timeout: httpx.Timeout | float | None | _DefaultTimeout = _DEFAULT_TIMEOUT,
 ) -> httpx.Client:
-    if timeout is _DEFAULT_TIMEOUT:
+    if isinstance(timeout, _DefaultTimeout):
         effective_timeout: httpx.Timeout | float | None = httpx.Timeout(
             connect=10.0,
             read=60.0,
@@ -232,11 +249,27 @@ def _client(
         )
     else:
         effective_timeout = timeout
+
+    api_url = httpx.URL(settings.base_url)
+    api_origin = (api_url.scheme, api_url.host, api_url.port)
+    api_path = api_url.path.rstrip("/")
+
+    def scope_credentials(request: httpx.Request) -> None:
+        """Check every outgoing request, including redirects, before sending credentials."""
+        target = request.url
+        same_origin = (target.scheme, target.host, target.port) == api_origin
+        under_api_path = target.path == api_path or target.path.startswith(api_path + "/")
+        if same_origin and under_api_path:
+            request.headers.update(_auth_headers(settings))
+        else:
+            request.headers.pop("Authorization", None)
+
     return httpx.Client(
         base_url=settings.base_url,
         timeout=effective_timeout,
         http2=http2,
         headers=_auth_headers(settings),
+        event_hooks={"request": [scope_credentials]},
     )
 
 
@@ -244,10 +277,10 @@ def _client_ctx(
     settings: APISettings,
     *,
     http2: bool = True,
-    timeout: httpx.Timeout | float | None | object = _DEFAULT_TIMEOUT,
+    timeout: httpx.Timeout | float | None | _DefaultTimeout = _DEFAULT_TIMEOUT,
 ) -> ContextManager[httpx.Client]:
     @contextmanager
-    def _ctx() -> Iterator[httpx.Client]:
+    def _ctx() -> Generator[httpx.Client]:
         client = _client(settings, http2=http2, timeout=timeout)
         try:
             yield client
@@ -262,7 +295,7 @@ def _client_ctx_or_shared(
     settings: APISettings,
     *,
     http2: bool = True,
-    timeout: httpx.Timeout | float | None | object = _DEFAULT_TIMEOUT,
+    timeout: httpx.Timeout | float | None | _DefaultTimeout = _DEFAULT_TIMEOUT,
 ) -> ContextManager[httpx.Client]:
     if shared is not None:
         return nullcontext(shared)
@@ -502,8 +535,14 @@ def resume_status(
     json_output: bool = typer.Option(
         False, "--json/--no-json", help="Emit JSON instead of tables."
     ),
-    output_format: Optional[str] = typer.Option(None, "--format", help="Emit json or toon output (env: MWB_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT)."),
-    stats: bool = typer.Option(False, "--stats", help="Show token savings comparison (JSON vs TOON bytes)."),
+    output_format: Optional[str] = typer.Option(
+        None,
+        "--format",
+        help="Emit json or toon output (env: MWB_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT).",
+    ),
+    stats: bool = typer.Option(
+        False, "--stats", help="Show token savings comparison (JSON vs TOON bytes)."
+    ),
 ) -> None:
     """Inspect the completion state tracked by --resume."""
 
@@ -1467,7 +1506,6 @@ def watch(
         if shared_client is not None:
             shared_client.close()
 
-
         if shared_client is not None:
             shared_client.close()
 
@@ -1505,9 +1543,7 @@ def crawl(
         "url": url,
         "max_pages": max_pages,
         "max_depth": max_depth,
-        "domain_allowlist": [
-            d.strip() for d in (domain_allowlist or "").split(",") if d.strip()
-        ],
+        "domain_allowlist": [d.strip() for d in (domain_allowlist or "").split(",") if d.strip()],
         "respect_robots_txt": respect_robots_txt,
         "crawl_delay_ms": crawl_delay_ms,
         "reuse_cache": reuse_cache,
@@ -1516,7 +1552,7 @@ def crawl(
         payload["profile_id"] = profile
     if ocr_policy:
         payload["ocr_policy"] = ocr_policy
-    with httpx.Client(http2=http2, timeout=30.0) as client:
+    with _client(_resolve_settings(api_root), http2=http2, timeout=30.0) as client:
         response = client.post(f"{api_root}/jobs/crawl", json=payload)
         response.raise_for_status()
         initial = response.json()
@@ -1566,7 +1602,7 @@ def _watch_jobs_blocking(job_ids: list[str], api_root: str, poll_interval: float
     pending: set[str] = {j for j in job_ids if j}
     while pending:
         time.sleep(poll_interval)
-        with httpx.Client(timeout=10.0) as client:
+        with _client(_resolve_settings(api_root), http2=False, timeout=10.0) as client:
             still_pending: list[str] = []
             for jid in list(pending):
                 try:
@@ -1597,7 +1633,7 @@ def rerun(
     """Re-capture the same URL with the same profile + tags (POST /jobs/{id}/rerun)."""
     api_root = _resolve_settings(api_base).base_url
     params = {"reuse_cache": "true" if reuse_cache else "false"}
-    with httpx.Client(http2=http2, timeout=30.0) as client:
+    with _client(_resolve_settings(api_root), http2=http2, timeout=30.0) as client:
         response = client.post(f"{api_root}/jobs/{job_id}/rerun", params=params)
         response.raise_for_status()
         data = response.json()
@@ -1620,13 +1656,15 @@ def diff(
     b: str = typer.Argument(..., help="Second job id (the 'after' capture)"),
     api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
     include_links: bool = typer.Option(True, "--links/--no-links", help="Also diff link sets"),
-    max_chars_per_section: int = typer.Option(2000, "--max-chars", help="Cap excerpt length per section"),
+    max_chars_per_section: int = typer.Option(
+        2000, "--max-chars", help="Cap excerpt length per section"
+    ),
     json_output: bool = typer.Option(False, "--json"),
     http2: bool = typer.Option(True, "--http2/--no-http2"),
 ) -> None:
     """Diff two captures section-by-section (POST /jobs/{id}/diff)."""
     api_root = _resolve_settings(api_base).base_url
-    with httpx.Client(http2=http2, timeout=30.0) as client:
+    with _client(_resolve_settings(api_root), http2=http2, timeout=30.0) as client:
         response = client.post(
             f"{api_root}/jobs/{a}/diff",
             json={
@@ -1654,7 +1692,9 @@ def diff(
     for s in data.get("sections", []):
         if s["state"] == "unchanged":
             continue
-        marker = {"added": "[green]+[/]", "removed": "[red]-[/]", "changed": "[yellow]~[/]"}.get(s["state"], "?")
+        marker = {"added": "[green]+[/]", "removed": "[red]-[/]", "changed": "[yellow]~[/]"}.get(
+            s["state"], "?"
+        )
         console.print(f"  {marker} {s['heading']}  (a={s['a_chars']}c, b={s['b_chars']}c)")
     if include_links:
         la = data.get("links_a_only") or []
@@ -1669,7 +1709,9 @@ def diff(
 def search(
     query: str = typer.Argument(..., help="Search query. Quoted phrases match literally."),
     state: Optional[str] = typer.Option(None, "--state", help="Restrict to a job state"),
-    url_contains: Optional[str] = typer.Option(None, "--url-contains", help="Substring match on URL"),
+    url_contains: Optional[str] = typer.Option(
+        None, "--url-contains", help="Substring match on URL"
+    ),
     tag: Optional[str] = typer.Option(None, "--tag"),
     limit: int = typer.Option(25, "--limit"),
     api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
@@ -1685,7 +1727,7 @@ def search(
         body["url_contains"] = url_contains
     if tag:
         body["tag"] = tag
-    with httpx.Client(http2=http2, timeout=60.0) as client:
+    with _client(_resolve_settings(api_root), http2=http2, timeout=60.0) as client:
         response = client.post(f"{api_root}/jobs/search", json=body)
         response.raise_for_status()
         data = response.json()
@@ -1710,7 +1752,7 @@ def embedders(
 ) -> None:
     """List available text-embedder backends (GET /embedders)."""
     api_root = _resolve_settings(api_base).base_url
-    with httpx.Client(http2=http2, timeout=15.0) as client:
+    with _client(_resolve_settings(api_root), http2=http2, timeout=15.0) as client:
         response = client.get(f"{api_root}/embedders")
         response.raise_for_status()
         data = response.json()
@@ -1733,14 +1775,16 @@ def embed(
     /jobs/{id}/embeddings/search.
     """
     api_root = _resolve_settings(api_base).base_url
-    with httpx.Client(http2=http2, timeout=15.0) as client:
+    with _client(_resolve_settings(api_root), http2=http2, timeout=15.0) as client:
         response = client.post(f"{api_root}/embeddings/text", json={"text": text})
         response.raise_for_status()
         data = response.json()
     if json_output:
         typer.echo(json.dumps(data, indent=2))
         return
-    console.print(f"[dim]model={data['model']} dim={data['dim']} text_chars={data['text_chars']}[/]")
+    console.print(
+        f"[dim]model={data['model']} dim={data['dim']} text_chars={data['text_chars']}[/]"
+    )
     head = ", ".join(f"{v:.4f}" for v in data["vector"][:8])
     console.print(f"  vector[:8]=[{head}, ...]")
 
@@ -1760,7 +1804,7 @@ def events_json(
     params: dict = {}
     if since:
         params["since"] = since
-    with httpx.Client(http2=http2, timeout=30.0) as client:
+    with _client(_resolve_settings(api_root), http2=http2, timeout=30.0) as client:
         response = client.get(f"{api_root}/jobs/{job_id}/events.json", params=params)
         response.raise_for_status()
         typer.echo(json.dumps(response.json(), indent=2))
@@ -1771,7 +1815,8 @@ def links_cmd(
     job_id: str = typer.Argument(..., help="Job identifier"),
     api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
     source: Optional[str] = typer.Option(
-        None, "--source",
+        None,
+        "--source",
         help="Filter to a specific source: dom|ocr|both|other",
     ),
     json_output: bool = typer.Option(False, "--json"),
@@ -1779,7 +1824,7 @@ def links_cmd(
 ) -> None:
     """Per-source link breakdown (GET /jobs/{id}/links)."""
     api_root = _resolve_settings(api_base).base_url
-    with httpx.Client(http2=http2, timeout=15.0) as client:
+    with _client(_resolve_settings(api_root), http2=http2, timeout=15.0) as client:
         response = client.get(f"{api_root}/jobs/{job_id}/links")
         response.raise_for_status()
         data = response.json()
@@ -1807,7 +1852,7 @@ def artifacts_cmd(
 ) -> None:
     """Enumerate every artifact file (GET /jobs/{id}/artifacts)."""
     api_root = _resolve_settings(api_base).base_url
-    with httpx.Client(http2=http2, timeout=15.0) as client:
+    with _client(_resolve_settings(api_root), http2=http2, timeout=15.0) as client:
         response = client.get(f"{api_root}/jobs/{job_id}/artifacts")
         response.raise_for_status()
         data = response.json()
@@ -1827,14 +1872,16 @@ def artifacts_cmd(
 @cli.command()
 def cancel(
     job_id: str = typer.Argument(..., help="Job to cancel"),
-    reason: str = typer.Option("cancelled by user", "--reason", help="Cancellation reason recorded on the job"),
+    reason: str = typer.Option(
+        "cancelled by user", "--reason", help="Cancellation reason recorded on the job"
+    ),
     api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
     json_output: bool = typer.Option(False, "--json"),
     http2: bool = typer.Option(True, "--http2/--no-http2"),
 ) -> None:
     """Cancel an in-flight job (POST /jobs/{id}/cancel)."""
     api_root = _resolve_settings(api_base).base_url
-    with httpx.Client(http2=http2, timeout=15.0) as client:
+    with _client(_resolve_settings(api_root), http2=http2, timeout=15.0) as client:
         response = client.post(
             f"{api_root}/jobs/{job_id}/cancel",
             params={"reason": reason},
@@ -1862,7 +1909,7 @@ def tags_cmd(
     api_root = _resolve_settings(api_base).base_url
     if action == "list":
         # Use the existing single-tag GET to fetch the current set
-        with httpx.Client(http2=http2, timeout=15.0) as client:
+        with _client(_resolve_settings(api_root), http2=http2, timeout=15.0) as client:
             # We added a /jobs/{id}/tags multi-add but no list endpoint;
             # use the add endpoint's response shape by reading from /jobs/{id}
             response = client.get(f"{api_root}/jobs/{job_id}")
@@ -1880,7 +1927,7 @@ def tags_cmd(
     elif action == "add":
         if not tag:
             raise typer.BadParameter("add requires at least one tag")
-        with httpx.Client(http2=http2, timeout=15.0) as client:
+        with _client(_resolve_settings(api_root), http2=http2, timeout=15.0) as client:
             response = client.post(
                 f"{api_root}/jobs/{job_id}/tags",
                 json={"tags": list(tag)},
@@ -1894,7 +1941,7 @@ def tags_cmd(
     elif action == "rm":
         if not tag or len(tag) != 1:
             raise typer.BadParameter("rm requires exactly one tag")
-        with httpx.Client(http2=http2, timeout=15.0) as client:
+        with _client(_resolve_settings(api_root), http2=http2, timeout=15.0) as client:
             response = client.delete(
                 f"{api_root}/jobs/{job_id}/tag/{quote(tag[0], safe='')}",
             )
@@ -1926,7 +1973,7 @@ def batch_status_cmd(
         ids = [line.strip() for line in stdin_data.splitlines() if line.strip()]
     if not ids:
         raise typer.BadParameter("Provide at least one job id (or pipe via stdin).")
-    with httpx.Client(http2=http2, timeout=30.0) as client:
+    with _client(_resolve_settings(api_root), http2=http2, timeout=30.0) as client:
         response = client.post(
             f"{api_root}/jobs/batch/status",
             json={"job_ids": ids},
@@ -1938,9 +1985,7 @@ def batch_status_cmd(
         return
     for s in data.get("statuses", []):
         marker = "[cyan]hit[/]" if s.get("cache_hit") else " "
-        console.print(
-            f"  {s['job_id'][:8]:8s} [{s['state']:>9s}] {marker} {s.get('url', '')[:60]}"
-        )
+        console.print(f"  {s['job_id'][:8]:8s} [{s['state']:>9s}] {marker} {s.get('url', '')[:60]}")
 
 
 @beads_cli.command("health")
@@ -1959,7 +2004,9 @@ def beads_health(
     """
     from scripts import bead_health
 
-    out_path = out or Path(os.environ.get("MDWB_BEAD_HEALTH_OUT", str(bead_health.DEFAULT_OUTPUT)))
+    out_path = out or Path(
+        _load_cli_config()("MDWB_BEAD_HEALTH_OUT", default=str(bead_health.DEFAULT_OUTPUT))
+    )
     if read:
         snap = bead_health.read_latest(out_path)
         typer.echo(json.dumps(snap, indent=2))
@@ -1990,7 +2037,7 @@ def share(
     public snapshot without an API key. Default TTL is 24 hours.
     """
     api_root = _resolve_settings(api_base).base_url
-    with httpx.Client(http2=http2, timeout=15.0) as client:
+    with _client(_resolve_settings(api_root), http2=http2, timeout=15.0) as client:
         response = client.post(
             f"{api_root}/jobs/{job_id}/share",
             params={"ttl_seconds": ttl_seconds},
@@ -2018,7 +2065,7 @@ def store_embeddings_cmd(
 ) -> None:
     """Re-compute and persist section embeddings (POST /jobs/{id}/embeddings/store)."""
     api_root = _resolve_settings(api_base).base_url
-    with httpx.Client(http2=http2, timeout=60.0) as client:
+    with _client(_resolve_settings(api_root), http2=http2, timeout=60.0) as client:
         response = client.post(
             f"{api_root}/jobs/{job_id}/embeddings/store",
             json={"model": model, "replace": replace},
@@ -2044,7 +2091,7 @@ def schema_json_cmd(
 ) -> None:
     """Print or save the live /schema.json payload for offline reference."""
     api_root = _resolve_settings(api_base).base_url
-    with httpx.Client(http2=http2, timeout=15.0) as client:
+    with _client(_resolve_settings(api_root), http2=http2, timeout=15.0) as client:
         response = client.get(f"{api_root}/schema.json")
         response.raise_for_status()
         data = response.json()
@@ -2066,9 +2113,13 @@ def health(
     """Hit /health/live (or /health/ready with --ready) and print the response."""
     api_root = _resolve_settings(api_base).base_url
     path = "/health/ready" if ready else "/health/live"
-    with httpx.Client(http2=http2, timeout=10.0) as client:
+    with _client(_resolve_settings(api_root), http2=http2, timeout=10.0) as client:
         response = client.get(f"{api_root}{path}")
-        body = response.json() if response.headers.get("content-type", "").startswith("application/json") else {}
+        body = (
+            response.json()
+            if response.headers.get("content-type", "").startswith("application/json")
+            else {}
+        )
         if response.status_code != 200:
             console.print(f"[red]{path} returned {response.status_code}[/]  body={body}")
             raise typer.Exit(code=1)
@@ -2086,14 +2137,16 @@ def admin_stats(
 ) -> None:
     """Per-day counts (last 90 days) + per-state + per-embedder (GET /admin/stats)."""
     api_root = _resolve_settings(api_base).base_url
-    with httpx.Client(http2=http2, timeout=15.0) as client:
+    with _client(_resolve_settings(api_root), http2=http2, timeout=15.0) as client:
         response = client.get(f"{api_root}/admin/stats")
         response.raise_for_status()
         data = response.json()
     if json_output:
         typer.echo(json.dumps(data, indent=2))
         return
-    console.print(f"[bold]total jobs[/] {data.get('total', 0)}  cache_hits={data.get('cache_hits', 0)}")
+    console.print(
+        f"[bold]total jobs[/] {data.get('total', 0)}  cache_hits={data.get('cache_hits', 0)}"
+    )
     by_state = data.get("by_state", {})
     for st, n in sorted(by_state.items(), key=lambda x: -x[1]):
         console.print(f"  {st:>12s}  {n}")
@@ -2109,7 +2162,9 @@ def admin_stats(
 
 @admin_cli.command("prune")
 def admin_prune(
-    older_than_days: int = typer.Option(..., "--older-than-days", help="Delete DONE/FAILED jobs older than N days"),
+    older_than_days: int = typer.Option(
+        ..., "--older-than-days", help="Delete DONE/FAILED jobs older than N days"
+    ),
     state: Optional[str] = typer.Option(None, "--state", help="Restrict to a given state"),
     yes: bool = typer.Option(False, "--yes", help="Skip the dry-run confirmation"),
     api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
@@ -2128,7 +2183,7 @@ def admin_prune(
     body: dict = {"older_than_days": older_than_days, "dry_run": not yes}
     if state:
         body["state"] = state
-    with httpx.Client(http2=http2, timeout=120.0) as client:
+    with _client(_resolve_settings(api_root), http2=http2, timeout=120.0) as client:
         response = client.post(f"{api_root}/admin/jobs/prune", json=body)
         response.raise_for_status()
         data = response.json()
@@ -2136,9 +2191,13 @@ def admin_prune(
         typer.echo(json.dumps(data, indent=2))
         return
     if data.get("dry_run"):
-        console.print(f"[yellow]dry-run[/]: {data.get('candidates', 0)} candidates  cutoff={data.get('cutoff')}")
+        console.print(
+            f"[yellow]dry-run[/]: {data.get('candidates', 0)} candidates  cutoff={data.get('cutoff')}"
+        )
     else:
-        console.print(f"[green]Pruned[/]: {data.get('deleted', 0)}/{data.get('candidates', 0)} jobs")
+        console.print(
+            f"[green]Pruned[/]: {data.get('deleted', 0)}/{data.get('candidates', 0)} jobs"
+        )
 
 
 @admin_cli.command("cache-invalidate")
@@ -2149,7 +2208,7 @@ def admin_cache_invalidate(
 ) -> None:
     """Drop a specific URL from the capture cache (POST /admin/cache/invalidate)."""
     api_root = _resolve_settings(api_base).base_url
-    with httpx.Client(http2=http2, timeout=15.0) as client:
+    with _client(_resolve_settings(api_root), http2=http2, timeout=15.0) as client:
         response = client.post(f"{api_root}/admin/cache/invalidate", params={"url": url})
         response.raise_for_status()
         data = response.json()
@@ -2166,7 +2225,7 @@ def admin_cache_clear(
 ) -> None:
     """Clear the in-process cache (POST /admin/cache/clear)."""
     api_root = _resolve_settings(api_base).base_url
-    with httpx.Client(http2=http2, timeout=15.0) as client:
+    with _client(_resolve_settings(api_root), http2=http2, timeout=15.0) as client:
         response = client.post(f"{api_root}/admin/cache/clear")
         response.raise_for_status()
         data = response.json()
@@ -2185,7 +2244,7 @@ def metrics(
 ) -> None:
     """Pretty-print /metrics/job-counts + /metrics/embedders (one HTTP call each)."""
     api_root = _resolve_settings(api_base).base_url
-    with httpx.Client(http2=http2, timeout=15.0) as client:
+    with _client(_resolve_settings(api_root), http2=http2, timeout=15.0) as client:
         counts = client.get(f"{api_root}/metrics/job-counts").json()
         embedders = client.get(f"{api_root}/metrics/embedders").json()
     if json_output:
@@ -2217,9 +2276,7 @@ def batch(
         None, "--tag", help="Tag applied to every job (repeat for multiple)."
     ),
     reuse_cache: bool = typer.Option(True, "--reuse-cache/--no-cache"),
-    watch: bool = typer.Option(
-        True, "--watch/--no-watch", help="Poll each child job until DONE."
-    ),
+    watch: bool = typer.Option(True, "--watch/--no-watch", help="Poll each child job until DONE."),
     http2: bool = typer.Option(True, "--http2/--no-http2"),
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
@@ -2255,7 +2312,7 @@ def batch(
         body["ocr_policy"] = ocr_policy
     if tag:
         body["tags"] = list(tag)
-    with httpx.Client(http2=http2, timeout=60.0) as client:
+    with _client(_resolve_settings(api_root), http2=http2, timeout=60.0) as client:
         response = client.post(f"{api_root}/jobs/batch", json=body)
         response.raise_for_status()
         result = response.json()
@@ -2286,7 +2343,7 @@ def schema(
     specifically so AI agents can orient without reading source code.
     """
     api_root = _resolve_settings(api_base).base_url
-    with httpx.Client(http2=http2, timeout=15.0) as client:
+    with _client(_resolve_settings(api_root), http2=http2, timeout=15.0) as client:
         response = client.get(f"{api_root}/schema")
         response.raise_for_status()
         data = response.json()
@@ -2324,7 +2381,7 @@ def slo(
     freshest manifest index) and prints the per-category p50/p95 + breaches.
     """
     api_root = _resolve_settings(api_base).base_url
-    with httpx.Client(timeout=15.0) as client:
+    with _client(_resolve_settings(api_root), http2=False, timeout=15.0) as client:
         response = client.get(f"{api_root}/metrics/slo")
         response.raise_for_status()
         data = response.json()
@@ -2334,7 +2391,9 @@ def slo(
     if data.get("status") == "no-data":
         typer.echo("[yellow]No manifests recorded yet — run a capture or smoke first.[/]")
         return
-    typer.echo(f"SLO rollup generated_at={data.get('generated_at')} entries={data.get('entry_count', 0)}")
+    typer.echo(
+        f"SLO rollup generated_at={data.get('generated_at')} entries={data.get('entry_count', 0)}"
+    )
     for category, metrics in (data.get("categories") or {}).items():
         if not isinstance(metrics, dict):
             continue
@@ -2342,9 +2401,7 @@ def slo(
         p95 = metrics.get("p95_total_ms") or metrics.get("p95_ms") or "-"
         breaches = metrics.get("breach_count") or metrics.get("breaches") or 0
         budget = metrics.get("budget_p95_ms") or "-"
-        typer.echo(
-            f"  {category:>20s}  p50={p50}  p95={p95}  budget={budget}  breaches={breaches}"
-        )
+        typer.echo(f"  {category:>20s}  p50={p50}  p95={p95}  budget={budget}  breaches={breaches}")
 
 
 @cli.command()
@@ -2367,7 +2424,7 @@ def discover(
     live_endpoints: list[dict[str, Any]] = []
     if live:
         try:
-            with httpx.Client(timeout=10.0) as client:
+            with _client(_resolve_settings(api_root), http2=False, timeout=10.0) as client:
                 schema_resp = client.get(f"{api_root}/openapi.json")
                 schema_resp.raise_for_status()
                 schema = schema_resp.json()
@@ -2452,15 +2509,18 @@ def discover(
         typer.echo("")
 
 
-
-
-
 @demo_cli.command("snapshot")
 def demo_snapshot(
     api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
     json_output: bool = typer.Option(False, "--json", help="Print raw JSON instead of tables."),
-    output_format: Optional[str] = typer.Option(None, "--format", help="Emit json or toon output (env: MWB_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT)."),
-    stats: bool = typer.Option(False, "--stats", help="Show token savings comparison (JSON vs TOON bytes)."),
+    output_format: Optional[str] = typer.Option(
+        None,
+        "--format",
+        help="Emit json or toon output (env: MWB_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT).",
+    ),
+    stats: bool = typer.Option(
+        False, "--stats", help="Show token savings comparison (JSON vs TOON bytes)."
+    ),
 ) -> None:
     """Fetch the demo job snapshot from /jobs/demo."""
 
@@ -2482,8 +2542,14 @@ def demo_snapshot(
 def demo_links(
     api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
     json_output: bool = typer.Option(False, "--json", help="Print raw JSON."),
-    output_format: Optional[str] = typer.Option(None, "--format", help="Emit json or toon output (env: MWB_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT)."),
-    stats: bool = typer.Option(False, "--stats", help="Show token savings comparison (JSON vs TOON bytes)."),
+    output_format: Optional[str] = typer.Option(
+        None,
+        "--format",
+        help="Emit json or toon output (env: MWB_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT).",
+    ),
+    stats: bool = typer.Option(
+        False, "--stats", help="Show token savings comparison (JSON vs TOON bytes)."
+    ),
 ) -> None:
     """Fetch the demo links JSON."""
 
@@ -3408,8 +3474,14 @@ def dom_links(
     json_output: bool = typer.Option(
         False, "--json", help="Print raw JSON list instead of a table."
     ),
-    output_format: Optional[str] = typer.Option(None, "--format", help="Emit json or toon output (env: MWB_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT)."),
-    stats: bool = typer.Option(False, "--stats", help="Show token savings comparison (JSON vs TOON bytes)."),
+    output_format: Optional[str] = typer.Option(
+        None,
+        "--format",
+        help="Emit json or toon output (env: MWB_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT).",
+    ),
+    stats: bool = typer.Option(
+        False, "--stats", help="Show token savings comparison (JSON vs TOON bytes)."
+    ),
 ) -> None:
     """Extract links from a DOM snapshot using the ogf helper."""
 
@@ -3441,8 +3513,14 @@ def jobs_webhooks_list(
     json_output: bool = typer.Option(
         False, "--json", help="Emit structured JSON instead of a table."
     ),
-    output_format: Optional[str] = typer.Option(None, "--format", help="Emit json or toon output (env: MWB_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT)."),
-    stats: bool = typer.Option(False, "--stats", help="Show token savings comparison (JSON vs TOON bytes)."),
+    output_format: Optional[str] = typer.Option(
+        None,
+        "--format",
+        help="Emit json or toon output (env: MWB_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT).",
+    ),
+    stats: bool = typer.Option(
+        False, "--stats", help="Show token savings comparison (JSON vs TOON bytes)."
+    ),
 ) -> None:
     """List registered webhooks for a job."""
 
@@ -3480,8 +3558,14 @@ def jobs_webhooks_add(
     json_output: bool = typer.Option(
         False, "--json/--no-json", help="Emit JSON payload instead of text."
     ),
-    output_format: Optional[str] = typer.Option(None, "--format", help="Emit json or toon output (env: MWB_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT)."),
-    stats: bool = typer.Option(False, "--stats", help="Show token savings comparison (JSON vs TOON bytes)."),
+    output_format: Optional[str] = typer.Option(
+        None,
+        "--format",
+        help="Emit json or toon output (env: MWB_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT).",
+    ),
+    stats: bool = typer.Option(
+        False, "--stats", help="Show token savings comparison (JSON vs TOON bytes)."
+    ),
 ) -> None:
     """Register a webhook for a job."""
 
@@ -3501,7 +3585,9 @@ def jobs_webhooks_add(
         body = response.json()
     resolved_format = _resolve_output_format(json_output, output_format)
     if resolved_format:
-        _emit_machine_payload({"status": "ok", **body}, output_format=resolved_format, show_stats=stats)
+        _emit_machine_payload(
+            {"status": "ok", **body}, output_format=resolved_format, show_stats=stats
+        )
         return
     console.print(
         f"[green]Registered webhook for {job_id} ({url}).[/] Trigger states: {', '.join(event) if event else 'DONE, FAILED'}."
@@ -3517,8 +3603,14 @@ def jobs_webhooks_delete(
     json_output: bool = typer.Option(
         False, "--json/--no-json", help="Emit JSON payload instead of text."
     ),
-    output_format: Optional[str] = typer.Option(None, "--format", help="Emit json or toon output (env: MWB_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT)."),
-    stats: bool = typer.Option(False, "--stats", help="Show token savings comparison (JSON vs TOON bytes)."),
+    output_format: Optional[str] = typer.Option(
+        None,
+        "--format",
+        help="Emit json or toon output (env: MWB_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT).",
+    ),
+    stats: bool = typer.Option(
+        False, "--stats", help="Show token savings comparison (JSON vs TOON bytes)."
+    ),
 ) -> None:
     """Remove a webhook subscription from a job."""
 
@@ -3628,10 +3720,16 @@ def jobs_bundle(
 
 @jobs_cli.command("list")
 def jobs_list(
-    state: Optional[str] = typer.Option(None, "--state", help="Filter by job state (DONE|FAILED|PENDING|...)"),
+    state: Optional[str] = typer.Option(
+        None, "--state", help="Filter by job state (DONE|FAILED|PENDING|...)"
+    ),
     profile_id: Optional[str] = typer.Option(None, "--profile", help="Filter by profile_id"),
-    url_contains: Optional[str] = typer.Option(None, "--url-contains", help="Substring match on URL"),
-    cache_hit: Optional[bool] = typer.Option(None, "--cache-hit/--no-cache-hit", help="Filter by cache state"),
+    url_contains: Optional[str] = typer.Option(
+        None, "--url-contains", help="Substring match on URL"
+    ),
+    cache_hit: Optional[bool] = typer.Option(
+        None, "--cache-hit/--no-cache-hit", help="Filter by cache state"
+    ),
     tag: Optional[str] = typer.Option(None, "--tag", help="Filter by tag"),
     limit: int = typer.Option(50, "--limit", help="Max jobs to return"),
     offset: int = typer.Option(0, "--offset"),
@@ -3656,7 +3754,7 @@ def jobs_list(
         params["cache_hit"] = "true" if cache_hit else "false"
     if tag:
         params["tag"] = tag
-    with httpx.Client(http2=http2, timeout=30.0) as client:
+    with _client(_resolve_settings(api_root), http2=http2, timeout=30.0) as client:
         response = client.get(f"{api_root}/jobs", params=params)
         response.raise_for_status()
         data = response.json()
@@ -3684,7 +3782,7 @@ def jobs_tag(
 ) -> None:
     """Append a tag to a job (persists on the run record)."""
     api_root = _resolve_settings(api_base).base_url
-    with httpx.Client(http2=http2, timeout=15.0) as client:
+    with _client(_resolve_settings(api_root), http2=http2, timeout=15.0) as client:
         response = client.post(
             f"{api_root}/jobs/{job_id}/tag",
             json={"tag": tag},
@@ -3697,19 +3795,21 @@ def jobs_tag(
 def jobs_result(
     job_id: str = typer.Argument(..., help="Job identifier"),
     api_base: Optional[str] = typer.Option(None, help="Override API base URL"),
-    json_output: bool = typer.Option(False, "--json", help="Emit structured result.json instead of raw Markdown."),
+    json_output: bool = typer.Option(
+        False, "--json", help="Emit structured result.json instead of raw Markdown."
+    ),
     http2: bool = typer.Option(True, "--http2/--no-http2"),
 ) -> None:
     """Fetch a job's result: raw Markdown by default, structured sections + links with --json."""
     api_root = _resolve_settings(api_base).base_url
     if json_output:
-        with httpx.Client(http2=http2, timeout=15.0) as client:
+        with _client(_resolve_settings(api_root), http2=http2, timeout=15.0) as client:
             response = client.get(f"{api_root}/jobs/{job_id}/result.json")
             response.raise_for_status()
             data = response.json()
         typer.echo(json.dumps(data, indent=2))
         return
-    with httpx.Client(http2=http2, timeout=15.0) as client:
+    with _client(_resolve_settings(api_root), http2=http2, timeout=15.0) as client:
         response = client.get(f"{api_root}/jobs/{job_id}/result.md")
         response.raise_for_status()
         typer.echo(response.text)
@@ -3741,7 +3841,7 @@ def jobs_compare(
 ) -> None:
     """Diff two captures (alias for `mdwb diff`)."""
     api_root = _resolve_settings(api_base).base_url
-    with httpx.Client(http2=http2, timeout=30.0) as client:
+    with _client(_resolve_settings(api_root), http2=http2, timeout=30.0) as client:
         response = client.post(
             f"{api_root}/jobs/{a}/diff",
             json={"other_job_id": b, "include_links": True, "max_chars_per_section": max_chars},
@@ -3765,7 +3865,9 @@ def jobs_compare(
     for s in data.get("sections", []):
         if s["state"] == "unchanged":
             continue
-        marker = {"added": "[green]+[/]", "removed": "[red]-[/]", "changed": "[yellow]~[/]"}.get(s["state"], "?")
+        marker = {"added": "[green]+[/]", "removed": "[red]-[/]", "changed": "[yellow]~[/]"}.get(
+            s["state"], "?"
+        )
         console.print(f"  {marker} {s['heading']}  (a={s['a_chars']}c, b={s['b_chars']}c)")
 
 
@@ -3779,7 +3881,7 @@ def jobs_toc(
 ) -> None:
     """Print the text-only table of contents (GET /jobs/{id}/toc)."""
     api_root = _resolve_settings(api_base).base_url
-    with httpx.Client(http2=http2, timeout=15.0) as client:
+    with _client(_resolve_settings(api_root), http2=http2, timeout=15.0) as client:
         response = client.get(
             f"{api_root}/jobs/{job_id}/toc",
             params={"max_links": max_links},
@@ -3795,7 +3897,9 @@ def jobs_toc(
         console.print(f"{indent}- [bold]{s.get('heading')}[/]  ({s.get('body_chars', 0)} chars)")
     outbound = data.get("outbound_links") or []
     if outbound:
-        console.print(f"  [dim]{len(outbound)} outbound link{'s' if len(outbound) != 1 else ''} (showing first 5)[/]")
+        console.print(
+            f"  [dim]{len(outbound)} outbound link{'s' if len(outbound) != 1 else ''} (showing first 5)[/]"
+        )
         for href in outbound[:5]:
             console.print(f"    - {href}")
 
@@ -3809,7 +3913,7 @@ def jobs_summary(
 ) -> None:
     """Print a 1-paragraph natural-language summary (GET /jobs/{id}/summary)."""
     api_root = _resolve_settings(api_base).base_url
-    with httpx.Client(http2=http2, timeout=15.0) as client:
+    with _client(_resolve_settings(api_root), http2=http2, timeout=15.0) as client:
         response = client.get(f"{api_root}/jobs/{job_id}/summary")
         response.raise_for_status()
         data = response.json()
@@ -3835,10 +3939,8 @@ def jobs_headings(
 ) -> None:
     """Get the body + sub-sections for a specific heading (GET /jobs/{id}/headings/{heading})."""
     api_root = _resolve_settings(api_base).base_url
-    with httpx.Client(http2=http2, timeout=15.0) as client:
-        response = client.get(
-            f"{api_root}/jobs/{job_id}/headings/{quote(heading, safe='')}"
-        )
+    with _client(_resolve_settings(api_root), http2=http2, timeout=15.0) as client:
+        response = client.get(f"{api_root}/jobs/{job_id}/headings/{quote(heading, safe='')}")
         response.raise_for_status()
         data = response.json()
     if json_output:
@@ -3866,10 +3968,8 @@ def jobs_follow(
 ) -> None:
     """Resolve an in-page anchor to its link target (GET /jobs/{id}/follow?anchor=…)."""
     api_root = _resolve_settings(api_base).base_url
-    with httpx.Client(http2=http2, timeout=15.0) as client:
-        response = client.get(
-            f"{api_root}/jobs/{job_id}/follow", params={"anchor": anchor}
-        )
+    with _client(_resolve_settings(api_root), http2=http2, timeout=15.0) as client:
+        response = client.get(f"{api_root}/jobs/{job_id}/follow", params={"anchor": anchor})
         response.raise_for_status()
         data = response.json()
     if json_output:
@@ -3900,7 +4000,7 @@ def jobs_export(
     params: dict = {"strip_provenance": not keep_provenance}
     if max_chars:
         params["max_chars"] = max_chars
-    with httpx.Client(http2=http2, timeout=15.0) as client:
+    with _client(_resolve_settings(api_root), http2=http2, timeout=15.0) as client:
         response = client.get(f"{api_root}/jobs/{job_id}/export.md", params=params)
         response.raise_for_status()
         data = response.json()
@@ -3924,19 +4024,23 @@ def jobs_sections(
 ) -> None:
     """Print flat list of sections (GET /jobs/{id}/sections)."""
     api_root = _resolve_settings(api_base).base_url
-    with httpx.Client(http2=http2, timeout=15.0) as client:
+    with _client(_resolve_settings(api_root), http2=http2, timeout=15.0) as client:
         response = client.get(f"{api_root}/jobs/{job_id}/sections")
         response.raise_for_status()
         data = response.json()
     if json_output:
         typer.echo(json.dumps(data, indent=2))
         return
-    console.print(f"[dim]{data.get('url', '')}[/]  [bold]{len(data.get('sections', []))} sections, {data.get('total_chars', 0)} chars[/]")
+    console.print(
+        f"[dim]{data.get('url', '')}[/]  [bold]{len(data.get('sections', []))} sections, {data.get('total_chars', 0)} chars[/]"
+    )
     for s in data.get("sections", []):
         if s.get("level", 1) > max_depth:
             continue
         indent = "  " * (max(1, s.get("level", 1)) - 1)
-        console.print(f"{indent}- [bold]{s.get('heading')}[/]  (#{s.get('anchor') or '?'}, {s.get('body_chars', 0)} chars)")
+        console.print(
+            f"{indent}- [bold]{s.get('heading')}[/]  (#{s.get('anchor') or '?'}, {s.get('body_chars', 0)} chars)"
+        )
 
 
 @jobs_cli.command("extract")
@@ -3949,7 +4053,7 @@ def jobs_extract(
 ) -> None:
     """Extract structured data (links, tables, code blocks) from a job (GET /jobs/{id}/extract)."""
     api_root = _resolve_settings(api_base).base_url
-    with httpx.Client(http2=http2, timeout=15.0) as client:
+    with _client(_resolve_settings(api_root), http2=http2, timeout=15.0) as client:
         response = client.get(f"{api_root}/jobs/{job_id}/extract")
         response.raise_for_status()
         data = response.json()
@@ -3968,7 +4072,9 @@ def jobs_extract(
         if tables:
             console.print(f"[bold]{len(tables)} tables[/]")
             for i, t in enumerate(tables[:3], start=1):
-                console.print(f"  Table {i}: {len(t.get('headers', []))} cols x {len(t.get('rows', []))} rows")
+                console.print(
+                    f"  Table {i}: {len(t.get('headers', []))} cols x {len(t.get('rows', []))} rows"
+                )
     if not only or only == "code":
         codes = data.get("code_blocks", [])
         if codes:
@@ -3985,7 +4091,7 @@ def jobs_tree(
 ) -> None:
     """Print an ASCII tree of the job's heading structure (from /jobs/{id}/result.json)."""
     api_root = _resolve_settings(api_base).base_url
-    with httpx.Client(http2=http2, timeout=15.0) as client:
+    with _client(_resolve_settings(api_root), http2=http2, timeout=15.0) as client:
         response = client.get(f"{api_root}/jobs/{job_id}/result.json")
         response.raise_for_status()
         data = response.json()
@@ -4023,7 +4129,7 @@ def jobs_retry(
         body["profile_id"] = profile
     if ocr_policy:
         body["ocr_policy"] = ocr_policy
-    with httpx.Client(http2=http2, timeout=30.0) as client:
+    with _client(_resolve_settings(api_root), http2=http2, timeout=30.0) as client:
         response = client.post(f"{api_root}/jobs/{job_id}/replay", json=body)
         response.raise_for_status()
         data = response.json()
@@ -4051,7 +4157,7 @@ def jobs_delete(
         if not confirmed:
             raise typer.Abort()
     api_root = _resolve_settings(api_base).base_url
-    with httpx.Client(http2=http2, timeout=30.0) as client:
+    with _client(_resolve_settings(api_root), http2=http2, timeout=30.0) as client:
         response = client.delete(f"{api_root}/jobs/{job_id}")
         response.raise_for_status()
         data = response.json()

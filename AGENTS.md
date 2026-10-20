@@ -161,9 +161,14 @@ If you see errors, **carefully understand and resolve each issue**. Read suffici
 
 After capture-facing changes, also run:
 ```bash
-uv run playwright test tests/smoke_capture.spec.ts
+uv run --python 3.13 pytest tests/test_full_capture.py tests/test_scroll_policy.py tests/test_browser_ui.py -x
 ```
-This confirms Playwright 1.50+ screenshot APIs still freeze animations under the pinned CfT label/build and whichever transport (CDP/BiDi) was exercised.
+These tests execute native Python Playwright and pyvips to verify animation freezing,
+viewport sweeps, masks, and safe viewer behavior. Record the observed browser build.
+They do not establish CfT pin or BiDi qualification; those require the separate
+browser-build/transport acceptance probes. The Python Playwright CLI has no `test`
+subcommand. `scripts/run_checks.sh` includes these tests in the full Python suite
+and fails if its required browser or libvips preflight fails.
 
 ---
 
@@ -1101,4 +1106,4 @@ NEVER EVER DO THAT AGAIN. The answer is literally ALWAYS the same: those are cha
 
 Also, if I ask you to explicitly use your built-in TODO functionality, don't complain about this and say you need to use beads. You can use built-in TODOs if I tell you specifically to do so. Always comply with such orders.
 
-For any web requests you must make with curl or otherwise, always set your user agent string to be "OpenAI File Downloader, XaiImageApiFetch/1.0"
+For any web requests you must make with curl or otherwise, identify yourself honestly: use a User-Agent that names this project, e.g. "markdown_web_browser-agent (+https://github.com/Dicklesworthstone/markdown_web_browser)". Never borrow another product's or company's crawler or client User-Agent, and never spoof a client to get past a block.

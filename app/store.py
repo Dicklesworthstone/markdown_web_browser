@@ -16,6 +16,7 @@ from enum import Enum
 from pathlib import Path
 import sqlite3
 import sys
+from uuid import uuid4
 import tarfile
 import threading
 import types
@@ -23,7 +24,7 @@ from typing import Any, AsyncIterator, Callable, Generator, Iterable, Mapping, S
 
 import sqlite_vec
 import zstandard as zstd
-from sqlalchemy import Column, desc, event, or_, text
+from sqlalchemy import Column, UniqueConstraint, desc, event, or_, text
 from sqlalchemy.dialects.sqlite import JSON as SQLITE_JSON
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from sqlmodel import Field, Session, SQLModel, col, create_engine, select
@@ -49,7 +50,8 @@ from .embeddings import EMBEDDING_DIM, EmbeddingMatch, search_embeddings  # noqa
 from .settings import load_config  # noqa: E402
 
 # Import models so they're registered with SQLModel.metadata
-from app.auth import APIKey  # noqa: E402, F401 - imported for table registration
+from app.auth import APIKey, ResourceOwner, current_owner  # noqa: E402, F401
+from app.rate_limit import RateLimitBucket  # noqa: E402, F401 - table registration
 
 DEFAULT_JOB_STATE = "BROWSER_STARTING"
 
@@ -93,7 +95,7 @@ class RunRecord(SQLModel, table=True):
     overlap_match_ratio: float | None = None
     validation_failure_count: int | None = None
     profile_id: str | None = None
-    owner: str | None = Field(default=None, index=True)
+    owner_key: str | None = Field(default=None, index=True)
     cache_key: str | None = None
     cache_hit: bool = Field(default=False)
     cache_source_job_id: str | None = None
@@ -137,6 +139,31 @@ class WebhookRecord(SQLModel, table=True):
     url: str
     events: list[str] = Field(default_factory=list, sa_column=Column(SQLITE_JSON))
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class EventCursorRecord(SQLModel, table=True):
+    """Durable namespace and dense sequence for one owner's global feed."""
+
+    __tablename__ = "event_cursors"
+    scope_key: str = Field(primary_key=True)
+    epoch: str
+    sequence: int = -1
+
+
+class JobEventRecord(SQLModel, table=True):
+    """Append-only canonical events; initial admission can precede run allocation."""
+
+    __tablename__ = "job_events"
+    __table_args__ = (
+        UniqueConstraint("job_id", "sequence"),
+        UniqueConstraint("scope_key", "global_sequence"),
+    )
+    id: int | None = Field(default=None, primary_key=True)
+    job_id: str = Field(index=True)
+    sequence: int
+    scope_key: str = Field(index=True)
+    global_sequence: int
+    payload: dict[str, Any] = Field(sa_column=Column(SQLITE_JSON, nullable=False))
 
 
 @dataclass(frozen=True)
@@ -253,13 +280,19 @@ class Store:
         self._ensure_vec_table()
         self._ensure_run_columns()
         self._ensure_indexes()
+        with self.engine.begin() as conn:
+            columns = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(api_keys)")}
+            if "is_admin" not in columns:
+                conn.exec_driver_sql(
+                    "ALTER TABLE api_keys ADD COLUMN is_admin BOOLEAN NOT NULL DEFAULT 0"
+                )
 
     def _ensure_indexes(self) -> None:
         """Create workload-driven indexes on runs, links, webhooks, and embedding metadata."""
         index_ddls = (
             "CREATE INDEX IF NOT EXISTS idx_runs_status_started_at ON runs (status, started_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_runs_cache_lookup ON runs (cache_key, status, started_at DESC)",
-            "CREATE INDEX IF NOT EXISTS idx_runs_owner_started_at ON runs (owner, started_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_runs_owner_started_at ON runs (owner_key, started_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_runs_profile_started_at ON runs (profile_id, started_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_runs_cache_path ON runs (cache_path)",
             "CREATE INDEX IF NOT EXISTS idx_links_run_id ON links (run_id)",
@@ -322,7 +355,7 @@ class Store:
             "overlap_match_ratio": "REAL",
             "validation_failure_count": "INTEGER",
             "profile_id": "TEXT",
-            "owner": "TEXT",
+            "owner_key": "TEXT",
             "cache_key": "TEXT",
             "cache_hit": "INTEGER",
             "cache_source_job_id": "TEXT",
@@ -424,7 +457,7 @@ class Store:
             cache_path=str(paths.root),
             manifest_path=str(paths.manifest_path),
             profile_id=profile_id,
-            owner=owner,
+            owner_key=current_owner() if current_owner() is not None else owner,
             cache_key=cache_key,
             cache_hit=False,
             tags=list(tags) if tags else None,
@@ -475,36 +508,46 @@ class Store:
         with self.session() as session:
             stmt = select(RunRecord)
             count_stmt = select(RunRecord)
-            if enforce_owner or owner is not None:
-                if owner is not None:
-                    stmt = stmt.where(RunRecord.owner == owner)
-                    count_stmt = count_stmt.where(RunRecord.owner == owner)
-                else:
-                    stmt = stmt.where(RunRecord.owner == None)  # noqa: E711
-                    count_stmt = count_stmt.where(RunRecord.owner == None)  # noqa: E711
+            scoped_owner = current_owner()
+            if scoped_owner is None:
+                scoped_owner = owner
+            if scoped_owner is not None:
+                stmt = stmt.where(col(RunRecord.owner_key) == scoped_owner)
+                count_stmt = count_stmt.where(col(RunRecord.owner_key) == scoped_owner)
+            elif enforce_owner:
+                stmt = stmt.where(col(RunRecord.owner_key).is_(None))
+                count_stmt = count_stmt.where(col(RunRecord.owner_key).is_(None))
             if state:
-                stmt = stmt.where(RunRecord.status == state)
-                count_stmt = count_stmt.where(RunRecord.status == state)
+                stmt = stmt.where(col(RunRecord.status) == state)
+                count_stmt = count_stmt.where(col(RunRecord.status) == state)
             if profile_id:
-                stmt = stmt.where(RunRecord.profile_id == profile_id)
-                count_stmt = count_stmt.where(RunRecord.profile_id == profile_id)
+                stmt = stmt.where(col(RunRecord.profile_id) == profile_id)
+                count_stmt = count_stmt.where(col(RunRecord.profile_id) == profile_id)
             if url_contains:
                 stmt = stmt.where(col(RunRecord.url).contains(url_contains))
                 count_stmt = count_stmt.where(col(RunRecord.url).contains(url_contains))
             if tag:
                 try:
                     stmt = stmt.where(
-                        text("EXISTS (SELECT 1 FROM json_each(runs.tags) WHERE json_each.value = :tag)").bindparams(tag=tag)
+                        text(
+                            "EXISTS (SELECT 1 FROM json_each(runs.tags) WHERE json_each.value = :tag)"
+                        ).bindparams(tag=tag)
                     )
                     count_stmt = count_stmt.where(
-                        text("EXISTS (SELECT 1 FROM json_each(runs.tags) WHERE json_each.value = :tag)").bindparams(tag=tag)
+                        text(
+                            "EXISTS (SELECT 1 FROM json_each(runs.tags) WHERE json_each.value = :tag)"
+                        ).bindparams(tag=tag)
                     )
                 except Exception:
                     pass
             if cache_hit is not None:
-                stmt = stmt.where(RunRecord.cache_hit == bool(cache_hit))
-                count_stmt = count_stmt.where(RunRecord.cache_hit == bool(cache_hit))
-            stmt = stmt.order_by(desc(col(RunRecord.started_at))).offset(max(0, offset)).limit(max(1, limit))
+                stmt = stmt.where(col(RunRecord.cache_hit) == bool(cache_hit))
+                count_stmt = count_stmt.where(col(RunRecord.cache_hit) == bool(cache_hit))
+            stmt = (
+                stmt.order_by(col(RunRecord.started_at).desc())
+                .offset(max(0, offset))
+                .limit(max(1, limit))
+            )
             rows = list(session.exec(stmt))
             total = len(list(session.exec(count_stmt)))
             return rows, total
@@ -523,23 +566,22 @@ class Store:
         cutoff_time = cutoff_time.replace(tzinfo=None)
 
         with self.session() as session:
-            owner_clause = (
-                RunRecord.owner == owner
-                if owner is not None
-                else RunRecord.owner == None  # noqa: E711
-            )
             statement = (
                 select(RunRecord)
                 .where(
-                    RunRecord.cache_key == cache_key,
-                    owner_clause,
-                    RunRecord.status == "DONE",
+                    col(RunRecord.cache_key) == cache_key,
+                    col(RunRecord.status) == "DONE",
                     col(RunRecord.finished_at).is_not(None),
                     # Only return cache hits within TTL window
                     col(RunRecord.finished_at) >= cutoff_time,
                 )
-                .order_by(desc(col(RunRecord.finished_at)))
+                .order_by(col(RunRecord.finished_at).desc())
             )
+            scoped_owner = current_owner()
+            if scoped_owner is None:
+                scoped_owner = owner
+            if scoped_owner is not None:
+                statement = statement.where(col(RunRecord.owner_key) == scoped_owner)
             for record in session.exec(statement):
                 if bool(getattr(record, "cache_invalidated", False)):
                     continue
@@ -610,7 +652,7 @@ class Store:
             overlap_match_ratio=source.overlap_match_ratio,
             validation_failure_count=source.validation_failure_count,
             profile_id=source.profile_id,
-            owner=owner if owner is not None else source.owner,
+            owner_key=owner if owner is not None else source.owner_key,
             cache_key=source.cache_key,
             cache_hit=True,
             cache_source_job_id=source.id,
@@ -799,7 +841,7 @@ class Store:
                 raise KeyError(f"Run {job_id} not found")
             statement = (
                 select(WebhookRecord)
-                .where(WebhookRecord.job_id == job_id)
+                .where(col(WebhookRecord.job_id) == job_id)
                 .order_by(col(WebhookRecord.created_at))
             )
             return list(session.exec(statement).all())
@@ -817,11 +859,11 @@ class Store:
             run = session.get(RunRecord, job_id)
             if not run:
                 raise KeyError(f"Run {job_id} not found")
-            statement = select(WebhookRecord).where(WebhookRecord.job_id == job_id)
+            statement = select(WebhookRecord).where(col(WebhookRecord.job_id) == job_id)
             if webhook_id is not None:
-                statement = statement.where(WebhookRecord.id == webhook_id)
+                statement = statement.where(col(WebhookRecord.id) == webhook_id)
             if url:
-                statement = statement.where(WebhookRecord.url == url)
+                statement = statement.where(col(WebhookRecord.url) == url)
             records = list(session.exec(statement))
             if not records:
                 return 0
@@ -843,11 +885,11 @@ class Store:
             run = session.get(RunRecord, job_id)
             if not run:
                 raise KeyError(f"Run {job_id} not found")
-            statement = select(WebhookRecord).where(WebhookRecord.job_id == job_id)
+            statement = select(WebhookRecord).where(col(WebhookRecord.job_id) == job_id)
             if webhook_id is not None:
-                statement = statement.where(WebhookRecord.id == webhook_id)
+                statement = statement.where(col(WebhookRecord.id) == webhook_id)
             if url:
-                statement = statement.where(WebhookRecord.url == url)
+                statement = statement.where(col(WebhookRecord.url) == url)
             records = session.exec(statement).all()
             for record in records:
                 session.delete(record)
@@ -973,6 +1015,7 @@ class Store:
                     "scale_x": tile.scale_x,
                     "scale_y": tile.scale_y,
                     "device_scale_factor": tile.device_scale_factor,
+                    "source_rect": tile.source_rect,
                     "source_y_offset": tile.source_y_offset,
                     "viewport_y_offset": tile.viewport_y_offset,
                     "css_y_offset": tile.css_y_offset,
@@ -999,9 +1042,14 @@ class Store:
         paths.artifacts_manifest_path.parent.mkdir(parents=True, exist_ok=True)
         paths.artifacts_manifest_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
-    def write_links(self, *, job_id: str, links: Sequence[Mapping[str, object]]) -> Path:
+    def write_links(
+        self,
+        *,
+        job_id: str,
+        links: Sequence[Mapping[str, object]] | Mapping[str, object],
+    ) -> Path:
         paths = self._paths_for_job(job_id)
-        payload = [dict(link) for link in links]
+        payload = dict(links) if isinstance(links, Mapping) else [dict(link) for link in links]
         paths.links_path.parent.mkdir(parents=True, exist_ok=True)
         paths.links_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         try:
@@ -1091,10 +1139,7 @@ class Store:
         return artifacts
 
     def read_manifest(self, job_id: str) -> dict[str, Any]:
-        record = self.fetch_run(job_id)
-        if not record:
-            raise KeyError(f"Run {job_id} not found")
-        manifest_path = Path(record.manifest_path)
+        manifest_path = self._paths_for_job(job_id).manifest_path
         if not manifest_path.exists():
             raise FileNotFoundError(manifest_path)
         return json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -1105,35 +1150,35 @@ class Store:
             raise FileNotFoundError(paths.markdown_path)
         return paths.markdown_path.read_text(encoding="utf-8")
 
-    def read_links(self, job_id: str) -> list[dict[str, Any]]:
+    def read_links(self, job_id: str) -> list[dict[str, Any]] | dict[str, Any]:
         paths = self._paths_for_job(job_id)
-        if paths.links_path.exists():
-            raw = json.loads(paths.links_path.read_text(encoding="utf-8"))
-            if isinstance(raw, list):
-                return [dict(item) for item in raw if isinstance(item, Mapping)]
-            if isinstance(raw, Mapping):
-                anchors = raw.get("anchors") or raw.get("links") or []
-                if isinstance(anchors, list):
-                    return [dict(item) for item in anchors if isinstance(item, Mapping)]
-            return []
-        with self.session() as session:
-            stmt = (
-                select(LinkRecord)
-                .where(LinkRecord.run_id == job_id)
-                .order_by(col(LinkRecord.id).asc())
-            )
-            rows = list(session.exec(stmt))
-            if not rows:
-                return []
-            return [
-                {
-                    "href": row.href,
-                    "text": row.text,
-                    "rel": row.rel.split() if isinstance(row.rel, str) and row.rel.strip() else [],
-                    "source": row.source,
-                }
-                for row in rows
-            ]
+        if not paths.links_path.exists():
+            with self.session() as session:
+                stmt = (
+                    select(LinkRecord)
+                    .where(LinkRecord.run_id == job_id)
+                    .order_by(col(LinkRecord.id).asc())
+                )
+                rows = list(session.exec(stmt))
+                if not rows:
+                    return []
+                return [
+                    {
+                        "href": row.href,
+                        "text": row.text,
+                        "rel": row.rel.split() if isinstance(row.rel, str) and row.rel.strip() else [],
+                        "source": row.source,
+                    }
+                    for row in rows
+                ]
+        payload = json.loads(paths.links_path.read_text(encoding="utf-8"))
+        if isinstance(payload, dict):
+            return payload
+        if isinstance(payload, list) and all(isinstance(link, dict) for link in payload):
+            return payload
+        raise ValueError(
+            f"Invalid links payload in {paths.links_path}: expected an object or object list"
+        )
 
     def resolve_artifact(self, job_id: str, relative_path: str) -> Path:
         paths = self._paths_for_job(job_id)
@@ -1333,9 +1378,153 @@ class Store:
     def fetch_run(self, job_id: str) -> RunRecord | None:
         return self._fetch_run(job_id)
 
+    def append_job_event(
+        self, *, job_id: str, owner: str | None, entry: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Allocate both cursors and commit the complete entry in one transaction.
+
+        Called by the manager's bounded writer outside the API event loop.
+        BEGIN IMMEDIATE serializes competing managers before reading counters.
+        """
+        # Freeze nested input and reject non-JSON/nonfinite values before a write.
+        payload = json.loads(json.dumps(entry, allow_nan=False))
+        with self.session() as session:
+            session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            self._append_event_in_session(session, job_id=job_id, owner=owner, payload=payload)
+            session.commit()
+        return payload
+
+    def _append_event_in_session(
+        self, session: Session, *, job_id: str, owner: str | None, payload: dict[str, Any]
+    ) -> None:
+        scope_key = owner or ""
+        grant = session.get(ResourceOwner, f"job:{job_id}")
+        run = session.get(RunRecord, job_id)
+        expected_owner = grant.owner_key if grant else run.owner_key if run else None
+        if owner != expected_owner:
+            raise PermissionError("Event owner does not match the durable job owner")
+        previous = session.exec(
+            select(JobEventRecord)
+            .where(JobEventRecord.job_id == job_id)
+            .order_by(col(JobEventRecord.sequence).desc())
+            .limit(1)
+        ).first()
+        if previous is not None and previous.scope_key != scope_key:
+            raise PermissionError("Event history owner cannot change")
+        sequence = previous.sequence + 1 if previous else 0
+        cursor = session.get(EventCursorRecord, scope_key)
+        if cursor is None:
+            cursor = EventCursorRecord(scope_key=scope_key, epoch=uuid4().hex)
+        cursor.sequence += 1
+        payload.update(job_id=job_id, sequence=sequence, cursor=f"{cursor.epoch}:{cursor.sequence}")
+        if isinstance(payload.get("snapshot"), dict):
+            payload["snapshot"]["sequence"] = sequence
+        session.add(cursor)
+        session.add(
+            JobEventRecord(
+                job_id=job_id,
+                sequence=sequence,
+                scope_key=scope_key,
+                global_sequence=cursor.sequence,
+                payload=payload,
+            )
+        )
+
+    def recover_terminal_event(self, *, job_id: str, owner: str | None) -> dict[str, Any] | None:
+        """Reconcile a terminal run/event crash window without inventing past stages."""
+        with self.session() as session:
+            session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            run = session.get(RunRecord, job_id)
+            if run is None or run.owner_key != owner:
+                return None
+            latest = session.exec(
+                select(JobEventRecord)
+                .where(
+                    JobEventRecord.job_id == job_id,
+                    col(JobEventRecord.payload)["event"].as_string() == "snapshot",
+                )
+                .order_by(col(JobEventRecord.sequence).desc())
+                .limit(1)
+            ).first()
+            if latest is None:
+                return None
+            snapshot = dict(latest.payload["snapshot"])
+            recorded_state = snapshot.get("state")
+            terminal = {"DONE", "FAILED", "CANCELLED"}
+            if run.status not in terminal and recorded_state in {"FAILED", "CANCELLED"}:
+                run.status = str(recorded_state)
+                run.finished_at = run.finished_at or datetime.now(timezone.utc)
+                session.add(run)
+                session.commit()
+                return None
+            if run.status not in terminal or recorded_state == run.status:
+                return None
+            snapshot.update(
+                id=run.id, url=run.url, state=run.status, manifest_path=run.manifest_path
+            )
+            if run.status == "DONE":
+                snapshot["progress"] = {"done": run.tiles_total or 0, "total": run.tiles_total or 0}
+            payload = {
+                "event": "snapshot",
+                "snapshot": snapshot,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "data": {
+                    "reason": "terminal-record-recovery",
+                    "previous_sequence": latest.sequence,
+                },
+            }
+            self._append_event_in_session(session, job_id=job_id, owner=owner, payload=payload)
+            session.commit()
+            return payload
+
+    def read_job_events(
+        self, job_id: str, *, owner: str | None, limit: int = 500
+    ) -> list[dict[str, Any]]:
+        if not 1 <= limit <= 500:
+            raise ValueError("Event history limit must be between 1 and 500")
+        with self.session() as session:
+            records = session.exec(
+                select(JobEventRecord)
+                .where(JobEventRecord.job_id == job_id, JobEventRecord.scope_key == (owner or ""))
+                .order_by(col(JobEventRecord.sequence).desc())
+                .limit(limit)
+            ).all()
+            return [record.payload for record in reversed(records)]
+
+    def read_global_events(
+        self, *, owner: str | None, limit: int = 500
+    ) -> tuple[str, int, list[dict[str, Any]]]:
+        if not 1 <= limit <= 500:
+            raise ValueError("Event history limit must be between 1 and 500")
+        scope_key = owner or ""
+        with self.session() as session:
+            session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            cursor = session.get(EventCursorRecord, scope_key)
+            if cursor is None:
+                cursor = EventCursorRecord(scope_key=scope_key, epoch=uuid4().hex)
+                session.add(cursor)
+                session.flush()
+            records = session.exec(
+                select(JobEventRecord)
+                .where(JobEventRecord.scope_key == scope_key)
+                .order_by(col(JobEventRecord.global_sequence).desc())
+                .limit(limit)
+            ).all()
+            result = (
+                cursor.epoch,
+                cursor.sequence + 1,
+                [record.payload for record in reversed(records)],
+            )
+            session.commit()
+            return result
+
     def _fetch_run(self, job_id: str) -> RunRecord | None:
         with self.session() as session:
-            return session.get(RunRecord, job_id)
+            record = session.get(RunRecord, job_id)
+            owner = current_owner()
+            if record is not None and owner is not None and record.owner_key != owner:
+                return None
+            return record
 
     def delete_run(self, job_id: str) -> bool:
         """Delete the RunRecord (and any related rows) for a job.
@@ -1344,35 +1533,56 @@ class Store:
         Cached artifacts on disk are NOT removed by this method; this only
         cleans up the SQLite rows (embeddings across all dims, links, webhooks, runs).
         """
-        from .embeddings import delete_embeddings as _delete_embeddings
+        from sqlalchemy import delete as _delete
 
         with self.session() as session:
             row = session.get(RunRecord, job_id)
             if row is None:
                 return False
-            _delete_embeddings(session=session, run_id=job_id)
-            conn = session.connection()
-            conn.exec_driver_sql(
-                "DELETE FROM links WHERE run_id = :job_id",
-                {"job_id": job_id},
+            owner = current_owner()
+            if owner is not None and row.owner_key != owner:
+                return False
+            session.connection().exec_driver_sql(
+                "DELETE FROM section_embeddings WHERE run_id = :id",
+                {"id": job_id},
             )
-            conn.exec_driver_sql(
-                "DELETE FROM webhooks WHERE job_id = :job_id",
-                {"job_id": job_id},
+            session.connection().exec_driver_sql(
+                "DELETE FROM section_embedding_meta WHERE run_id = :id",
+                {"id": job_id},
             )
-            conn.exec_driver_sql(
-                "DELETE FROM runs WHERE id = :job_id",
-                {"job_id": job_id},
+            session.exec(_delete(LinkRecord).where(col(LinkRecord.run_id) == job_id))
+            session.exec(_delete(WebhookRecord).where(col(WebhookRecord.job_id) == job_id))
+            session.exec(
+                _delete(ResourceOwner).where(col(ResourceOwner.resource) == f"job:{job_id}")
             )
+            session.exec(_delete(RunRecord).where(col(RunRecord.id) == job_id))
             session.commit()
             return True
+
+    def path_reference_count(self, cache_path: str) -> int:
+        with self.session() as session:
+            return len(
+                list(session.exec(select(RunRecord).where(col(RunRecord.cache_path) == cache_path)))
+            )
 
     def _paths_for_job(self, job_id: str) -> RunPaths:
         record = self.fetch_run(job_id)
         if not record:
             raise KeyError(f"Run {job_id} not found")
         paths = RunPaths.from_record(record)
-        paths.ensure_directories()
+        root = paths.root.resolve()
+        if not root.is_relative_to(self.config.cache_root.resolve()):
+            raise FileNotFoundError("Run root is outside configured cache")
+        for path in (
+            paths.manifest_path,
+            paths.markdown_path,
+            paths.links_path,
+            paths.dom_snapshot_path,
+            paths.artifacts_manifest_path,
+            paths.tiles_dir,
+        ):
+            if not path.resolve().is_relative_to(root):
+                raise FileNotFoundError("Run artifact path escapes its root")
         return paths
 
     def build_bundle(
@@ -1574,7 +1784,11 @@ class Store:
         if "fetch_run" in self.__dict__:
             return await asyncio.to_thread(self.fetch_run, job_id)
         async with self.async_session() as session:
-            return await session.get(RunRecord, job_id)
+            record = await session.get(RunRecord, job_id)
+            owner = current_owner()
+            if record is not None and owner is not None and record.owner_key != owner:
+                return None
+            return record
 
     async def alist_runs(
         self,
@@ -1610,13 +1824,13 @@ class Store:
                 stmt = stmt.where(col(RunRecord.status) == state)
             if profile_id is not None:
                 stmt = stmt.where(col(RunRecord.profile_id) == profile_id)
-            if enforce_owner:
-                if owner is None:
-                    stmt = stmt.where(col(RunRecord.owner).is_(None))
-                else:
-                    stmt = stmt.where(col(RunRecord.owner) == owner)
-            elif owner is not None:
-                stmt = stmt.where(col(RunRecord.owner) == owner)
+            scoped_owner = current_owner()
+            if scoped_owner is None:
+                scoped_owner = owner
+            if scoped_owner is not None:
+                stmt = stmt.where(col(RunRecord.owner_key) == scoped_owner)
+            elif enforce_owner:
+                stmt = stmt.where(col(RunRecord.owner_key).is_(None))
             if cache_hit is True:
                 stmt = stmt.where(col(RunRecord.cache_hit).is_(True))
             elif cache_hit is False:
@@ -2372,6 +2586,7 @@ def _apply_manifest_metadata(record: RunRecord, manifest: Mapping[str, object] |
         _set("ocr_provider", manifest_dict.get("ocr_provider"))
         _set_int("device_scale_factor", manifest_dict.get("device_scale_factor"))
     _set("backend_id", manifest_dict.get("backend_id"))
+    _set("ocr_model", manifest_dict.get("selected_ocr_model"))
     _set("backend_mode", manifest_dict.get("backend_mode"))
     _set("hardware_path", manifest_dict.get("hardware_path"))
     _set_chain(manifest_dict.get("fallback_chain"))

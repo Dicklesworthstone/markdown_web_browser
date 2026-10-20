@@ -1,112 +1,169 @@
 #!/usr/bin/env python3
-"""Tests for browser capture, build pinning, transport reporting, and BrowserPool."""
+"""Local native browser/capture smoke; excludes hosted OCR and CfT qualification."""
 
 from __future__ import annotations
 
-import asyncio
-from dataclasses import replace
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from pathlib import Path
+import hashlib
 import sys
-import threading
+from dataclasses import replace
+from importlib import metadata
+from pathlib import Path
 
+import pyvips
 import pytest
+from playwright.async_api import async_playwright
 
+import app.capture as capture_module
 from app.capture import (
     BrowserPinMismatchError,
-    BrowserPool,
     CaptureConfig,
     UnsupportedTransportError,
-    _normalize_channel,
     _validate_playwright_version,
     build_user_agent_for_version,
     capture_tiles,
-    compute_effective_style_hash,
     format_cft_version,
     resolve_browser_transport,
     verify_browser_build,
 )
-from app.settings import get_settings
+from app.tiler import TileSlice
 
 
-class _SimpleHTMLHandler(BaseHTTPRequestHandler):
-    def do_GET(self) -> None:  # noqa: N802
-        body = (
-            b"<!doctype html><html><head><title>Pin Test</title></head>"
-            b"<body><main><h1>Browser Build Verification</h1><p>Deterministic content.</p></main></body></html>"
-        )
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def log_message(self, format: str, *args: object) -> None:  # noqa: A002
-        return
+COLORS = ((230, 20, 30), (20, 210, 40), (20, 80, 220))
 
 
-@pytest.fixture()
-def local_html_url():
-    server = HTTPServer(("127.0.0.1", 0), _SimpleHTMLHandler)
-    port = server.server_port
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    try:
-        yield f"http://127.0.0.1:{port}/"
-    finally:
-        server.shutdown()
-        server.server_close()
+def _assert_tile_coverage(tiles: list[TileSlice], scroll_height: int) -> None:
+    assert tiles, "Capture tiles missing"
+    assert tiles[0].source_y_offset == 0, "Capture must include the page top"
+    previous_end = 0.0
+    for index, tile in enumerate(tiles):
+        assert tile.index == index
+        assert tile.source_y_offset <= previous_end, "Capture left an uncaptured gap"
+        assert tile.sha256 == hashlib.sha256(tile.png_bytes).hexdigest(), "Tile checksum mismatch"
+        image = pyvips.Image.new_from_buffer(tile.png_bytes, "")
+        assert (image.width, image.height) == (320, 240)
+        assert (tile.width, tile.height) == (image.width, image.height)
+        assert tile.scale == 1.0
+        expected = COLORS[(int(tile.source_y_offset) + 20) // 240]
+        assert tuple(image.getpoint(10, 20)[:3]) == expected, "Known tile pixels absent"
+        previous_end = tile.source_y_offset + tile.height
+    assert previous_end == scroll_height, "Capture must include the page bottom"
 
 
-async def test_playwright_installed() -> None:
-    """Verify Playwright and the configured Chrome channel launch cleanly."""
-    from playwright.async_api import async_playwright
+@pytest.mark.asyncio
+async def test_basic_capture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capture_fixture_url, operator_network_settings
+) -> None:
+    """The native capture pipeline returns complete known content and metadata."""
+    fixture = tmp_path / "capture.html"
+    fixture.write_text(
+        """<!doctype html><html><head><title>Capture smoke fixture</title><style>
+        body { margin: 0; } section { height: 240px; }
+        #top { background: rgb(230, 20, 30); }
+        #middle { background: rgb(20, 210, 40); }
+        #bottom { background: rgb(20, 80, 220); }
+        </style></head><body><section id="top">Top capture section</section>
+        <section id="middle">Middle capture section</section>
+        <section id="bottom">Bottom capture section</section></body></html>""",
+        encoding="utf-8",
+    )
+    settings = operator_network_settings
+    capture_settings = replace(
+        settings,
+        browser=replace(
+            settings.browser,
+            playwright_channel="chromium",
+            viewport_overlap_px=60,
+            tile_overlap_px=40,
+            scroll_settle_ms=0,
+            max_viewport_sweeps=12,
+        ),
+    )
+    monkeypatch.setattr(capture_module, "get_settings", lambda: capture_settings)
+    stages: list[str] = []
 
-    settings = get_settings()
-    channel = _normalize_channel(settings.browser.playwright_channel)
-    async with async_playwright() as p:
-        launch_kwargs: dict[str, object] = {
-            "headless": True,
-            "args": ["--headless=new", "--no-sandbox", "--disable-gpu"],
-        }
-        if channel:
-            launch_kwargs["channel"] = channel
-        browser = await p.chromium.launch(**launch_kwargs)
-        version = browser.version
-        await browser.close()
-    assert version and version[0].isdigit()
+    def record_stage(stage: str, done: int | None, total: int | None) -> None:
+        stages.append(stage)
 
-
-async def test_basic_capture(local_html_url: str) -> None:
-    """Verify real browser capture records observed build, transport, UA, and checklist."""
     config = CaptureConfig(
-        url=local_html_url,
-        viewport_width=1280,
-        viewport_height=800,
+        url=capture_fixture_url(fixture.read_bytes()),
+        viewport_width=320,
+        viewport_height=240,
         device_scale_factor=1,
+        long_side_px=320,
+        stage_callback=record_stage,
     )
     result = await capture_tiles(config)
 
-    assert len(result.tiles) >= 1
-    assert result.manifest.cft_version.startswith("chrome-")
-    observed_ver = result.manifest.cft_version.removeprefix("chrome-")
-    assert f"Chrome/{observed_ver}" in result.manifest.user_agent
-    assert result.manifest.browser_transport == "cdp"
-    assert result.manifest.playwright_version != "unknown"
-    assert result.manifest.screenshot_style_hash == compute_effective_style_hash(
-        settings_browser=get_settings().browser,
-        config=config,
-        blocklist_version=result.manifest.blocklist_version,
+    _assert_tile_coverage(result.tiles, scroll_height=720)
+    assert len(result.tiles) == 4
+    assert result.manifest.tiles_total == len(result.tiles)
+    assert result.manifest.viewport_width == 320
+    assert result.manifest.viewport_height == 240
+    assert result.manifest.device_scale_factor == 1
+    assert result.manifest.url == config.url
+    assert result.manifest.network_policy["mode"] == "public-plus-server-grants"
+    connections = result.manifest.network_policy["connections_opened"]
+    assert isinstance(connections, int) and connections >= 1
+    assert result.manifest.user_agent
+    observed_build = result.manifest.cft_version.removeprefix("chrome-")
+    assert observed_build in result.manifest.user_agent
+    if sys.platform == "linux":
+        assert "Linux" in result.manifest.user_agent
+        assert "Windows NT" not in result.manifest.user_agent
+    assert result.manifest.capture_ms > 0
+    assert result.manifest.playwright_version == metadata.version("playwright")
+    assert result.manifest.playwright_channel == "chromium"
+    assert result.manifest.cft_label and result.manifest.cft_version
+    assert (
+        result.manifest.configured_screenshot_style_hash
+        == capture_settings.browser.screenshot_style_hash
     )
-
+    assert len(result.manifest.screenshot_style_hash) == 64
+    assert result.manifest.browser_transport == capture_settings.browser.browser_transport
+    assert result.manifest.sweep_stats.sweep_count == 4
+    assert result.manifest.sweep_stats.total_scroll_height == 720
+    assert result.manifest.validation_failures == []
+    assert stages[0] == "BROWSER_STARTING"
+    assert stages.count("CAPTURING") == 4
+    assert stages.count("TILING") == 4
+    assert stages.count("SCROLLING") == 3
     checklist = result.manifest.metadata_checklist()
     assert checklist["cft_label"] == result.manifest.cft_label
     assert checklist["cft_version"] == result.manifest.cft_version
-    assert checklist["browser_transport"] == "cdp"
+    assert checklist["browser_transport"] == result.manifest.browser_transport
     assert checklist["playwright_version"] == result.manifest.playwright_version
     assert checklist["screenshot_style_hash"] == result.manifest.screenshot_style_hash
     assert checklist["ocr_model"] == result.manifest.ocr_model
     assert isinstance(checklist["viewport_sweep_retries_triggered"], bool)
+    assert result.dom_snapshot is not None
+    for content in (b"Top capture section", b"Middle capture section", b"Bottom capture section"):
+        assert content in result.dom_snapshot
+
+    with pytest.raises(AssertionError, match="page bottom"):
+        _assert_tile_coverage(result.tiles[:-1], scroll_height=720)
+    corrupt_tile = replace(result.tiles[0], png_bytes=b"invalid PNG bytes")
+    with pytest.raises(AssertionError, match="Tile checksum mismatch"):
+        _assert_tile_coverage([corrupt_tile, *result.tiles[1:]], scroll_height=720)
+
+
+@pytest.mark.asyncio
+async def test_playwright_installed() -> None:
+    """Launch the actual native channel and observe its reported browser build."""
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(channel="chromium", headless=True)
+        try:
+            version_parts = browser.version.split(".")
+            assert len(version_parts) == 4 and all(part.isdigit() for part in version_parts)
+            assert int(version_parts[0]) > 0
+            playwright_version = metadata.version("playwright")
+            assert tuple(int(part) for part in playwright_version.split(".")[:2]) >= (1, 50)
+            print(f"Native Chromium={browser.version}; Playwright={playwright_version}")
+            context = await browser.new_context(viewport={"width": 320, "height": 240})
+            page = await context.new_page()
+            await page.set_content("<h1>Native browser is running</h1>")
+            assert await page.locator("h1").inner_text() == "Native browser is running"
+        finally:
+            await browser.close()
 
 
 def test_resolve_browser_transport_validates_and_rejects_unexercised_bidi() -> None:
@@ -115,16 +172,15 @@ def test_resolve_browser_transport_validates_and_rejects_unexercised_bidi() -> N
     assert resolve_browser_transport("CDP") == "cdp"
     assert resolve_browser_transport("bidi,cdp") == "cdp"
 
-    with pytest.raises(UnsupportedTransportError, match="not supported"):
+    with pytest.raises(UnsupportedTransportError, match="BiDi is unsupported"):
         resolve_browser_transport("bidi")
 
-    with pytest.raises(UnsupportedTransportError, match="Unsupported browser_transport"):
+    with pytest.raises(UnsupportedTransportError, match="Browser transport must be cdp"):
         resolve_browser_transport("websocket-magic")
 
 
 def test_verify_browser_build_enforces_pin_mismatch() -> None:
     """When enforce_pin is enabled, version mismatches raise BrowserPinMismatchError."""
-    # Unpinned mode records the actual observed browser version even if configured differs
     observed = verify_browser_build(
         observed_version="155.0.8059.79",
         configured_version="chrome-130.0.6723.69",
@@ -132,7 +188,6 @@ def test_verify_browser_build_enforces_pin_mismatch() -> None:
     )
     assert observed == "chrome-155.0.8059.79"
 
-    # Pinned mode succeeds when versions match
     matched = verify_browser_build(
         observed_version="155.0.8059.79",
         configured_version="chrome-155.0.8059.79",
@@ -140,7 +195,6 @@ def test_verify_browser_build_enforces_pin_mismatch() -> None:
     )
     assert matched == "chrome-155.0.8059.79"
 
-    # Pinned mode fails fast before navigation/OCR when versions diverge
     with pytest.raises(BrowserPinMismatchError, match="Browser build mismatch"):
         verify_browser_build(
             observed_version="155.0.8059.79",
@@ -149,54 +203,8 @@ def test_verify_browser_build_enforces_pin_mismatch() -> None:
         )
 
 
-async def test_capture_fails_fast_on_pinned_version_or_missing_executable(
-    local_html_url: str,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """capture_tiles must fail before navigation when CFT_ENFORCE_PIN or executable_path fails."""
-    base_settings = get_settings()
-    pinned_browser = replace(
-        base_settings.browser,
-        cft_version="chrome-99.0.1234.56",
-        enforce_version_pin=True,
-    )
-    monkeypatch.setattr(
-        "app.capture.get_settings",
-        lambda: replace(base_settings, browser=pinned_browser),
-    )
-
-    with pytest.raises(BrowserPinMismatchError, match="Browser build mismatch"):
-        await capture_tiles(
-            CaptureConfig(
-                url=local_html_url,
-                viewport_width=800,
-                viewport_height=600,
-                device_scale_factor=1,
-            )
-        )
-
-    missing_exec_browser = replace(
-        base_settings.browser,
-        executable_path=Path("/nonexistent/cft/chrome-binary"),
-        enforce_version_pin=False,
-    )
-    monkeypatch.setattr(
-        "app.capture.get_settings",
-        lambda: replace(base_settings, browser=missing_exec_browser),
-    )
-    with pytest.raises(BrowserPinMismatchError, match="does not exist"):
-        await capture_tiles(
-            CaptureConfig(
-                url=local_html_url,
-                viewport_width=800,
-                viewport_height=600,
-                device_scale_factor=1,
-            )
-        )
-
-
 def test_playwright_version_gate_and_user_agent_builder() -> None:
-    """Playwright version gate requires >= 1.50 and UA reflects actual browser version."""
+    """Playwright version gate requires >= 1.50 and UA reflects the launched browser."""
     assert _validate_playwright_version("1.57.0") == "1.57.0"
     with pytest.raises(RuntimeError, match=">= 1.50"):
         _validate_playwright_version("1.49.0")
@@ -204,80 +212,39 @@ def test_playwright_version_gate_and_user_agent_builder() -> None:
     ua = build_user_agent_for_version("chrome-155.0.8059.79")
     assert "Chrome/155.0.8059.79" in ua
     assert "130.0.0.0" not in ua
+    if sys.platform == "linux":
+        assert "Linux" in ua
+        assert "Windows NT" not in ua
     assert format_cft_version("155.0.8059.79") == "chrome-155.0.8059.79"
 
 
-async def test_browser_pool_concurrency_and_crash_recycling(
+@pytest.mark.asyncio
+async def test_capture_fails_fast_on_pinned_version_or_missing_executable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """BrowserPool caps concurrency, reuses healthy browsers, and recycles crashed ones."""
-
-    class FakePW:
-        async def start(self) -> FakePW:
-            return self
-
-        async def stop(self) -> None:
-            pass
-
-    class FakeBrowser:
-        def __init__(self, idx: int) -> None:
-            self.idx = idx
-            self.version = f"155.0.0.{idx}"
-            self.connected = True
-            self.closed = False
-
-        def is_connected(self) -> bool:
-            return self.connected and not self.closed
-
-        async def close(self) -> None:
-            self.closed = True
-            self.connected = False
-
-    created_browsers: list[FakeBrowser] = []
-
-    async def fake_launch_browser(*args: object, **kwargs: object) -> FakeBrowser:
-        browser = FakeBrowser(len(created_browsers) + 1)
-        created_browsers.append(browser)
-        return browser
-
-    monkeypatch.setattr("app.capture.async_playwright", lambda: FakePW())
-    monkeypatch.setattr("app.capture._launch_browser", fake_launch_browser)
-
-    pool = BrowserPool(max_concurrent=2)
-    active = 0
-    max_active = 0
-    gate = asyncio.Event()
-
-    async def worker(simulate_crash: bool = False) -> int:
-        nonlocal active, max_active
-        async with pool.acquire_browser(
-            channel="cft",
-            viewport_width=800,
-            viewport_height=600,
-        ) as browser:
-            active += 1
-            max_active = max(max_active, active)
-            if active == 2:
-                gate.set()
-            await gate.wait()
-            if simulate_crash:
-                browser.connected = False
-            active -= 1
-            return browser.idx
-
-    results = await asyncio.gather(
-        worker(simulate_crash=True),
-        worker(simulate_crash=False),
-        worker(simulate_crash=False),
+    """Honest CFT launch fails before navigation when the pinned executable is absent."""
+    base_settings = capture_module.get_settings()
+    missing = Path("/nonexistent/cft/chrome-linux64/chrome")
+    pinned_browser = replace(
+        base_settings.browser,
+        playwright_channel="cft",
+        cft_version="chrome-99.0.1234.56",
+        cft_executable=missing,
+        executable_path=missing,
+        browser_transport="cdp",
     )
-    assert max_active <= 2
-    assert len(results) == 3
-    assert pool.recycle_count >= 1
-    assert created_browsers[0].closed is True
+    monkeypatch.setattr(
+        capture_module,
+        "get_settings",
+        lambda: replace(base_settings, browser=pinned_browser),
+    )
 
-    await pool.close_all()
-
-
-if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v"]))
-
+    with pytest.raises(ValueError, match="Pinned CfT executable is missing"):
+        await capture_tiles(
+            CaptureConfig(
+                url="https://example.com",
+                viewport_width=800,
+                viewport_height=600,
+                device_scale_factor=1,
+            )
+        )

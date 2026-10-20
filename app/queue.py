@@ -13,7 +13,7 @@ from arq.connections import ArqRedis, RedisSettings
 from arq.jobs import Job, JobStatus
 from arq.worker import Worker, create_worker, func
 
-from app.settings import Settings
+from app.settings import Settings, load_config
 
 LOGGER = logging.getLogger(__name__)
 
@@ -35,6 +35,8 @@ class QueueConfig:
     redis_port: int = 6379
     redis_database: int = 0
     redis_password: Optional[str] = None
+    redis_username: str | None = None
+    redis_ssl: bool = False
 
     # Worker configuration
     max_jobs: int = 10  # Max concurrent jobs per worker
@@ -49,9 +51,39 @@ class QueueConfig:
     def from_env(cls, settings: Settings | None = None) -> QueueConfig:
         """Load configuration from environment variables."""
 
-        # In a real implementation, these would come from settings
-        # For now, use defaults
-        return cls()
+        from urllib.parse import urlsplit, unquote
+
+        config = load_config(settings.env_path if settings else ".env")
+        url = urlsplit(config("REDIS_URL", default="redis://localhost:6379/0"))
+        if url.scheme not in {"redis", "rediss"} or not url.hostname or url.query or url.fragment:
+            raise ValueError(
+                "REDIS_URL must be a redis:// or rediss:// URL with a host and no query/fragment"
+            )
+        result = cls(
+            redis_host=url.hostname,
+            redis_port=url.port or 6379,
+            redis_database=int(url.path.lstrip("/") or "0"),
+            redis_password=unquote(url.password) if url.password else None,
+            redis_username=unquote(url.username) if url.username else None,
+            redis_ssl=url.scheme == "rediss",
+            max_jobs=config("QUEUE_MAX_JOBS", cast=int, default=10),
+            job_timeout=config("QUEUE_JOB_TIMEOUT", cast=int, default=3600),
+            keep_result=config("QUEUE_KEEP_RESULT", cast=int, default=3600),
+            max_retries=config("QUEUE_MAX_RETRIES", cast=int, default=3),
+            retry_delay=config("QUEUE_RETRY_DELAY", cast=int, default=60),
+        )
+        if (
+            result.redis_database < 0
+            or result.max_jobs < 1
+            or result.job_timeout < 1
+            or result.keep_result < 0
+            or result.max_retries < 0
+            or result.retry_delay < 0
+        ):
+            raise ValueError(
+                "Queue limits must be nonnegative and job concurrency/timeout positive"
+            )
+        return result
 
 
 def get_redis_settings(config: QueueConfig | None = None) -> RedisSettings:
@@ -63,6 +95,9 @@ def get_redis_settings(config: QueueConfig | None = None) -> RedisSettings:
         port=config.redis_port,
         database=config.redis_database,
         password=config.redis_password,
+        username=config.redis_username,
+        ssl=config.redis_ssl,
+        ssl_check_hostname=config.redis_ssl,
     )
 
 
@@ -366,8 +401,13 @@ def create_arq_worker(
     functions = functions or WORKER_FUNCTIONS
 
     return create_worker(
-        WorkerSettings,
+        dict(vars(WorkerSettings)),
+        functions=functions,
         redis_settings=get_redis_settings(config),
+        max_jobs=config.max_jobs,
+        job_timeout=config.job_timeout,
+        keep_result=config.keep_result,
+        max_tries=config.max_retries + 1,
     )
 
 

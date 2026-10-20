@@ -16,6 +16,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from enum import Enum
+from itertools import islice
 
 from rich.console import Console, Group
 from rich.live import Live
@@ -30,7 +31,7 @@ from rich.align import Align
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from app.settings import get_settings
+from app.settings import get_settings, load_config
 
 
 class TestStage(Enum):
@@ -81,7 +82,11 @@ class PipelineMonitor:
         self.start_time = time.time()
 
     def add_event(
-        self, stage: TestStage, message: str, data: Dict[str, Any] = None, level: str = "info"
+        self,
+        stage: TestStage,
+        message: str,
+        data: Dict[str, Any] | None = None,
+        level: str = "info",
     ):
         """Add an event to the pipeline."""
         event = PipelineEvent(
@@ -110,7 +115,7 @@ class PipelineMonitor:
             else:
                 stage_style = "cyan"
 
-            details = ", ".join(f"{k}={v}" for k, v in event.data.items()[:3])
+            details = ", ".join(f"{k}={v}" for k, v in islice(event.data.items(), 3))
 
             table.add_row(
                 time_str,
@@ -154,6 +159,11 @@ class AdvancedIntegrationTester:
         self.api_url = api_url
         self.console = Console(width=160, record=True)
         self.settings = get_settings()
+        cfg = load_config(self.settings.env_path)
+        self.headers = {"User-Agent": "mdwb (+https://github.com/Dicklesworthstone/markdown_web_browser)"}
+        api_key = cfg("MDWB_API_KEY", default="")
+        if api_key:
+            self.headers[self.settings.API_KEY_HEADER] = api_key
         self.test_cases: List[TestCase] = []
         self.results: List[Dict[str, Any]] = []
 
@@ -187,21 +197,26 @@ class AdvancedIntegrationTester:
         ]
 
     async def monitor_job_with_events(
-        self, job_id: str, monitor: PipelineMonitor
+        self, job_id: str, monitor: PipelineMonitor, timeout_s: float = 60.0
     ) -> Dict[str, Any]:
         """Monitor a job and track pipeline events."""
 
-        async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
-            poll_count = 0
-            max_polls = 120
+        async with httpx.AsyncClient(timeout=httpx.Timeout(120.0), headers=self.headers) as client:
+            if timeout_s <= 0:
+                raise ValueError("Test timeout must be positive")
+            deadline = time.monotonic() + timeout_s
             last_state = None
 
-            while poll_count < max_polls:
-                poll_count += 1
-                await asyncio.sleep(0.5)
+            while time.monotonic() < deadline:
+                await asyncio.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
 
                 try:
-                    response = await client.get(f"{self.api_url}/jobs/{job_id}")
+                    response = await asyncio.wait_for(
+                        client.get(f"{self.api_url}/jobs/{job_id}"), timeout=remaining
+                    )
                     if response.status_code != 200:
                         monitor.add_event(
                             TestStage.FAILED,
@@ -270,6 +285,8 @@ class AdvancedIntegrationTester:
                                 if value:
                                     monitor.metrics[f"time_{key}"] = f"{value}ms"
 
+                except TimeoutError:
+                    break
                 except Exception as e:
                     monitor.add_event(
                         TestStage.FAILED, f"Error polling job: {str(e)}", level="error"
@@ -280,6 +297,24 @@ class AdvancedIntegrationTester:
             return {"success": False, "error": "Timeout"}
 
     async def run_test_case(self, test_case: TestCase) -> Dict[str, Any]:
+        """Bound submission, polling, and validation by the case's timeout."""
+        if test_case.timeout <= 0:
+            return {
+                "test_case": test_case.name,
+                "success": False,
+                "data": {"error": "Test timeout must be positive"},
+            }
+        try:
+            async with asyncio.timeout(test_case.timeout):
+                return await self._run_test_case(test_case)
+        except TimeoutError:
+            return {
+                "test_case": test_case.name,
+                "success": False,
+                "data": {"error": f"Timeout after {test_case.timeout}s"},
+            }
+
+    async def _run_test_case(self, test_case: TestCase) -> Dict[str, Any]:
         """Run a single test case with detailed monitoring."""
 
         monitor = PipelineMonitor(self.console)
@@ -292,7 +327,7 @@ class AdvancedIntegrationTester:
             )
 
             # Submit job
-            async with httpx.AsyncClient() as client:
+            async with httpx.AsyncClient(headers=self.headers) as client:
                 monitor.add_event(TestStage.INIT, "Submitting capture job")
 
                 response = await client.post(
@@ -313,7 +348,9 @@ class AdvancedIntegrationTester:
             layout = self.create_monitoring_layout(test_case, monitor)
 
             with Live(layout, refresh_per_second=2, console=self.console):
-                job_result = await self.monitor_job_with_events(job_id, monitor)
+                job_result = await self.monitor_job_with_events(
+                    job_id, monitor, timeout_s=test_case.timeout
+                )
 
                 # Validate results
                 if job_result["success"]:
@@ -349,47 +386,86 @@ class AdvancedIntegrationTester:
         validation = {"success": True, "checks": {}}
 
         try:
-            async with httpx.AsyncClient() as client:
+            async with httpx.AsyncClient(headers=self.headers) as client:
                 # Check manifest
                 manifest = job_data.get("manifest", {})
 
-                if test_case.expected_tiles and manifest.get("tiles_total"):
-                    actual_tiles = manifest["tiles_total"]
-                    expected_tiles = test_case.expected_tiles
-                    tiles_match = abs(actual_tiles - expected_tiles) <= 2  # Allow some variance
+                if not isinstance(manifest, dict):
+                    raise ValueError("Job manifest must be an object")
+                actual_tiles = manifest.get("tiles_total")
+                expected_tiles = test_case.expected_tiles
+                tiles_match = (
+                    isinstance(actual_tiles, int)
+                    and not isinstance(actual_tiles, bool)
+                    and actual_tiles > 0
+                    and (
+                        expected_tiles is None
+                        or abs(actual_tiles - expected_tiles) <= 2  # Original tolerance
+                    )
+                )
 
-                    validation["checks"]["tiles"] = {
-                        "expected": expected_tiles,
-                        "actual": actual_tiles,
-                        "passed": tiles_match,
-                    }
+                validation["checks"]["tiles"] = {
+                    "expected": expected_tiles,
+                    "actual": actual_tiles,
+                    "passed": tiles_match,
+                }
 
-                    if tiles_match:
-                        monitor.add_event(
-                            TestStage.VALIDATION,
-                            f"Tile count validated: {actual_tiles}",
-                            level="success",
-                        )
-                    else:
-                        monitor.add_event(
-                            TestStage.VALIDATION,
-                            f"Tile count mismatch: expected {expected_tiles}, got {actual_tiles}",
-                            level="warning",
-                        )
-                        validation["success"] = False
+                if tiles_match:
+                    monitor.add_event(
+                        TestStage.VALIDATION,
+                        f"Tile count validated: {actual_tiles}",
+                        level="success",
+                    )
+                else:
+                    monitor.add_event(
+                        TestStage.VALIDATION,
+                        f"Tile count missing or mismatched: expected {expected_tiles}, got {actual_tiles}",
+                        level="error",
+                    )
+                    validation["success"] = False
 
                 # Check artifacts exist
-                artifacts = ["out.md", "links.json", "manifest.json"]
+                artifacts = ["result.md", "links.json", "manifest.json"]
                 for artifact in artifacts:
                     response = await client.get(f"{self.api_url}/jobs/{job_id}/{artifact}")
                     exists = response.status_code == 200
+                    valid = exists and bool(response.content.strip())
+                    if valid and artifact in {"links.json", "manifest.json"}:
+                        payload = response.json()
+                        if artifact == "manifest.json":
+                            valid = isinstance(payload, dict) and bool(payload)
+                        else:
+                            if isinstance(payload, dict):
+                                if "domains" in payload:
+                                    links = [
+                                        link
+                                        for domain in payload["domains"]
+                                        for link in domain["links"]
+                                    ]
+                                else:
+                                    links = payload.get("anchors")
+                            else:
+                                links = payload
+                            valid = isinstance(links, list) and all(
+                                isinstance(link, dict) for link in links
+                            )
+                            if test_case.expected_links is not None:
+                                count = len(links) if valid else None
+                                links_match = count == test_case.expected_links
+                                validation["checks"]["links"] = {
+                                    "expected": test_case.expected_links,
+                                    "actual": count,
+                                    "passed": links_match,
+                                }
+                                valid = valid and links_match
 
                     validation["checks"][artifact] = {
                         "exists": exists,
                         "size": len(response.content) if exists else 0,
+                        "passed": valid,
                     }
 
-                    if exists:
+                    if valid:
                         monitor.add_event(
                             TestStage.VALIDATION,
                             f"Artifact {artifact} verified",
@@ -398,7 +474,9 @@ class AdvancedIntegrationTester:
                         )
                     else:
                         monitor.add_event(
-                            TestStage.VALIDATION, f"Artifact {artifact} missing", level="error"
+                            TestStage.VALIDATION,
+                            f"Artifact {artifact} missing, empty, or invalid",
+                            level="error",
                         )
                         validation["success"] = False
 
@@ -470,7 +548,7 @@ class AdvancedIntegrationTester:
         info_grid.add_row("API URL:", self.api_url, "Test Cases:", str(len(self.test_cases)))
         info_grid.add_row(
             "OCR Server:",
-            self.settings.OLMOCR_SERVER[:40],
+            self.settings.ocr.server_url[:40],
             "Timestamp:",
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         )
@@ -603,6 +681,8 @@ async def main():
 
     tester = AdvancedIntegrationTester(api_url=args.api_url)
     await tester.run_all_tests()
+    if not tester.results or any(not result["success"] for result in tester.results):
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

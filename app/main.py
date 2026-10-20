@@ -6,6 +6,7 @@ import asyncio
 import html
 import json
 import logging
+import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,11 +25,21 @@ from prometheus_client import start_http_server
 from prometheus_fastapi_instrumentator import Instrumentator
 
 from app import metrics
-from app.auth import check_job_owner_access, ensure_owner_access, get_request_owner
+from app.auth import AUTH_CONTEXT, authenticate, claim_resource, current_owner, owns_resource
+from app.rate_limit import consume_shared
 from app.crawler import CrawlConfig, get_crawler, submit_and_wait_for_job
 from app.dom_links import blend_dom_with_ocr, demo_dom_links, demo_ocr_links, serialize_links
-from app.jobs import JobManager, JobSnapshot, JobState, _parse_markdown_sections, build_signed_webhook_sender
-from app.rate_limit import RateLimitMiddleware
+from app.jobs import (
+    EventHistoryGap,
+    EventPersistenceError,
+    GlobalEventHistoryGap,
+    JobManager,
+    JobSnapshot,
+    JobState,
+    _parse_markdown_sections,
+    build_signed_webhook_sender,
+    request_from_manifest,
+)
 from app.schemas import (
     BatchJobItem,
     BatchJobRequest,
@@ -60,13 +71,28 @@ from app.schemas import (
     JobTagRequest,
     JobSharePublicResponse,
     JobShareResponse,
-    JobTocResponse, TocEntry, JobSummaryResponse,
-    JobSearchTextRequest, EmbeddingBatchRequest, EmbeddingBatchItem, EmbeddingBatchResponse,
-    JobCountsResponse, EmbedderStatsResponse,
-    JobReplayRequest, JobReplayResponse, JobDeleteResponse,
-    JobSectionsResponse, ExtractedLink, ExtractedTable, ExtractedCodeBlock,
-    ExtractResponse, LinkLookupResponse,
-    AdminStatsResponse, AdminPruneRequest, AdminPruneResponse, AdminCacheClearResponse,
+    JobTocResponse,
+    TocEntry,
+    JobSummaryResponse,
+    JobSearchTextRequest,
+    EmbeddingBatchRequest,
+    EmbeddingBatchItem,
+    EmbeddingBatchResponse,
+    JobCountsResponse,
+    EmbedderStatsResponse,
+    JobReplayRequest,
+    JobReplayResponse,
+    JobDeleteResponse,
+    JobSectionsResponse,
+    ExtractedLink,
+    ExtractedTable,
+    ExtractedCodeBlock,
+    ExtractResponse,
+    LinkLookupResponse,
+    AdminStatsResponse,
+    AdminPruneRequest,
+    AdminPruneResponse,
+    AdminCacheClearResponse,
     JobTagResponse,
     EmbeddingStoreRequest,
     EmbeddingStoreResponse,
@@ -75,15 +101,20 @@ from app.schemas import (
     BatchStatusResponse,
     JobArtifactsResponse,
     JobEventsJsonResponse,
-    HeadingBodyResponse, FollowResponse, ExportMdResponse,
-    BatchQueryRequest, BatchQueryResponse, CacheMetricsResponse, QueueMetricsResponse,
+    HeadingBodyResponse,
+    FollowResponse,
+    ExportMdResponse,
+    BatchQueryRequest,
+    BatchQueryResponse,
+    CacheMetricsResponse,
+    QueueMetricsResponse,
     JobLinksResponse,
     WebhookRegistrationRequest,
     WebhookSubscription,
     WebhookDeleteRequest,
 )
 from app.settings import settings
-from app.store import build_store
+from app.store import RunPaths, build_store
 from app.warning_log import summarize_dom_assists
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -131,7 +162,6 @@ async def _lifespan(_: FastAPI):
 
 
 app = FastAPI(title="Markdown Web Browser", lifespan=_lifespan)
-app.add_middleware(RateLimitMiddleware)
 app.mount("/static", StaticFiles(directory=WEB_ROOT), name="static")
 instrumentator = Instrumentator(should_instrument_requests_inprogress=True)
 instrumentator.instrument(app)
@@ -212,6 +242,125 @@ def _normalize_links_anchors(payload: Any) -> list[dict[str, Any]]:
         return []
     return [dict(a) for a in anchors if isinstance(a, Mapping)]
 
+_SESSION_COOKIE = "mdwb_session"
+_PUBLIC_PATHS = {"/", "/browser", "/health", "/health/live", "/health/ready", "/auth/config"}
+_JOB_COLLECTIONS = {"batch", "crawl", "search", "stream", "demo"}
+
+
+@app.exception_handler(EventPersistenceError)
+async def event_journal_unavailable(request: Request, exc: EventPersistenceError) -> JSONResponse:
+    return JSONResponse(status_code=503, content={"detail": {"code": "event-journal-unavailable"}})
+
+
+@app.middleware("http")
+async def access_control(request: Request, call_next):
+    """Authenticate before route admission and confine all job surfaces to owners."""
+    path = request.url.path
+    public = (
+        path in _PUBLIC_PATHS
+        or path.startswith("/static/")
+        or bool(re.fullmatch(r"/jobs/share/[^/]+", path))
+    )
+    if public or (path == "/auth/session" and request.method == "DELETE"):
+        response = await call_next(request)
+        if path.startswith("/jobs/share/"):
+            response.headers["Cache-Control"] = "no-store"
+        return response
+    key = request.headers.get(settings.API_KEY_HEADER)
+    authorization = request.headers.get("Authorization", "")
+    if key is None and authorization.startswith("Bearer "):
+        key = authorization[7:]
+    cookie_auth = settings.REQUIRE_API_KEY and key is None and _SESSION_COOKIE in request.cookies
+    if cookie_auth:
+        key = request.cookies[_SESSION_COOKIE]
+        if request.method not in {"GET", "HEAD", "OPTIONS"}:
+            origin = str(request.url.replace(path="", query="")).rstrip("/")
+            if request.headers.get("Origin") != origin:
+                return JSONResponse({"detail": "Same-origin request required"}, status_code=403)
+    try:
+        context = await asyncio.to_thread(authenticate, key, store, settings)
+    except HTTPException as exc:
+        return JSONResponse(
+            {"detail": exc.detail}, status_code=exc.status_code, headers=exc.headers
+        )
+    request.state.auth_context = context
+    token = AUTH_CONTEXT.set(context)
+    try:
+        if context.owner_key is not None:
+            if path.startswith("/admin/") and not context.is_admin:
+                return JSONResponse({"detail": "Administrator key required"}, status_code=403)
+            match = re.match(r"^/jobs/([^/]+)", path)
+            resource = None
+            if match and match.group(1) not in _JOB_COLLECTIONS and match.group(1) != "share":
+                resource = f"job:{match.group(1)}"
+            if path.startswith("/crawl/"):
+                resource = f"crawl:{path.split('/')[2]}"
+            if resource is not None and not await asyncio.to_thread(
+                owns_resource,
+                store,
+                resource,
+                context.owner_key,
+            ):
+                return JSONResponse({"detail": "Resource not found"}, status_code=404)
+            # Demo routes expose fixtures, never a tenant's artifacts.
+            allowed, quota = await asyncio.to_thread(
+                consume_shared,
+                store.engine,
+                f"api_key:{context.api_key_id}",
+                context.rate_limit or settings.RATE_LIMIT_PER_MINUTE,
+            )
+            headers = {
+                "Cache-Control": "private, no-store",
+                "X-RateLimit-Limit": str(quota["limit"]),
+                "X-RateLimit-Remaining": str(quota["remaining"]),
+                "X-RateLimit-Reset": str(quota["reset"]),
+            }
+            if not allowed:
+                headers["Retry-After"] = str(quota["retry_after"])
+                return JSONResponse(
+                    {"detail": "Rate limit exceeded"}, status_code=429, headers=headers
+                )
+        else:
+            headers = {}
+        response = await call_next(request)
+        response.headers.update(headers)
+        return response
+    finally:
+        AUTH_CONTEXT.reset(token)
+
+
+@app.get("/auth/config")
+async def auth_config() -> dict[str, Any]:
+    return {"required": settings.REQUIRE_API_KEY, "header": settings.API_KEY_HEADER}
+
+
+@app.post("/auth/session", status_code=204)
+async def browser_session(request: Request):
+    # The admission middleware has verified the supplied header credential.
+    if not settings.REQUIRE_API_KEY:
+        raise HTTPException(status_code=400, detail="API key authentication is disabled")
+    key = request.headers.get(settings.API_KEY_HEADER)
+    if key is None:
+        raise HTTPException(status_code=401, detail="Provide the configured API key header")
+    response = PlainTextResponse("", status_code=204)
+    response.set_cookie(
+        _SESSION_COOKIE,
+        key,
+        httponly=True,
+        secure=request.url.scheme == "https",
+        samesite="strict",
+        path="/",
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.delete("/auth/session", status_code=204)
+async def browser_logout():
+    response = PlainTextResponse("", status_code=204)
+    response.delete_cookie(_SESSION_COOKIE, path="/")
+    return response
+
 
 def _demo_manifest_payload() -> dict:
     warnings = [
@@ -280,6 +429,41 @@ def _snapshot_to_response(snapshot: JobSnapshot) -> JobSnapshotResponse:
         profile_id=snapshot.get("profile_id"),
         cache_hit=snapshot.get("cache_hit"),
     )
+
+
+def _link_anchors(payload: Any) -> list[dict[str, Any]]:
+    """Consume the persisted flat links list and structured DOM payloads."""
+    values = payload.get("anchors", []) if isinstance(payload, dict) else payload
+    if not isinstance(values, list):
+        return []
+    return [entry for entry in values if isinstance(entry, dict)]
+
+
+
+def get_request_owner(request: Request | None = None) -> str | None:
+    """Authenticated journal owner. Callers keep the name; identity is current_owner()."""
+    del request
+    return current_owner()
+
+
+def ensure_owner_access(request: Request, resource_owner: str | None) -> None:
+    """404 when the authenticated owner does not own the resource."""
+    del request
+    owner = current_owner()
+    if owner is None:
+        return
+    if resource_owner != owner:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Resource not found")
+
+
+def check_job_owner_access(request: Request, job_id: str) -> None:
+    """404 unless the authenticated owner holds this job resource."""
+    del request
+    owner = current_owner()
+    if owner is None or not job_id:
+        return
+    if not owns_resource(store, f"job:{job_id}", owner):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Resource not found")
 
 
 def _render_highlight_page(*, job_id: str, tile: str, y0: int, y1: int) -> str:
@@ -422,9 +606,6 @@ async def health_beads() -> dict:
         return {"status": "error", "detail": str(exc)}
 
 
-
-
-
 @app.get("/embedders", tags=["embed"])
 async def list_embedders_endpoint() -> dict[str, Any]:
     """List available embedders + which one is the default."""
@@ -473,7 +654,7 @@ async def schema_discovery() -> dict[str, Any]:
                 "GET /jobs": "List jobs with filters (state, profile_id, url_contains, cache_hit, tag, limit, offset).",
                 "GET /jobs/{id}": "Fetch latest job snapshot. Returns JobSnapshotResponse.",
                 "GET /jobs/{id}/stream": "SSE: live state + manifest progress events.",
-                "GET /jobs/{id}/events": "NDJSON: structured event log (cursor-based via ?since=ISO).",
+                "GET /jobs/{id}/events": "NDJSON: structured event log; reconnect via ?after=sequence. A missing history range returns 409; ?since=ISO filters timestamps.",
                 "GET /crawl/{id}": "Live crawl status with per-URL outcomes.",
             },
             "artifacts": {
@@ -493,7 +674,7 @@ async def schema_discovery() -> dict[str, Any]:
                 "DELETE /jobs/{id}/webhooks": "Remove a webhook (by id or url).",
             },
             "observability": {
-                "GET /health": "Health check (returns {\"status\": \"ok\"}).",
+                "GET /health": 'Health check (returns {"status": "ok"}).',
                 "GET /metrics": "Prometheus scrape endpoint (text).",
                 "GET /metrics/slo": "JSON: latest capture/OCR SLO rollup with per-category p50/p95 + budget breaches.",
                 "GET /schema": "This endpoint. Optimized for LLM agents.",
@@ -533,7 +714,6 @@ async def schema_discovery() -> dict[str, Any]:
     }
 
 
-
 def _compute_live_slo_summary() -> dict[str, Any]:
     """Compute a capture/OCR SLO rollup from the latest manifest index.
 
@@ -547,7 +727,11 @@ def _compute_live_slo_summary() -> dict[str, Any]:
         load_budgets,
     )
 
-    summary: dict[str, Any] = {"status": "no-data", "categories": {}, "generated_at": datetime.now(timezone.utc).isoformat()}
+    summary: dict[str, Any] = {
+        "status": "no-data",
+        "categories": {},
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
     candidates = [
         Path("benchmarks/production/latest_manifest_index.json"),
         Path("benchmarks/production/weekly_summary.json"),
@@ -624,9 +808,11 @@ async def _call_create_job(
 
 
 @app.post("/jobs", response_model=JobSnapshotResponse, status_code=status.HTTP_202_ACCEPTED)
-async def create_job(request: JobCreateRequest, http_request: Request) -> JobSnapshotResponse:
-    owner = get_request_owner(http_request)
-    snapshot = await _call_create_job(request, owner=owner)
+async def create_job(request: JobCreateRequest) -> JobSnapshotResponse:
+    try:
+        snapshot = await JOB_MANAGER.create_job(request)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return _snapshot_to_response(snapshot)
 
 
@@ -753,7 +939,7 @@ async def start_crawl(request: CrawlRequest, http_request: Request) -> CrawlResp
         )
 
     crawl_id = await _crawler.start_crawl(config, capture_fn=_capture)
-    _crawl_owners[crawl_id] = owner
+    claim_resource(store, f"crawl:{crawl_id}")
     import asyncio
 
     await asyncio.sleep(0)
@@ -792,8 +978,9 @@ async def get_crawl_status(crawl_id: str, http_request: Request) -> CrawlStatusR
     )
 
 
-
-@app.post("/jobs/{job_id}/rerun", response_model=JobRerunResponse, status_code=status.HTTP_202_ACCEPTED)
+@app.post(
+    "/jobs/{job_id}/rerun", response_model=JobRerunResponse, status_code=status.HTTP_202_ACCEPTED
+)
 async def rerun_job(
     job_id: str,
     http_request: Request,
@@ -815,16 +1002,12 @@ async def rerun_job(
     profile_id = snapshot.get("profile_id")
     tags = list(snapshot.get("tags") or [])
     manifest = snapshot.get("manifest") if isinstance(snapshot.get("manifest"), Mapping) else {}
-    ocr_policy = manifest.get("requested_ocr_policy") or manifest.get("selected_ocr_policy")
-    ocr_model = manifest.get("ocr_model")
-    new_request = JobCreateRequest(
-        url=url,
-        profile_id=profile_id,
-        reuse_cache=reuse_cache,
-        ocr_policy=ocr_policy if isinstance(ocr_policy, str) else None,
-        ocr_model=ocr_model if isinstance(ocr_model, str) else None,
-    )
-    new_snapshot = await _call_create_job(new_request, tags=tags, owner=owner)
+    try:
+        new_request = request_from_manifest({**manifest, "url": url, "profile_id": profile_id})
+        new_request.reuse_cache = reuse_cache
+        new_snapshot = await JOB_MANAGER.create_job(new_request, tags=tags)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     new_id = str(new_snapshot.get("job_id") or new_snapshot.get("id") or "")
     return JobRerunResponse(
         original_job_id=job_id,
@@ -867,27 +1050,39 @@ async def diff_jobs(job_id: str, request: JobDiffRequest, http_request: Request)
         a = sections_a.get(anchor_key)
         b = sections_b.get(anchor_key)
         if a is None:
+            assert b is not None  # anchor_key belongs to the union of the two maps
             diffs.append(
                 JobDiffSection(
-                    heading=b["heading"], anchor=anchor_key, state="added",
-                    a_chars=0, b_chars=len(b["body"]), a_excerpt="",
+                    heading=b["heading"],
+                    anchor=anchor_key,
+                    state="added",
+                    a_chars=0,
+                    b_chars=len(b["body"]),
+                    a_excerpt="",
                     b_excerpt=b["body"][: request.max_chars_per_section],
                 )
             )
         elif b is None:
             diffs.append(
                 JobDiffSection(
-                    heading=a["heading"], anchor=anchor_key, state="removed",
-                    a_chars=len(a["body"]), b_chars=0,
-                    a_excerpt=a["body"][: request.max_chars_per_section], b_excerpt="",
+                    heading=a["heading"],
+                    anchor=anchor_key,
+                    state="removed",
+                    a_chars=len(a["body"]),
+                    b_chars=0,
+                    a_excerpt=a["body"][: request.max_chars_per_section],
+                    b_excerpt="",
                 )
             )
         else:
             state = "changed" if a["body"] != b["body"] else "unchanged"
             diffs.append(
                 JobDiffSection(
-                    heading=a["heading"], anchor=anchor_key, state=state,
-                    a_chars=len(a["body"]), b_chars=len(b["body"]),
+                    heading=a["heading"],
+                    anchor=anchor_key,
+                    state=state,
+                    a_chars=len(a["body"]),
+                    b_chars=len(b["body"]),
                     a_excerpt=a["body"][: request.max_chars_per_section],
                     b_excerpt=b["body"][: request.max_chars_per_section],
                 )
@@ -1075,48 +1270,75 @@ async def schema_json() -> dict:
 
 
 @app.get("/jobs/stream")
-async def jobs_global_stream(request: Request) -> StreamingResponse:
-    """SSE stream of ALL job state changes across the system."""
-    import asyncio
-    import json as _json
-
-    subscribe_fn = getattr(JOB_MANAGER, "subscribe_global", None)
-    unsubscribe_fn = getattr(JOB_MANAGER, "unsubscribe_global", None)
-    if callable(subscribe_fn):
-        queue = subscribe_fn()
-        sub_id = id(queue)
-        subscribers = None
-    else:
-        queue = asyncio.Queue(maxsize=256)
-        sub_id = id(queue)
-        subscribers = getattr(JOB_MANAGER, "_subscribers", {})
-        subscribers.setdefault(sub_id, []).append(queue)
+async def jobs_global_stream(request: Request, after: str | None = None) -> StreamingResponse:
+    """Stream this owner's job events with the per-job sequence contract."""
+    after = request.headers.get("last-event-id") or after
+    await JOB_MANAGER.restore_global_history()
+    try:
+        backlog, queue, cursor = JOB_MANAGER.subscribe_global_events(after=after)
+    except GlobalEventHistoryGap as exc:
+        raise HTTPException(status_code=409, detail=exc.detail) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     async def event_generator() -> AsyncIterator[str]:
+        last_cursor = cursor
         try:
-            yield f"data: {_json.dumps({'event': 'subscribed', 'subscriber_id': sub_id})}\n\n"
-            while True:
-                if await request.is_disconnected():
+            # Establish the tail before live delivery, even for an empty owner.
+            # Replays commit their own cursors below, without skipping backlog.
+            if not backlog:
+                yield f'id: {cursor}\ndata: {{"event":"subscribed"}}\n\n'
+            for entry in backlog:
+                last_cursor = entry["cursor"]
+                yield f"id: {last_cursor}\ndata: {_serialize_log_entry(entry)}\n\n"
+            while not await request.is_disconnected():
+                try:
+                    JOB_MANAGER.check_event_journal()
+                except EventPersistenceError:
+                    yield 'event: error\ndata: {"code":"event-journal-unavailable"}\n\n'
                     break
                 try:
-                    snap = await asyncio.wait_for(queue.get(), timeout=15.0)
+                    entry = await asyncio.wait_for(queue.get(), timeout=1.0)
                 except asyncio.TimeoutError:
-                    yield ": heartbeat\n\n"
+                    try:
+                        await JOB_MANAGER.restore_global_history()
+                        missed = JOB_MANAGER.get_global_events(after=last_cursor)
+                    except GlobalEventHistoryGap as exc:
+                        yield f"event: gap\ndata: {json.dumps(exc.detail)}\n\n"
+                        break
+                    except EventPersistenceError:
+                        yield 'event: error\ndata: {"code":"event-journal-unavailable"}\n\n'
+                        break
+                    for event in missed:
+                        last_cursor = event["cursor"]
+                        yield f"id: {last_cursor}\ndata: {_serialize_log_entry(event)}\n\n"
+                    if not missed:
+                        yield ": heartbeat\n\n"
                     continue
-                yield f"data: {_json.dumps(snap, default=str)}\n\n"
+                sequence = int(entry["cursor"].split(":")[1])
+                previous = int(last_cursor.split(":")[1])
+                if sequence <= previous:
+                    continue
+                if sequence > previous + 1:
+                    try:
+                        missed = JOB_MANAGER.get_global_events(after=last_cursor)
+                    except GlobalEventHistoryGap as exc:
+                        yield f"event: gap\ndata: {json.dumps(exc.detail)}\n\n"
+                        break
+                else:
+                    missed = [entry]
+                for event in missed:
+                    last_cursor = event["cursor"]
+                    yield f"id: {last_cursor}\ndata: {_serialize_log_entry(event)}\n\n"
         finally:
-            if callable(unsubscribe_fn):
-                unsubscribe_fn(queue)
-            elif isinstance(subscribers, dict):
-                subs = subscribers.get(sub_id, [])
-                if queue in subs:
-                    subs.remove(queue)
+            JOB_MANAGER.unsubscribe_all(queue)
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
 @app.get("/jobs/{job_id}", response_model=JobSnapshotResponse)
 async def fetch_job(job_id: str) -> JobSnapshotResponse:
+    await JOB_MANAGER.restore_job_history(job_id)
     try:
         snapshot = await _async_get_snapshot(job_id)
     except KeyError as exc:  # pragma: no cover - runtime only
@@ -1144,84 +1366,154 @@ async def replay_job(request: ReplayRequest, http_request: Request) -> JobSnapsh
 
 
 @app.get("/jobs/{job_id}/stream")
-async def job_stream(job_id: str, request: Request) -> StreamingResponse:
-    try:
-        queue = JOB_MANAGER.subscribe(job_id)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail="Job not found") from exc
+async def job_stream(job_id: str, request: Request, after: int | None = None) -> StreamingResponse:
+    header_cursor = request.headers.get("last-event-id")
+    if header_cursor is not None:
+        if len(header_cursor) > 20 or not re.fullmatch(r"-1|[0-9]+", header_cursor):
+            raise HTTPException(status_code=400, detail="Invalid job event cursor")
+        after = int(header_cursor)
+    if after is not None and after < -1:
+        raise HTTPException(status_code=400, detail="Event cursor must be at least -1")
+    if job_id == "demo":
+        queue = asyncio.Queue()
+        backlog = [{"event": "snapshot", "snapshot": _demo_snapshot()}]
+    else:
+        await JOB_MANAGER.restore_job_history(job_id)
+        try:
+            backlog, queue = JOB_MANAGER.subscribe_events(job_id, min_sequence=after)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Job not found") from exc
+        except EventHistoryGap as exc:
+            raise HTTPException(status_code=409, detail=exc.detail) from exc
+        if not backlog and after is None:
+            # A pre-journal run has a current persisted result, but no replayable
+            # history. Show that result without manufacturing a sequence/ID.
+            backlog = [{"event": "snapshot", "snapshot": JOB_MANAGER.get_snapshot(job_id)}]
 
     async def event_generator() -> AsyncIterator[str]:
-        heartbeat = 0
         try:
-            while True:
-                try:
-                    snapshot = await asyncio.wait_for(queue.get(), timeout=5)
-                except asyncio.TimeoutError:
-                    heartbeat += 1
-                    metrics.increment_sse_heartbeat()
-                    yield f"event: log\ndata: <li>Heartbeat {heartbeat}: waiting for updates…</li>\n\n"
-                    if await request.is_disconnected():
-                        break
+            async for entry in _job_event_feed(job_id, request, backlog, queue, after):
+                if entry["event"] == "heartbeat":
+                    yield ": heartbeat\n\n"
                     continue
-                for event_name, payload in _snapshot_events(snapshot):
-                    yield f"event: {event_name}\ndata: {payload}\n\n"
-                if await request.is_disconnected():
+                if entry["event"] in {"gap", "error"}:
+                    yield f"event: {entry['event']}\ndata: {_serialize_log_entry(entry)}\n\n"
                     break
+                snapshot = entry.get("snapshot", {})
+                for event_name, payload in _snapshot_events(snapshot):
+                    yield _sse_frame(event_name, payload)
+                if entry["event"] != "snapshot":
+                    payload = json.dumps(entry.get("data", {}))
+                    yield _sse_frame(entry["event"], payload)
+                if snapshot.get("state") == "DONE" and job_id != "demo":
+                    try:
+                        markdown = await asyncio.to_thread(JOB_MANAGER.store.read_markdown, job_id)
+                    except (KeyError, FileNotFoundError):
+                        markdown = ""
+                    if markdown:
+                        yield _sse_frame("raw", markdown)
+                # Commit the ID only AFTER the complete HTML/raw group. A
+                # disconnect halfway through safely replays the whole group.
+                sequence = _extract_sequence(entry)
+                if sequence is not None:
+                    yield f"event: job-event\nid: {sequence}\ndata: {_serialize_log_entry(entry)}\n\n"
         finally:
-            JOB_MANAGER.unsubscribe(job_id, queue)
+            if job_id != "demo":
+                JOB_MANAGER.unsubscribe_events(job_id, queue)
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
-@app.get("/jobs/{job_id}/events")
-async def job_events(
+async def _job_event_feed(
     job_id: str,
     request: Request,
-    since: str | None = None,
-    min_sequence: int | None = None,
+    backlog: list[dict[str, Any]],
+    queue: asyncio.Queue[dict[str, Any]],
+    after: int | None,
+) -> AsyncIterator[dict[str, Any]]:
+    """Replay retained events and repair bounded queue drops for both transports."""
+    last_sequence = _extract_sequence(backlog[-1]) if backlog else after
+    for entry in backlog:
+        yield entry
+    heartbeat = 0
+    while not await request.is_disconnected():
+        try:
+            JOB_MANAGER.check_event_journal()
+        except EventPersistenceError:
+            yield {"event": "error", "code": "event-journal-unavailable"}
+            return
+        try:
+            entry = await asyncio.wait_for(queue.get(), timeout=1)
+        except asyncio.TimeoutError:
+            try:
+                await JOB_MANAGER.restore_job_history(job_id)
+                missed = JOB_MANAGER.get_events(job_id, min_sequence=last_sequence)
+            except EventHistoryGap as exc:
+                yield {"event": "gap", **exc.detail}
+                return
+            except EventPersistenceError:
+                yield {"event": "error", "code": "event-journal-unavailable"}
+                return
+            except KeyError:
+                yield {"event": "error", "code": "job-not-found"}
+                return
+            if missed:
+                for event in missed:
+                    last_sequence = _extract_sequence(event)
+                    yield event
+                heartbeat = 0
+                continue
+            heartbeat += 1
+            metrics.increment_sse_heartbeat()
+            yield {
+                "event": "heartbeat",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "data": {"count": heartbeat},
+            }
+            continue
+        heartbeat = 0
+        sequence = _extract_sequence(entry)
+        if sequence is not None and last_sequence is not None:
+            if sequence <= last_sequence:
+                continue
+            if sequence > last_sequence + 1:
+                try:
+                    missed = JOB_MANAGER.get_events(job_id, min_sequence=last_sequence)
+                except EventHistoryGap as exc:
+                    yield {"event": "gap", **exc.detail}
+                    return
+                for event in missed:
+                    last_sequence = _extract_sequence(event)
+                    yield event
+                continue
+        if sequence is not None:
+            last_sequence = sequence
+        yield entry
+
+
+@app.get("/jobs/{job_id}/events")
+async def job_events(
+    job_id: str, request: Request, since: str | None = None, after: int | None = None
 ) -> StreamingResponse:
     parsed_since = _parse_since(since)
+    if after is not None and after < -1:
+        raise HTTPException(status_code=400, detail="Event cursor must be at least -1")
+    await JOB_MANAGER.restore_job_history(job_id)
     try:
-        try:
-            backlog, queue = JOB_MANAGER.subscribe_events(
-                job_id, since=parsed_since, min_sequence=min_sequence
-            )
-        except TypeError:
-            backlog, queue = JOB_MANAGER.subscribe_events(job_id, since=parsed_since)
+        backlog, queue = JOB_MANAGER.subscribe_events(
+            job_id, since=parsed_since, min_sequence=after
+        )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Job not found") from exc
+    except EventHistoryGap as exc:
+        raise HTTPException(status_code=409, detail=exc.detail) from exc
 
     async def event_generator() -> AsyncIterator[str]:
-        heartbeat = 0
-        last_sequence = _extract_sequence(backlog[-1]) if backlog else min_sequence
+
         try:
-            for entry in backlog:
+            async for entry in _job_event_feed(job_id, request, backlog, queue, after):
                 yield _serialize_log_entry(entry) + "\n"
-            while True:
-                try:
-                    event_entry = await asyncio.wait_for(queue.get(), timeout=5)
-                    heartbeat = 0
-                    sequence = _extract_sequence(event_entry)
-                    if (
-                        sequence is not None
-                        and last_sequence is not None
-                        and sequence <= last_sequence
-                    ):
-                        continue
-                    if sequence is not None:
-                        last_sequence = sequence
-                    yield _serialize_log_entry(event_entry) + "\n"
-                except asyncio.TimeoutError:
-                    heartbeat += 1
-                    metrics.increment_sse_heartbeat()
-                    heartbeat_entry = {
-                        "event": "heartbeat",
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                        "data": {"count": heartbeat},
-                    }
-                    yield json.dumps(heartbeat_entry) + "\n"
-                if await request.is_disconnected():
-                    break
+
         finally:
             JOB_MANAGER.unsubscribe_events(job_id, queue)
 
@@ -1237,7 +1529,8 @@ async def job_links(job_id: str) -> list[dict[str, object]]:
         return serialize_links(blended)
     active_store = _active_store()
     try:
-        return await _async_read_links(active_store, job_id)
+        payload = await _async_read_links(active_store, job_id)
+        return _normalize_links_anchors(payload)
     except (json.JSONDecodeError, ValueError) as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -1375,6 +1668,14 @@ async def share_job(
     if await _async_get_snapshot(job_id) is None:
         raise HTTPException(status_code=404, detail="Job not found")
     secret = (settings.webhook_secret or "mdwb-dev-webhook").encode("utf-8")
+    if settings.REQUIRE_API_KEY and (
+        settings.webhook_secret == "mdwb-dev-webhook" or len(secret) < 32
+    ):
+        raise HTTPException(
+            status_code=503, detail="Configure a private WEBHOOK_SECRET before sharing"
+        )
+    if JOB_MANAGER.get_snapshot(job_id) is None:
+        raise HTTPException(status_code=404, detail="Job not found")
     expires_at = int(time.time()) + max(60, ttl_seconds)
     payload = {"job_id": job_id, "exp": expires_at}
     body = _json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
@@ -1441,14 +1742,18 @@ async def public_share_view(token: str) -> JobSharePublicResponse:
     import time as _time
 
     secret = (settings.webhook_secret or "mdwb-dev-webhook").encode("utf-8")
+    if settings.REQUIRE_API_KEY and (
+        settings.webhook_secret == "mdwb-dev-webhook" or len(secret) < 32
+    ):
+        raise HTTPException(status_code=404, detail="Invalid share token")
     pad = "=" * ((4 - len(token) % 4) % 4)
     try:
         decoded = base64.urlsafe_b64decode(token + pad)
     except Exception:
         raise HTTPException(status_code=404, detail="Invalid share token") from None
-    if b"." not in decoded:
+    if len(decoded) < 34 or decoded[-33:-32] != b".":
         raise HTTPException(status_code=404, detail="Invalid share token")
-    body, sig = decoded.rsplit(b".", 1)
+    body, sig = decoded[:-33], decoded[-32:]
     expected = hmac.new(secret, body, hashlib.sha256).digest()
     if not hmac.compare_digest(sig, expected):
         raise HTTPException(status_code=404, detail="Invalid share token")
@@ -1456,7 +1761,9 @@ async def public_share_view(token: str) -> JobSharePublicResponse:
         payload = _json.loads(body)
     except Exception:
         raise HTTPException(status_code=404, detail="Invalid share token") from None
-    if int(payload.get("exp", 0)) < _time.time():
+    if not isinstance(payload, dict) or not isinstance(payload.get("exp"), int):
+        raise HTTPException(status_code=404, detail="Invalid share token")
+    if payload["exp"] < _time.time():
         raise HTTPException(status_code=404, detail="Share token expired")
     target_job = payload.get("job_id")
     if not isinstance(target_job, str):
@@ -1464,24 +1771,41 @@ async def public_share_view(token: str) -> JobSharePublicResponse:
     snap = await _async_get_snapshot(target_job)
     if snap is None:
         raise HTTPException(status_code=404, detail="Job not found")
+    raw_manifest = snap.get("manifest") or {}
+    public_fields = {
+        "tiles_total",
+        "capture_ms",
+        "ocr_ms",
+        "stitch_ms",
+        "cft_label",
+        "cft_version",
+        "playwright_version",
+        "browser_transport",
+        "screenshot_style_hash",
+        "long_side_px",
+        "selected_ocr_model",
+    }
+    manifest = {key: value for key, value in raw_manifest.items() if key in public_fields}
+    from urllib.parse import urlsplit, urlunsplit
+
+    source_url = urlsplit(str(snap.get("url") or ""))
+    public_url = urlunsplit(
+        (source_url.scheme, source_url.netloc.rsplit("@", 1)[-1], source_url.path, "", "")
+    )
     return JobSharePublicResponse(
         job_id=target_job,
-        url=str(snap.get("url") or ""),
+        url=public_url,
         state=str(snap.get("state", "UNKNOWN")),
         cache_hit=bool(snap.get("cache_hit")),
-        profile_id=None,
-        tags=list(snap.get("tags") or []),
         created_at=str(snap.get("started_at") or "") or None,
         finished_at=str(snap.get("finished_at") or "") or None,
-        manifest=_redact_public_manifest(snap.get("manifest")),
+        manifest=manifest,
         share_expires_at=str(payload.get("exp") or ""),
     )
 
 
 @app.post("/jobs/{job_id}/embeddings/store", response_model=EmbeddingStoreResponse)
-async def store_embeddings(
-    job_id: str, request: EmbeddingStoreRequest
-) -> EmbeddingStoreResponse:
+async def store_embeddings(job_id: str, request: EmbeddingStoreRequest) -> EmbeddingStoreResponse:
     """Re-compute and persist section embeddings (any model in /embedders)."""
     from app.embedders import get_embedder, list_embedders
 
@@ -1620,9 +1944,7 @@ async def store_embeddings(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:  # pragma: no cover
-        raise HTTPException(
-            status_code=500, detail=f"failed to persist embeddings: {exc}"
-        ) from exc
+        raise HTTPException(status_code=500, detail=f"failed to persist embeddings: {exc}") from exc
 
     return EmbeddingStoreResponse(
         job_id=job_id,
@@ -1636,6 +1958,7 @@ async def store_embeddings(
 @app.get("/jobs/{job_id}/raw")
 async def job_raw_events(job_id: str, min_sequence: int | None = None) -> dict:
     """JSON array of the entire event log (single-shot, vs. the streaming NDJSON at /events)."""
+    await JOB_MANAGER.restore_job_history(job_id)
     try:
         events = await asyncio.to_thread(
             JOB_MANAGER.get_events, job_id, since=None, min_sequence=min_sequence
@@ -1652,6 +1975,7 @@ async def job_heading(job_id: str, heading: str) -> HeadingBodyResponse:
     Resolves the heading by exact text match (case-insensitive); 404 if not found.
     Agents use this to drill into "give me the body of the Pricing section".
     """
+    structured: dict[str, Any]
     try:
         structured = await _async_get_structured(job_id)
     except KeyError as exc:
@@ -1671,7 +1995,7 @@ async def job_heading(job_id: str, heading: str) -> HeadingBodyResponse:
     body = matched.get("body", "") or ""
     matched_level = matched.get("level", 1)
     subsections: list = []
-    for s in sections[match_idx + 1:]:
+    for s in sections[match_idx + 1 :]:
         if s.get("level", 1) <= matched_level:
             break
         subsections.append(
@@ -1782,14 +2106,13 @@ async def job_export_md(
 
 
 @app.post("/jobs/{job_id}/queries", response_model=BatchQueryResponse)
-async def batch_queries(
-    job_id: str, request: BatchQueryRequest
-) -> BatchQueryResponse:
+async def batch_queries(job_id: str, request: BatchQueryRequest) -> BatchQueryResponse:
     """Answer multiple queries in one HTTP call.
 
     Each query in ``request.queries`` is one of:
     ``sections``, ``links``, ``headings``, ``summary``, ``toc``.
     """
+    structured: dict[str, Any]
     results: dict = {}
     qset = {q.lower() for q in request.queries}
     active_store = _active_store()
@@ -1803,7 +2126,12 @@ async def batch_queries(
         secs = structured.get("sections", []) or []
         if "sections" in qset or "headings" in qset:
             results["sections"] = [
-                {"level": s.get("level", 1), "heading": s.get("heading"), "anchor": s.get("anchor"), "body_chars": len(s.get("body") or "")}
+                {
+                    "level": s.get("level", 1),
+                    "heading": s.get("heading"),
+                    "anchor": s.get("anchor"),
+                    "body_chars": len(s.get("body") or ""),
+                }
                 for s in secs
             ]
         if "toc" in qset:
@@ -1918,8 +2246,7 @@ async def metrics_queue() -> QueueMetricsResponse:
     except Exception:
         pass
     watchdog_running = bool(
-        JOB_MANAGER._watchdog_task is not None
-        and not JOB_MANAGER._watchdog_task.done()
+        JOB_MANAGER._watchdog_task is not None and not JOB_MANAGER._watchdog_task.done()
     )
     # Approximate watchdog uptime via the task's start time
     uptime: float | None = None
@@ -1998,6 +2325,7 @@ async def job_sections(job_id: str) -> JobSectionsResponse:
     Cheaper than /jobs/{id}/toc because it doesn't include outbound links.
     Agents can pair this with /jobs/{id}/links/{query} to drill down.
     """
+    structured: dict[str, Any]
     try:
         structured = await _async_get_structured(job_id)
     except KeyError as exc:
@@ -2243,7 +2571,7 @@ async def admin_jobs_prune(request: AdminPruneRequest) -> AdminPruneResponse:
     if not request.dry_run:
         for jid in candidates:
             try:
-                resp = await job_delete(jid, dry_run=False)
+                resp = await job_delete(jid)
                 if resp.deleted:
                     deleted += 1
             except Exception:
@@ -2290,6 +2618,7 @@ async def job_toc(job_id: str, max_links: int = 50) -> JobTocResponse:
     fetching the full Markdown. Sections are derived from ``/jobs/{id}/result.json``;
     outbound links from ``/jobs/{id}/links.json``.
     """
+    structured: dict[str, Any]
     try:
         structured = await _async_get_structured(job_id)
     except KeyError as exc:
@@ -2330,6 +2659,7 @@ async def job_summary(job_id: str) -> JobSummaryResponse:
     """Compact natural-language summary of a captured page."""
     from datetime import datetime, timezone
 
+    structured: dict[str, Any]
     try:
         structured = await _async_get_structured(job_id)
     except KeyError as exc:
@@ -2379,6 +2709,7 @@ async def search_jobs_text(
 ) -> JobSearchResponse:
     """Alias of POST /jobs/search kept for text-search UX clarity."""
     from app.schemas import JobSearchRequest
+
     inner = JobSearchRequest(**request.model_dump())
     return await search_jobs(inner, http_request=http_request)
 
@@ -2487,16 +2818,16 @@ async def job_replay(
         raise HTTPException(status_code=400, detail="Original job has no URL; cannot replay")
     profile_id = request.profile_id or snap.get("profile_id")
     tags = list(snap.get("tags") or [])
-    raw_manifest = snap.get("manifest")
-    manifest = raw_manifest if isinstance(raw_manifest, Mapping) else {}
-    ocr_policy = request.ocr_policy or manifest.get("requested_ocr_policy") or manifest.get("selected_ocr_policy")
-    new_request = JobCreateRequest(
-        url=url,
-        profile_id=profile_id,
-        reuse_cache=request.reuse_cache,
-        ocr_policy=ocr_policy if isinstance(ocr_policy, str) else None,
-    )
-    new_snapshot = await _call_create_job(new_request, tags=tags, owner=owner)
+    raw_manifest = snap.get("manifest") if isinstance(snap.get("manifest"), Mapping) else {}
+    try:
+        new_request = request_from_manifest({**raw_manifest, "url": url})
+        new_request.profile_id = profile_id
+        new_request.reuse_cache = request.reuse_cache
+        if request.ocr_policy is not None:
+            new_request.ocr_policy = request.ocr_policy
+        new_snapshot = await JOB_MANAGER.create_job(new_request, tags=tags)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return JobReplayResponse(
         original_job_id=job_id,
         new_job_id=str(new_snapshot.get("job_id") or new_snapshot.get("id") or ""),
@@ -2505,96 +2836,62 @@ async def job_replay(
 
 
 @app.delete("/jobs/{job_id}", response_model=JobDeleteResponse)
-async def job_delete(job_id: str, dry_run: bool = False) -> JobDeleteResponse:
-    """Purge a job's run record from storage with shared-cache reference accounting.
+async def job_delete(job_id: str, purge_artifacts: bool = False) -> JobDeleteResponse:
+    """Remove a run; filesystem purging requires an explicit opt-in."""
+    import shutil
 
-    Non-destructive on disk: preserves on-disk files (especially when shared by
-    cached runs) and reports actual effects vs. candidate file/byte counts.
-    """
-    from app.store import RunPaths
+    task = JOB_MANAGER._tasks.get(job_id)
+    if task is not None and not task.done():
+        raise HTTPException(status_code=409, detail="Cancel the active job before removing its run")
 
+    paths: list = []
+    bytes_freed = 0
     active_store = _active_store()
-    candidate_files = 0
-    candidate_bytes = 0
-    shared_with: list[str] = []
-    purge_at_iso: str | None = None
     try:
         record = await _async_fetch_run(active_store, job_id)
     except Exception:
         record = None
-
-    if record is not None:
+    if record is not None and purge_artifacts:
         try:
-            if hasattr(active_store, "acache_path_references"):
-                shared_with = list(await active_store.acache_path_references(job_id))
-            elif hasattr(active_store, "cache_path_references"):
-                shared_with = list(await asyncio.to_thread(active_store.cache_path_references, job_id))
-        except Exception:
-            shared_with = []
-        raw_purge = getattr(record, "purge_at", None)
-        if hasattr(raw_purge, "isoformat"):
-            purge_at_iso = raw_purge.isoformat()
-        elif isinstance(raw_purge, str) and raw_purge.strip():
-            purge_at_iso = raw_purge.strip()
-        if not shared_with:
-            def _scan_files() -> tuple[int, int]:
-                c_files = 0
-                c_bytes = 0
-                try:
-                    paths = RunPaths.from_record(record)
-                    if paths.root.exists():
-                        for p in paths.root.rglob("*"):
-                            if p.is_file():
-                                c_files += 1
-                                try:
-                                    c_bytes += p.stat().st_size
-                                except OSError:
-                                    pass
-                except Exception:
-                    pass
-                return c_files, c_bytes
-
-            candidate_files, candidate_bytes = await asyncio.to_thread(_scan_files)
-
-    if dry_run:
-        return JobDeleteResponse(
-            job_id=job_id,
-            deleted=False,
-            dry_run=True,
-            artifacts_removed=0,
-            bytes_freed=0,
-            candidate_files=candidate_files,
-            candidate_bytes=candidate_bytes,
-            shared_with_job_ids=shared_with,
-            artifacts_preserved=True,
-            purge_at=purge_at_iso,
-        )
-
-    deleted_row = False
+            artifact_root = RunPaths.from_record(record).root.resolve()
+            cache_root = active_store.config.cache_root.resolve()
+            if not artifact_root.is_relative_to(cache_root) or artifact_root == cache_root:
+                raise HTTPException(status_code=409, detail="Artifact root is outside the cache")
+            if active_store.path_reference_count(record.cache_path) > 1:
+                raise HTTPException(status_code=409, detail="Artifacts are shared with another run")
+            if artifact_root.exists():
+                for p in artifact_root.rglob("*"):
+                    if p.is_file():
+                        try:
+                            bytes_freed += p.stat().st_size
+                        except OSError:
+                            pass
+                shutil.rmtree(artifact_root)
+                paths.append(artifact_root)
+        except HTTPException:
+            raise
+        except OSError as exc:
+            raise HTTPException(
+                status_code=500, detail="Artifact purge failed; run metadata retained"
+            ) from exc
     try:
-        if hasattr(active_store, "adelete_run"):
-            deleted_row = bool(await active_store.adelete_run(job_id))
-        else:
-            deleted_row = bool(await asyncio.to_thread(active_store.delete_run, job_id))
+        removed = bool(await asyncio.to_thread(active_store.delete_run, job_id))
     except Exception:
-        deleted_row = False
-    removed_mem = False
-    if hasattr(JOB_MANAGER, "remove_job_state"):
-        try:
-            removed_mem = bool(JOB_MANAGER.remove_job_state(job_id))
-        except Exception:
-            removed_mem = False
+        removed = False
+    if removed:
+        if hasattr(JOB_MANAGER, "remove_job_state"):
+            try:
+                JOB_MANAGER.remove_job_state(job_id)
+            except Exception:
+                pass
+        JOB_MANAGER._snapshots.pop(job_id, None)
+        JOB_MANAGER._job_tags.pop(job_id, None)
+        JOB_MANAGER._job_owners.pop(job_id, None)
     return JobDeleteResponse(
         job_id=job_id,
-        deleted=bool(deleted_row or removed_mem or record is not None),
-        dry_run=False,
-        artifacts_removed=0,
-        bytes_freed=0,
-        candidate_files=candidate_files,
-        candidate_bytes=candidate_bytes,
-        shared_with_job_ids=shared_with,
-        artifacts_preserved=True,
-        purge_at=purge_at_iso,
+        deleted=removed,
+        artifacts_removed=len(paths),
+        bytes_freed=bytes_freed,
     )
 
 
@@ -2620,23 +2917,20 @@ async def job_slo_json(job_id: str) -> Slosummary:
 
 @app.get("/jobs/{job_id}/events.json", response_model=JobEventsJsonResponse)
 async def job_events_json(
-    job_id: str,
-    since: str | None = None,
-    min_sequence: int | None = None,
+    job_id: str, since: str | None = None, after: int | None = None
 ) -> JobEventsJsonResponse:
     """Single-shot JSON dump of the event log (vs. the streaming NDJSON at /events)."""
     parsed = _parse_since(since)
+    if after is not None and after < -1:
+        raise HTTPException(status_code=400, detail="Event cursor must be at least -1")
+    await JOB_MANAGER.restore_job_history(job_id)
     try:
-        events = await asyncio.to_thread(
-            JOB_MANAGER.get_events, job_id, since=parsed, min_sequence=min_sequence
-        )
+        events = JOB_MANAGER.get_events(job_id, since=parsed, min_sequence=after)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Job not found") from exc
-    return JobEventsJsonResponse(
-        job_id=job_id,
-        count=len(events),
-        events=events,
-    )
+    except EventHistoryGap as exc:
+        raise HTTPException(status_code=409, detail=exc.detail) from exc
+    return JobEventsJsonResponse(job_id=job_id, count=len(events), events=events)
 
 
 @app.get("/jobs/{job_id}/links", response_model=JobLinksResponse)
@@ -2703,104 +2997,43 @@ async def job_artifacts(
     Resolves ``RunPaths`` from ``Store`` as authority, verifies SHA256 digests,
     paginates inventory, and emits relative URLs without leaking host paths.
     """
-    import hashlib
-    from pathlib import Path as _P
-    from app.schemas import JobArtifactsFile
+    record = store.fetch_run(job_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    root = RunPaths.from_record(record).root.resolve()
+    if not root.is_relative_to(store.config.cache_root.resolve()):
+        raise HTTPException(status_code=409, detail="Artifact root is outside the cache")
+    if not root.is_dir():
+        raise HTTPException(status_code=404, detail="Artifact root is unavailable")
+    artifact_root = str(root)
+    files: list[dict] = []
+    if artifact_root:
+        from pathlib import Path as _P
 
-    active_store = _active_store()
-    try:
-        manifest = await _async_read_manifest(active_store, job_id)
-    except (json.JSONDecodeError, ValueError) as exc:
-        raise HTTPException(status_code=422, detail=f"Corrupt manifest JSON: {exc}") from exc
-    except Exception:
-        manifest = None
-    if not isinstance(manifest, dict):
-        raise HTTPException(status_code=404, detail="Manifest not available")
-
-    try:
-        record = await _async_fetch_run(active_store, job_id)
-    except Exception:
-        record = None
-
-    if record is not None and hasattr(active_store, "inventory_artifacts"):
-        try:
-            if hasattr(active_store, "ainventory_artifacts"):
-                inv = await active_store.ainventory_artifacts(job_id)
-            else:
-                inv = await asyncio.to_thread(active_store.inventory_artifacts, job_id)
-        except (ValueError, FileNotFoundError) as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail="Job not found") from exc
-        all_files = [JobArtifactsFile(**f) for f in inv.get("files", [])]
-        paginated = all_files[offset : offset + limit]
-        return JobArtifactsResponse(
-            job_id=job_id,
-            artifact_root=str(inv.get("artifact_root") or f"/jobs/{job_id}/artifact"),
-            file_count=int(inv.get("file_count", len(all_files))),
-            total_bytes=int(inv.get("total_bytes", sum(f.size for f in all_files))),
-            offset=offset,
-            limit=limit,
-            has_more=(offset + limit) < len(all_files),
-            cache_hit=bool(inv.get("cache_hit", False)),
-            cache_source_job_id=inv.get("cache_source_job_id"),
-            shared_with_job_ids=list(inv.get("shared_with_job_ids") or []),
-            purge_at=inv.get("purge_at"),
-            files=paginated,
-            synthetic={
+        root = _P(artifact_root)
+        for p in sorted(root.rglob("*")) if root.exists() else []:
+            if p.is_file() and p.resolve().is_relative_to(root):
+                files.append(
+                    {
+                        "path": str(p.relative_to(root)),
+                        "absolute": str(p),
+                        "size": p.stat().st_size,
+                        "kind": "tile" if "tile" in p.parts else p.suffix.lstrip(".") or "file",
+                    }
+                )
+    return JobArtifactsResponse.model_validate(
+        {
+            "job_id": job_id,
+            "artifact_root": artifact_root,
+            "file_count": len(files),
+            "total_bytes": sum(f["size"] for f in files),
+            "files": files,
+            "synthetic": {
                 "structured_result": f"/jobs/{job_id}/result.json",
                 "per_job_slo": f"/jobs/{job_id}/slo",
                 "raw_markdown": f"/jobs/{job_id}/result.md?raw=true",
             },
-        )
-
-    artifact_root = str(manifest.get("artifact_root") or manifest.get("cache_path") or "")
-
-    def _scan_fallback() -> list[JobArtifactsFile]:
-        found: list[JobArtifactsFile] = []
-        if artifact_root:
-            root = _P(artifact_root)
-            for p in sorted(root.rglob("*")) if root.exists() else []:
-                if p.is_file():
-                    rel_path = p.relative_to(root).as_posix()
-                    data = p.read_bytes()
-                    rel_url = (
-                        f"/jobs/{job_id}/manifest.json"
-                        if rel_path == "manifest.json"
-                        else f"/jobs/{job_id}/result.md"
-                        if rel_path == "out.md"
-                        else f"/jobs/{job_id}/links.json"
-                        if rel_path == "links.json"
-                        else f"/jobs/{job_id}/artifact/{rel_path}"
-                    )
-                    found.append(
-                        JobArtifactsFile(
-                            path=rel_path,
-                            url=rel_url,
-                            absolute=rel_url,
-                            size=len(data),
-                            sha256=hashlib.sha256(data).hexdigest(),
-                            kind="tile" if ("tile" in p.parts or p.name.startswith("tile_")) else p.suffix.lstrip(".") or "file",
-                        )
-                    )
-        return found
-
-    files = await asyncio.to_thread(_scan_fallback)
-    paginated = files[offset : offset + limit]
-    return JobArtifactsResponse(
-        job_id=job_id,
-        artifact_root=f"/jobs/{job_id}/artifact" if artifact_root else "",
-        file_count=len(files),
-        total_bytes=sum(f.size for f in files),
-        offset=offset,
-        limit=limit,
-        has_more=(offset + limit) < len(files),
-        files=paginated,
-        synthetic={
-            "structured_result": f"/jobs/{job_id}/result.json",
-            "per_job_slo": f"/jobs/{job_id}/slo",
-            "raw_markdown": f"/jobs/{job_id}/result.md?raw=true",
-        },
+        }
     )
 
 
@@ -2825,7 +3058,6 @@ async def jobs_batch_status(
         count=len(statuses),
         statuses=[BatchStatusItem(**s) for s in statuses],
     )
-
 
 
 @app.get("/jobs/{job_id}/result.json", response_model=StructuredResult)
@@ -2860,6 +3092,7 @@ async def job_markdown(job_id: str, raw: bool = False) -> PlainTextResponse:
         raise HTTPException(status_code=404, detail="Markdown not available yet") from None
     if raw:
         import re as _re
+
         markdown = _re.sub(r"<!--[\s\S]*?-->\n?", "", markdown, flags=_re.DOTALL).strip()
     return PlainTextResponse(markdown, media_type="text/markdown")
 
@@ -2898,7 +3131,13 @@ async def job_artifact(job_id: str, artifact_path: str) -> FileResponse:
             target = await asyncio.to_thread(active_store.resolve_artifact, job_id, artifact_path)
     except (KeyError, FileNotFoundError) as exc:
         raise HTTPException(status_code=404, detail="Artifact not found") from exc
-    return FileResponse(target)
+    return FileResponse(
+        target,
+        headers={
+            "Content-Security-Policy": "sandbox; default-src 'none'",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 @app.post("/jobs/{job_id}/embeddings/search", response_model=EmbeddingSearchResponse)
@@ -3112,6 +3351,13 @@ def _serialize_log_entry(entry: dict[str, Any]) -> str:
     payload = entry.copy()
     payload.setdefault("event", "snapshot")
     return json.dumps(payload)
+
+
+def _sse_frame(event: str, payload: str) -> str:
+    # Bare lines are SSE protocol fields. Keep provider error text inside data.
+    normalized = payload.replace("\r\n", "\n").replace("\r", "\n")
+    lines = "\n".join(f"data: {line}" for line in normalized.split("\n"))
+    return f"event: {event}\n{lines}\n\n"
 
 
 def _extract_sequence(entry: Mapping[str, Any]) -> int | None:

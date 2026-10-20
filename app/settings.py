@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import ipaddress
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -56,6 +57,8 @@ class BrowserSettings:
     executable_path: Path | None = None
     enforce_version_pin: bool = False
     max_concurrent_browsers: int = 4
+    cft_executable: Path | None = None
+    fontconfig_file: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,6 +172,9 @@ class Settings:
     api_base_url: str = "http://localhost:8007"
     semantic_post: SemanticPostConfig = SemanticPostConfig()
     embedders: EmbedderConfig = EmbedderConfig()
+    NETWORK_PRIVATE_CIDRS: tuple[str, ...] = ()
+    NETWORK_TRUSTED_OWNERS: tuple[str, ...] = ()
+    NETWORK_TRUST_LOCAL_OPERATOR: bool = False
 
     def manifest_environment(self, *, playwright_version: str | None = None) -> ManifestEnvironment:
         """Return the manifest metadata block used across captures."""
@@ -386,6 +392,10 @@ def get_settings(env_path: str = ".env") -> Settings:
         executable_path=executable_path,
         enforce_version_pin=enforce_version_pin,
         max_concurrent_browsers=max_concurrent_browsers,
+        cft_executable=Path(cfg("CFT_EXECUTABLE")) if cfg("CFT_EXECUTABLE", default="") else None,
+        fontconfig_file=Path(cfg("PLAYWRIGHT_FONTCONFIG_FILE"))
+        if cfg("PLAYWRIGHT_FONTCONFIG_FILE", default="")
+        else None,
     )
     ocr_server = cfg("OLMOCR_SERVER", default=None) or cfg(
         "OCR_SERVER", default="https://ai2endpoints.cirrascale.ai/api"
@@ -476,7 +486,19 @@ def get_settings(env_path: str = ".env") -> Settings:
     # Authentication & rate-limit settings
     require_api_key = _bool(cfg, "REQUIRE_API_KEY", default=False)
     api_key_header = cfg("API_KEY_HEADER", default="X-API-Key")
-    rate_limit_per_minute = max(1, _int(cfg, "RATE_LIMIT_PER_MINUTE", default=60))
+    rate_limit_per_minute = _int(cfg, "RATE_LIMIT_PER_MINUTE", default=60)
+    if rate_limit_per_minute <= 0:
+        raise ValueError("RATE_LIMIT_PER_MINUTE must be positive")
+    private_cidrs = tuple(
+        str(ipaddress.ip_network(value.strip(), strict=True))
+        for value in cfg("NETWORK_PRIVATE_CIDRS", default="").split(",")
+        if value.strip()
+    )
+    trusted_owners = tuple(
+        value.strip()
+        for value in cfg("NETWORK_TRUSTED_OWNERS", default="").split(",")
+        if value.strip()
+    )
 
     return Settings(
         env_path=env_path,
@@ -495,6 +517,9 @@ def get_settings(env_path: str = ".env") -> Settings:
         api_base_url=api_base_url,
         semantic_post=semantic_post_cfg,
         embedders=embedders_cfg,
+        NETWORK_PRIVATE_CIDRS=private_cidrs,
+        NETWORK_TRUSTED_OWNERS=trusted_owners,
+        NETWORK_TRUST_LOCAL_OPERATOR=_bool(cfg, "NETWORK_TRUST_LOCAL_OPERATOR", default=False),
     )
 
 

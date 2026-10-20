@@ -1,4 +1,5 @@
 // Markdown Web Browser - Main logic
+import { renderSafeHtml, setupAuthentication } from './client.js';
 
 // ============================================================================
 // CONSTANTS & CONFIGURATION
@@ -411,6 +412,7 @@ class BrowserState {
 }
 
 const state = new BrowserState();
+let navigationController = null;
 
 // ============================================================================
 // DOM ELEMENTS
@@ -453,10 +455,10 @@ const elements = {
 // ============================================================================
 
 function init() {
-    // Sync any API key from query string / localStorage to cookie on startup
+    // Sync any API key from query string / localStorage to cookie on startup.
     getApiKey();
 
-    // Configure marked.js for security if externally provided
+    // Parse Markdown, then sanitize the final HTML at the rendering boundary.
     if (typeof marked !== 'undefined') {
         marked.setOptions({
             breaks: true,
@@ -509,6 +511,15 @@ function init() {
     // Set initial state
     updateNavigationButtons();
     setStatus('Ready');
+    setupAuthentication(() => {
+        navigationController?.abort();
+        state.cache.clear();
+        state.currentJobId = null;
+        elements.renderedContent.textContent = '';
+        elements.rawContent.textContent = '';
+        setLoading(false);
+        setStatus('Access changed. Load a page to continue.');
+    }).catch(error => showError('Access settings unavailable', error.message));
 }
 
 function attachEventListeners() {
@@ -579,7 +590,7 @@ async function handleRefresh() {
     if (state.currentUrl) {
         // Clear client cache and instruct backend to bypass server cache (reuse_cache: false)
         state.cache.delete(state.currentUrl);
-        await loadUrl(state.currentUrl, { skipHistory: true, forceRefresh: true });
+        await loadUrl(state.currentUrl, { skipHistory: true, reuseCache: false });
     }
 }
 
@@ -595,7 +606,7 @@ async function handleGo() {
 
 async function handleRetry() {
     if (state.currentUrl) {
-        await loadUrl(state.currentUrl, { skipHistory: true, forceRefresh: true });
+        await loadUrl(state.currentUrl, { skipHistory: true, reuseCache: false });
     }
 }
 
@@ -623,7 +634,12 @@ function normalizeInput(input) {
 // ============================================================================
 
 async function loadUrl(url, options = {}) {
-    const { skipHistory = false, forceRefresh = false } = options;
+    const { skipHistory = false, reuseCache = true } = options;
+    navigationController?.abort();
+    const controller = new AbortController();
+    navigationController = controller;
+    const signal = controller.signal;
+    state.currentJobId = null;
 
     // Update URL input
     elements.urlInput.value = url;
@@ -640,14 +656,14 @@ async function loadUrl(url, options = {}) {
     // Hide error view
     hideError();
 
-    // Check cache first (unless forceRefresh was requested)
-    if (!forceRefresh) {
-        const cached = state.getCached(url);
-        if (cached) {
-            setStatus(`Loaded from cache: ${url}`);
-            displayMarkdown(cached.markdown);
-            return;
-        }
+    // Check cache first
+    const cached = reuseCache ? state.getCached(url) : null;
+    if (cached) {
+        state.currentJobId = cached.jobId;
+        setStatus(`Loaded from cache: ${url}`);
+        displayMarkdown(cached.markdown);
+        setLoading(false);
+        return;
     }
 
     // Start loading
@@ -655,18 +671,20 @@ async function loadUrl(url, options = {}) {
         setLoading(true, 'Submitting capture job...');
         setStatus(`Loading: ${url}`);
 
-        // Submit capture job (pass reuseCache: !forceRefresh)
-        const jobId = await submitCaptureJob(url, { reuseCache: !forceRefresh });
+        // Submit capture job
+        const jobId = await submitCaptureJob(url, reuseCache, signal);
+        signal.throwIfAborted();
         state.currentJobId = jobId;
 
         setStatus(`Job ${jobId} submitted, waiting for completion...`);
 
         // Poll for completion
-        await pollJobCompletion(jobId);
+        await pollJobCompletion(jobId, signal);
 
         // Fetch markdown
         setLoading(true, 'Fetching markdown...');
-        const markdown = await fetchMarkdown(jobId);
+        const markdown = await fetchMarkdown(jobId, signal);
+        signal.throwIfAborted();
 
         // Cache the result
         state.setCached(url, markdown, jobId);
@@ -677,6 +695,7 @@ async function loadUrl(url, options = {}) {
         setLoading(false);
 
     } catch (error) {
+        if (signal.aborted) return;
         console.error('Failed to load URL:', error);
         showError('Failed to load page', error.message);
         setLoading(false);
@@ -687,15 +706,14 @@ async function loadUrl(url, options = {}) {
 // API CALLS
 // ============================================================================
 
-async function submitCaptureJob(url, options = {}) {
-    const { reuseCache = true } = options;
-    const payload = { url, reuse_cache: Boolean(reuseCache) };
+async function submitCaptureJob(url, reuseCache, signal) {
     const response = await fetch('/jobs', {
         method: 'POST',
         headers: authHeaders({
             'Content-Type': 'application/json'
         }),
-        body: JSON.stringify(payload)
+        body: JSON.stringify({ url, reuse_cache: reuseCache }),
+        signal,
     });
 
     if (!response.ok) {
@@ -711,12 +729,14 @@ async function submitCaptureJob(url, options = {}) {
     return data.id;
 }
 
-async function pollJobCompletion(jobId) {
+async function pollJobCompletion(jobId, signal) {
     let attempts = 0;
 
     while (attempts < MAX_POLL_ATTEMPTS) {
+        signal?.throwIfAborted();
         const response = await fetch(`/jobs/${encodeURIComponent(jobId)}`, {
-            headers: authHeaders()
+            headers: authHeaders(),
+            signal,
         });
 
         if (!response.ok) {
@@ -724,6 +744,7 @@ async function pollJobCompletion(jobId) {
         }
 
         const job = await response.json();
+        signal?.throwIfAborted();
         const jobState = job.state?.toUpperCase();
 
         // Update progress
@@ -741,7 +762,7 @@ async function pollJobCompletion(jobId) {
             return job;
         }
 
-        if (jobState === 'FAILED') {
+        if (jobState === 'FAILED' || jobState === 'CANCELLED') {
             throw new Error(job.error || 'Job failed');
         }
 
@@ -751,16 +772,17 @@ async function pollJobCompletion(jobId) {
         }
 
         // Wait before next poll
-        await sleep(POLL_INTERVAL_MS);
+        await sleep(POLL_INTERVAL_MS, signal);
         attempts++;
     }
 
     throw new Error('Job timeout - took longer than expected');
 }
 
-async function fetchMarkdown(jobId) {
+async function fetchMarkdown(jobId, signal) {
     const response = await fetch(`/jobs/${encodeURIComponent(jobId)}/result.md`, {
-        headers: authHeaders()
+        headers: authHeaders(),
+        signal,
     });
 
     if (!response.ok) {
@@ -793,14 +815,14 @@ function displayMarkdown(markdown) {
 }
 
 function renderMarkdown(markdown) {
-    let html = '';
+    // Prefer vendored marked + DOMPurify; fall back to the offline parser.
     if (typeof marked !== 'undefined' && typeof marked.parse === 'function') {
-        html = marked.parse(markdown);
+        renderSafeHtml(elements.renderedContent, marked.parse(markdown));
     } else {
-        html = parseMarkdownSafe(markdown, state.currentUrl);
+        const html = parseMarkdownSafe(markdown, state.currentUrl);
+        elements.renderedContent.innerHTML = html;
+        sanitizeRenderedDom(elements.renderedContent, state.currentUrl);
     }
-    elements.renderedContent.innerHTML = html;
-    sanitizeRenderedDom(elements.renderedContent, state.currentUrl);
     elements.renderedContent.classList.add('markdown-body');
 }
 
@@ -808,7 +830,7 @@ function renderRawMarkdown(markdown) {
     try {
         if (typeof Prism !== 'undefined' && Prism.languages?.markdown) {
             const highlighted = Prism.highlight(markdown, Prism.languages.markdown, 'markdown');
-            elements.rawContent.innerHTML = highlighted;
+            renderSafeHtml(elements.rawContent, highlighted);
         } else {
             elements.rawContent.innerHTML = highlightMarkdownSafe(markdown);
         }
@@ -934,8 +956,19 @@ function handleKeyboardShortcuts(e) {
 // UTILITY FUNCTIONS
 // ============================================================================
 
-function sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
+function sleep(ms, signal) {
+    return new Promise((resolve, reject) => {
+        signal.throwIfAborted();
+        const abort = () => {
+            clearTimeout(timer);
+            reject(signal.reason);
+        };
+        const timer = setTimeout(() => {
+            signal.removeEventListener('abort', abort);
+            resolve();
+        }, ms);
+        signal.addEventListener('abort', abort, { once: true });
+    });
 }
 
 // ============================================================================

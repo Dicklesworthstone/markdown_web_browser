@@ -15,10 +15,12 @@ from app.ocr_client import (
 
 
 def test_normalize_glm_file_reference_accepts_urls_data_uri_and_raw_b64() -> None:
-    assert normalize_glm_file_reference("https://example.com/file.png") == "https://example.com/file.png"
     assert (
-        normalize_glm_file_reference("data:image/png;base64,AAAA")
-        == "data:image/png;base64,AAAA"
+        normalize_glm_file_reference("https://example.com/file.png")
+        == "https://example.com/file.png"
+    )
+    assert (
+        normalize_glm_file_reference("data:image/png;base64,AAAA") == "data:image/png;base64,AAAA"
     )
     converted = normalize_glm_file_reference("QUJDRA==")
     assert converted == "data:image/png;base64,QUJDRA=="

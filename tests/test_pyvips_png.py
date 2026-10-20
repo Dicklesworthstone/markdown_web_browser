@@ -1,80 +1,25 @@
 #!/usr/bin/env python3
-"""Test different PNG encoding methods with pyvips to find the issue."""
+"""Verify the actual libvips PNG encoding and pixel round-trip contracts."""
 
+import pyvips
 import pytest
 
-# pyvips requires libvips to be installed on the system
-try:
-    import pyvips
 
-    PYVIPS_AVAILABLE = hasattr(pyvips, "Image")
-except (ImportError, OSError):
-    pyvips = None  # type: ignore[assignment]
-    PYVIPS_AVAILABLE = False
-
-
-@pytest.mark.skipif(not PYVIPS_AVAILABLE, reason="pyvips or libvips not available")
-def test_png_formats():
-    """Test various PNG encoding formats."""
-
-    # Create a simple test image
-    image = pyvips.Image.black(100, 100, bands=3)
-
-    print("Testing PNG encoding formats...")
-
-    # Test 1: Using ".png" (current approach)
-    try:
+@pytest.mark.parametrize("bands", [1, 3, 4])
+@pytest.mark.parametrize("encoder", ["write_to_buffer", "pngsave_buffer"])
+def test_png_formats(bands: int, encoder: str) -> None:
+    """Supported encoders preserve dimensions, channels and nonblank pixels."""
+    image = pyvips.Image.black(100, 100, bands=bands).new_from_image(list(range(10, 10 + bands)))
+    if encoder == "write_to_buffer":
         png_bytes = image.write_to_buffer(".png", compression=9, interlace=False)
-        print("✅ Format '.png' works - bytes:", len(png_bytes))
-    except Exception as e:
-        print(f"❌ Format '.png' failed: {e}")
-
-    # Test 2: Using "png" without dot
-    try:
-        png_bytes = image.write_to_buffer("png", compression=9, interlace=False)
-        print("✅ Format 'png' works - bytes:", len(png_bytes))
-    except Exception as e:
-        print(f"❌ Format 'png' failed: {e}")
-
-    # Test 3: Using "[png]" format
-    try:
+    else:
         png_bytes = image.pngsave_buffer(compression=9, interlace=False)
-        print("✅ pngsave_buffer() works - bytes:", len(png_bytes))
-    except Exception as e:
-        print(f"❌ pngsave_buffer() failed: {e}")
 
-    # Test 4: Check available savers
-    print("\nAvailable savers:")
-    try:
-        # List available foreign save operations
-        import subprocess
-
-        result = subprocess.run(["vips", "--list", "classes"], capture_output=True, text=True)
-        png_savers = [line for line in result.stdout.split("\n") if "png" in line.lower()]
-        for saver in png_savers[:5]:
-            print(f"  - {saver.strip()}")
-    except Exception:  # noqa: BLE001
-        pass
-
-    # Test 5: Test with spng if available
-    try:
-        png_bytes = image.write_to_buffer(".spng", compression=9)
-        print("✅ Format '.spng' works - bytes:", len(png_bytes))
-    except Exception as e:
-        print(f"❌ Format '.spng' not available: {e}")
-
-    # Test 6: Test reading and re-encoding a PNG
-    try:
-        # Create a PNG, then read it back
-        png_bytes = image.pngsave_buffer(compression=9, interlace=False)
-        reloaded = pyvips.Image.new_from_buffer(png_bytes, "")
-        re_encoded = reloaded.pngsave_buffer(compression=9, interlace=False)
-        print(
-            f"✅ Round-trip PNG encoding works - original: {len(png_bytes)}, re-encoded: {len(re_encoded)}"
-        )
-    except Exception as e:
-        print(f"❌ Round-trip failed: {e}")
-
-
-if __name__ == "__main__":
-    test_png_formats()
+    assert png_bytes.startswith(b"\x89PNG\r\n\x1a\n")
+    assert png_bytes[28] == 0, "PNG output must be non-interlaced"
+    reloaded = pyvips.Image.new_from_buffer(png_bytes, "")
+    assert (reloaded.width, reloaded.height, reloaded.bands) == (100, 100, bands)
+    assert reloaded.write_to_memory() == image.write_to_memory()
+    re_encoded = reloaded.pngsave_buffer(compression=9, interlace=False)
+    round_trip = pyvips.Image.new_from_buffer(re_encoded, "")
+    assert round_trip.write_to_memory() == image.write_to_memory()

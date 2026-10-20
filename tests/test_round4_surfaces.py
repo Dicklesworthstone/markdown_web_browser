@@ -1,15 +1,19 @@
 """Tests for R4 surfaces: multi-tag, cancel, slo.json, events.json, links, artifacts, batch/status, raw markdown, CANCELLED state."""
+
 from __future__ import annotations
 
 import json
 import pathlib
+from datetime import datetime, timezone
+from typing import Iterator
 
 import pytest
 from fastapi.testclient import TestClient
 
 import app.main as main_mod
-from app.jobs import JobState
+from app.jobs import JobManager, JobState
 from app.main import app
+from app.store import RunRecord, StorageConfig, Store
 
 
 class _FakeJobManager:
@@ -36,6 +40,16 @@ def _patch_jm(monkeypatch, **attrs):
 @pytest.fixture
 def client() -> TestClient:
     return TestClient(app)
+
+
+@pytest.fixture
+def artifact_store(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Store]:
+    store = Store(StorageConfig(tmp_path / "cache", tmp_path / "runs.db"))
+    monkeypatch.setattr(main_mod, "store", store)
+    try:
+        yield store
+    finally:
+        store.engine.dispose()
 
 
 # ---------------------------------------------------------------------------
@@ -116,9 +130,7 @@ def test_cancel_404_for_unknown_job(client: TestClient, monkeypatch: pytest.Monk
 # ---------------------------------------------------------------------------
 
 
-def test_slo_json_alias_matches_slo(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_slo_json_alias_matches_slo(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
     def _manifest(self, jid):
         return {"timings": {"capture_ms": 100, "ocr_ms": 200, "stitch_ms": 50, "total_ms": 350}}
 
@@ -133,13 +145,21 @@ def test_slo_json_alias_matches_slo(
 # ---------------------------------------------------------------------------
 
 
-def test_events_json_empty_for_unknown_job(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch
+def test_events_json_404_for_unknown_job(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, artifact_store: Store
 ) -> None:
-    def _events(job_id, since=None, min_sequence=0):
-        return []
+    monkeypatch.setattr(main_mod, "JOB_MANAGER", JobManager(store=artifact_store))
+    response = client.get("/jobs/abc/events.json")
+    assert response.status_code == 404
 
-    _patch_jm(monkeypatch, get_events=_events)
+
+def test_events_json_empty_for_known_job_without_history(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, artifact_store: Store
+) -> None:
+    artifact_store.allocate_run(
+        job_id="abc", url="https://example.com", started_at=datetime.now(timezone.utc)
+    )
+    monkeypatch.setattr(main_mod, "JOB_MANAGER", JobManager(store=artifact_store))
     response = client.get("/jobs/abc/events.json")
     assert response.status_code == 200
     body = response.json()
@@ -149,18 +169,21 @@ def test_events_json_empty_for_unknown_job(
 
 
 def test_events_json_returns_recorded_events(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, artifact_store: Store
 ) -> None:
+    artifact_store.allocate_run(
+        job_id="abc", url="https://example.com", started_at=datetime.now(timezone.utc)
+    )
     events = [
-        {"sequence": 1, "event": "state_change", "data": {"state": "DONE"}},
-        {"sequence": 2, "event": "cache_hit", "data": {"source_job_id": "old"}},
+        artifact_store.append_job_event(job_id="abc", owner=None, entry=entry)
+        for entry in (
+            {"event": "state_change", "data": {"state": "DONE"}},
+            {"event": "cache_hit", "data": {"source_job_id": "old"}},
+        )
     ]
-
-    def _events(job_id, since=None, min_sequence=0):
-        return list(events)
-
-    _patch_jm(monkeypatch, get_events=_events)
+    monkeypatch.setattr(main_mod, "JOB_MANAGER", JobManager(store=artifact_store))
     response = client.get("/jobs/abc/events.json")
+    assert response.status_code == 200
     body = response.json()
     assert body["count"] == 2
     assert body["events"] == events
@@ -197,9 +220,7 @@ def test_links_structured_groups_by_source(
     assert len(body["by_source"]["dom"]) == 2
 
 
-def test_links_structured_empty(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_links_structured_empty(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
     def _links(self, jid):
         return None
 
@@ -215,31 +236,27 @@ def test_links_structured_empty(
 # ---------------------------------------------------------------------------
 
 
-def test_artifacts_404_when_manifest_missing(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    def _manifest(self, jid):
-        return None
-
-    monkeypatch.setattr(type(main_mod.store), "read_manifest", _manifest)
+def test_artifacts_404_when_run_missing(client: TestClient, artifact_store: Store) -> None:
+    assert artifact_store.fetch_run("abc") is None
     response = client.get("/jobs/abc/artifacts")
     assert response.status_code == 404
 
 
-def test_artifacts_lists_files_in_root(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path
-) -> None:
-    (tmp_path / "manifest.json").write_text("{}")
-    (tmp_path / "out.md").write_text("# hi")
-    (tmp_path / "tile_0000.png").write_bytes(b"fake-png")
-    sub = tmp_path / "tiles"
+def test_artifacts_lists_files_in_root(client: TestClient, artifact_store: Store) -> None:
+    run_paths = artifact_store.allocate_run(
+        job_id="abc", url="https://example.com", started_at=datetime.now(timezone.utc)
+    )
+    root = run_paths.root
+    run_paths.manifest_path.write_text("{}", encoding="utf-8")
+    run_paths.markdown_path.write_text("# hi", encoding="utf-8")
+    (root / "tile_0000.png").write_bytes(b"fake-png")
+    sub = root / "tiles"
     sub.mkdir()
     (sub / "tile_0001.png").write_bytes(b"more")
-
-    def _manifest(self, jid):
-        return {"artifact_root": str(tmp_path)}
-
-    monkeypatch.setattr(type(main_mod.store), "read_manifest", _manifest)
+    record = artifact_store.fetch_run("abc")
+    assert record is not None
+    assert pathlib.Path(record.cache_path) == root
+    assert "artifact_root" not in json.loads(run_paths.manifest_path.read_text("utf-8"))
     response = client.get("/jobs/abc/artifacts")
     assert response.status_code == 200
     body = response.json()
@@ -249,8 +266,83 @@ def test_artifacts_lists_files_in_root(
     assert "out.md" in paths
     assert "tile_0000.png" in paths
     assert "tiles/tile_0001.png" in paths
+    assert paths == {"manifest.json", "out.md", "tile_0000.png", "tiles/tile_0001.png"}
+    assert body["artifact_root"] == str(root.resolve())
+    assert {file["path"]: file["size"] for file in body["files"]} == {
+        "manifest.json": 2,
+        "out.md": 4,
+        "tile_0000.png": 8,
+        "tiles/tile_0001.png": 4,
+    }
     assert body["synthetic"]["structured_result"].endswith("/result.json")
     assert body["total_bytes"] == sum(f["size"] for f in body["files"])
+    assert body["total_bytes"] == 18
+
+
+def test_artifacts_404_when_persisted_root_is_absent(
+    client: TestClient, artifact_store: Store
+) -> None:
+    root = artifact_store.config.cache_root / "absent-run"
+    with artifact_store.session() as session:
+        session.add(
+            RunRecord(
+                id="absent-root",
+                url="https://example.com",
+                started_at=datetime.now(timezone.utc),
+                cache_path=str(root),
+                manifest_path=str(root / "manifest.json"),
+            )
+        )
+        session.commit()
+    assert artifact_store.fetch_run("absent-root") is not None
+    assert not root.exists()
+    response = client.get("/jobs/absent-root/artifacts")
+    assert response.status_code == 404
+
+
+def test_artifacts_refuse_persisted_root_outside_cache(
+    client: TestClient, artifact_store: Store, tmp_path: pathlib.Path
+) -> None:
+    outside = tmp_path / "outside-cache"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("outside-secret-sentinel", encoding="utf-8")
+    with artifact_store.session() as session:
+        session.add(
+            RunRecord(
+                id="escaped-root",
+                url="https://example.com",
+                started_at=datetime.now(timezone.utc),
+                cache_path=str(outside),
+                manifest_path=str(outside / "manifest.json"),
+            )
+        )
+        session.commit()
+    response = client.get("/jobs/escaped-root/artifacts")
+    assert response.status_code == 409
+    assert "secret.txt" not in response.text
+    assert "outside-secret-sentinel" not in response.text
+    assert str(outside) not in response.text
+
+
+def test_artifacts_do_not_list_symlinked_files_outside_root(
+    client: TestClient, artifact_store: Store, tmp_path: pathlib.Path
+) -> None:
+    run_paths = artifact_store.allocate_run(
+        job_id="symlink-run", url="https://example.com", started_at=datetime.now(timezone.utc)
+    )
+    run_paths.manifest_path.write_text("{}", encoding="utf-8")
+    outside = tmp_path / "outside-secret.txt"
+    outside.write_text("outside-secret-sentinel", encoding="utf-8")
+    (run_paths.root / "escaped-secret.txt").symlink_to(outside)
+    response = client.get("/jobs/symlink-run/artifacts")
+    assert response.status_code == 200
+    body = response.json()
+    assert [file["path"] for file in body["files"]] == ["manifest.json"]
+    assert body["file_count"] == 1
+    assert body["total_bytes"] == 2
+    assert "escaped-secret.txt" not in response.text
+    assert "outside-secret-sentinel" not in response.text
+    assert str(outside) not in response.text
 
 
 # ---------------------------------------------------------------------------
@@ -264,9 +356,7 @@ def test_batch_status_rejects_empty_ids(client: TestClient) -> None:
 
 
 def test_batch_status_rejects_too_many_ids(client: TestClient) -> None:
-    response = client.post(
-        "/jobs/batch/status", json={"job_ids": [f"x{i}" for i in range(501)]}
-    )
+    response = client.post("/jobs/batch/status", json={"job_ids": [f"x{i}" for i in range(501)]})
     assert response.status_code == 422
 
 
@@ -327,9 +417,7 @@ def test_result_md_raw_strips_provenance(
     assert "Last paragraph." in response.text
 
 
-def test_result_md_raw_alias_route(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_result_md_raw_alias_route(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
     md = "# X\n<!-- comment -->\nY"
 
     def _read_md(self, jid):
@@ -370,7 +458,7 @@ def test_r4_cli_subcommands_registered(cmd) -> None:
     assert result.exit_code == 0, f"{' '.join(cmd)} --help failed: {result.output}"
 
 
-def test_r4_cli_tags_add_invokes_correct_endpoint() -> None:
+def test_r4_cli_tags_add_invokes_correct_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
     from typer.testing import CliRunner
 
     from scripts import mdwb_cli
@@ -405,8 +493,8 @@ def test_r4_cli_tags_add_invokes_correct_endpoint() -> None:
                 request=_hx.Request("POST", url, json=json),
             )
 
-    mdwb_cli.httpx.Client = _StubClient
-    mdwb_cli._resolve_settings = _fake_settings
+    monkeypatch.setattr(mdwb_cli.httpx, "Client", _StubClient)
+    monkeypatch.setattr(mdwb_cli, "_resolve_settings", _fake_settings)
 
     runner = CliRunner()
     result = runner.invoke(mdwb_cli.cli, ["tags", "abc", "add", "foo"])
@@ -415,7 +503,7 @@ def test_r4_cli_tags_add_invokes_correct_endpoint() -> None:
     assert "/jobs/abc/tags" in captured["url"]
 
 
-def test_r4_cli_batch_status_invokes_correct_endpoint() -> None:
+def test_r4_cli_batch_status_invokes_correct_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
     from typer.testing import CliRunner
 
     from scripts import mdwb_cli
@@ -450,8 +538,8 @@ def test_r4_cli_batch_status_invokes_correct_endpoint() -> None:
                 request=_hx.Request("POST", url, json=json),
             )
 
-    mdwb_cli.httpx.Client = _StubClient
-    mdwb_cli._resolve_settings = _fake_settings
+    monkeypatch.setattr(mdwb_cli.httpx, "Client", _StubClient)
+    monkeypatch.setattr(mdwb_cli, "_resolve_settings", _fake_settings)
 
     runner = CliRunner()
     result = runner.invoke(mdwb_cli.cli, ["batch-status", "a", "b"])
@@ -460,7 +548,7 @@ def test_r4_cli_batch_status_invokes_correct_endpoint() -> None:
     assert "/jobs/batch/status" in captured["url"]
 
 
-def test_r4_cli_schema_json_writes_to_file(tmp_path) -> None:
+def test_r4_cli_schema_json_writes_to_file(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     from typer.testing import CliRunner
 
     from scripts import mdwb_cli
@@ -494,8 +582,8 @@ def test_r4_cli_schema_json_writes_to_file(tmp_path) -> None:
                 request=_hx.Request("GET", url),
             )
 
-    mdwb_cli.httpx.Client = _StubClient
-    mdwb_cli._resolve_settings = _fake_settings
+    monkeypatch.setattr(mdwb_cli.httpx, "Client", _StubClient)
+    monkeypatch.setattr(mdwb_cli, "_resolve_settings", _fake_settings)
 
     out = tmp_path / "schema.json"
     runner = CliRunner()

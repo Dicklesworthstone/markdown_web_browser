@@ -38,16 +38,18 @@ class TileSlice:
     width: int
     height: int
     scale: float
-    source_y_offset: int
+    # CSS document pixels. set_tile_overlap derives shared rows from this offset.
+    source_y_offset: float
     viewport_y_offset: int
     overlap_px: int
     top_overlap_sha256: Optional[str]
     bottom_overlap_sha256: Optional[str]
     seam_top_hash: Optional[str] = None
     seam_bottom_hash: Optional[str] = None
-    scale_x: float = 0.0
-    scale_y: float = 0.0
-    device_scale_factor: float = 1.0
+    source_rect: tuple[float, float, float, float] | None = None
+    scale_x: float | None = None
+    scale_y: float | None = None
+    device_scale_factor: float = 1
     source_crop_x: int = 0
     source_crop_y: int = 0
     source_crop_width: int = 0
@@ -58,14 +60,14 @@ class TileSlice:
     css_height: int = 0
     top_overlap_px: int = 0
     bottom_overlap_px: int = 0
-    coordinate_space: str = "screenshot_px"
+    coordinate_space: str = "CSS document offsets; screenshot physical-pixel source_rect"
 
     def __post_init__(self) -> None:
-        if self.scale_x <= 0:
+        if self.scale_x is None or self.scale_x <= 0:
             self.scale_x = self.scale if self.scale > 0 else 1.0
-        if self.scale_y <= 0:
+        if self.scale_y is None or self.scale_y <= 0:
             self.scale_y = self.scale if self.scale > 0 else 1.0
-        if self.device_scale_factor <= 0:
+        if not self.device_scale_factor or self.device_scale_factor <= 0:
             self.device_scale_factor = 1.0
         if self.source_crop_width <= 0:
             self.source_crop_width = max(1, int(round(self.width / self.scale_x)))
@@ -79,15 +81,22 @@ class TileSlice:
                 self.source_crop_height,
             )
         if self.css_y_offset == 0 and (self.viewport_y_offset != 0 or self.source_crop_y != 0):
-            self.css_y_offset = int(
-                round(self.viewport_y_offset + (self.source_crop_y / self.device_scale_factor))
-            )
+            self.css_y_offset = int(round(self.source_y_offset))
         if self.css_height <= 0:
-            self.css_height = max(1, int(round(self.source_crop_height / self.device_scale_factor)))
+            self.css_height = max(
+                1, int(round(self.source_crop_height / self.device_scale_factor))
+            )
         if self.top_overlap_px == 0 and self.overlap_px > 0:
             self.top_overlap_px = min(self.overlap_px, self.height)
         if self.bottom_overlap_px == 0 and self.overlap_px > 0:
             self.bottom_overlap_px = min(self.overlap_px, self.height)
+        if self.source_rect is None and self.source_crop_width > 0 and self.source_crop_height > 0:
+            self.source_rect = (
+                float(self.source_crop_x),
+                float(self.source_crop_y),
+                float(self.source_crop_width),
+                float(self.source_crop_height),
+            )
 
     @property
     def source_crop_box(self) -> tuple[int, int, int, int]:
@@ -136,13 +145,14 @@ async def slice_into_tiles(
     tile_index_offset: int = 0,
     viewport_y_offset: int = 0,
     target_long_side_px: int = 1288,
-    device_scale_factor: float = 1.0,
+    device_scale_factor: float = 1,
 ) -> List[TileSlice]:
     """Slice a viewport-sized screenshot into <=1288 px-long aspect-preserving tiles.
 
     The longest dimension for each resulting tile is capped at ``target_long_side_px``
-    while keeping ≈``overlap_px`` pixels of vertical overlap (and exact final-tile overlap)
-    so OCR stitching can deduplicate seams deterministically.
+    while keeping ≈``overlap_px`` pixels of vertical overlap so OCR stitching can
+    deduplicate seams deterministically. A short final tile keeps the nominal step;
+    cross-sweep overlap larger than that step is recorded by ``set_tile_overlap``.
     """
 
     return await asyncio.to_thread(
@@ -162,102 +172,55 @@ def _slice_sync(
     tile_index_offset: int,
     viewport_y_offset: int,
     target_long_side_px: int,
-    device_scale_factor: float = 1.0,
+    device_scale_factor: float,
 ) -> List[TileSlice]:
     if not image_bytes:
         raise ValueError("image_bytes must be non-empty")
-    if target_long_side_px <= 0:
-        raise ValueError("target_long_side_px must be > 0")
-    if overlap_px < 0:
-        raise ValueError("overlap_px must be >= 0")
-
-    dpr = float(device_scale_factor) if device_scale_factor and device_scale_factor > 0 else 1.0
+    if target_long_side_px < 1 or device_scale_factor < 1:
+        raise ValueError("target_long_side_px and device scale factor must be positive")
+    if not 0 <= overlap_px < target_long_side_px:
+        raise ValueError("overlap_px must be nonnegative and smaller than tile size")
     vips = _require_pyvips()
+    # Avoid sequential access which can cause issues with some PNG data
     try:
         image = vips.Image.new_from_buffer(image_bytes, "")
     except Exception:
+        # Fallback to sequential if needed
         image = vips.Image.new_from_buffer(image_bytes, "", access="sequential")
 
-    source_width = int(image.width)
-    source_height = int(image.height)
+    source_width, source_height = image.width, image.height
     if source_width <= 0 or source_height <= 0:
         raise ValueError(f"Invalid source image dimensions: {source_width}x{source_height}")
-
-    # Preserve aspect ratio: when width exceeds target_long_side_px, downscale uniformly on both axes.
+    # Resize both axes together. Cropping the uniformly resized image then
+    # bounds each tile without stretching the source content.
     scale = 1.0
-    if source_width > target_long_side_px:
-        scale = target_long_side_px / source_width
-        image = image.resize(scale, vscale=scale)
-        if image.width > target_long_side_px:
-            image = image.crop(0, 0, target_long_side_px, image.height)
-
-    height = int(image.height)
-    width = int(image.width)
-    scale_x = width / source_width
-    scale_y = height / source_height
-    viewport_y_screenshot_px = int(round(viewport_y_offset * dpr))
-
-    # Precompute tile (cursor, tile_height) bands in resized tile coordinates
-    bands: list[tuple[int, int]] = []
-    if height <= target_long_side_px:
-        bands.append((0, height))
-    else:
-        effective_overlap = min(overlap_px, max(0, target_long_side_px - 1))
-        step = max(1, target_long_side_px - effective_overlap)
-        cursor = 0
-        while cursor < height:
-            remaining = height - cursor
-            tile_height = target_long_side_px if remaining > target_long_side_px else remaining
-            if remaining < target_long_side_px and cursor > 0:
-                cursor = max(0, height - target_long_side_px)
-                tile_height = height - cursor
-            bands.append((cursor, tile_height))
-            if cursor + tile_height >= height:
-                break
-            cursor += step
+    if image.width > target_long_side_px:
+        scale = target_long_side_px / image.width
+        image = image.resize(scale)
 
     tiles: List[TileSlice] = []
-    num_bands = len(bands)
+    height = image.height
+    width = image.width
+    scale_x, scale_y = width / source_width, height / source_height
 
-    for tile_idx, (cursor, tile_height) in enumerate(bands):
-        cropped = (
-            image
-            if (cursor == 0 and tile_height == height)
-            else image.crop(0, cursor, width, tile_height)
-        )
+    step = max(1, target_long_side_px - overlap_px)
+    cursor = 0
+    tile_idx = 0
+
+    while cursor < height:
+        remaining = height - cursor
+        tile_height = target_long_side_px if remaining > target_long_side_px else remaining
+
+        cropped = image.crop(0, cursor, width, tile_height)
         png_bytes = cropped.pngsave_buffer(**_PNG_ENCODE_ARGS)
-
-        # Compute actual pixel overlap with adjacent tiles in this sweep
-        if tile_idx > 0:
-            prev_cursor, prev_height = bands[tile_idx - 1]
-            actual_top_overlap = max(0, min(tile_height, (prev_cursor + prev_height) - cursor))
-        else:
-            actual_top_overlap = min(overlap_px, tile_height) if overlap_px > 0 else 0
-
-        if tile_idx + 1 < num_bands:
-            next_cursor, _ = bands[tile_idx + 1]
-            actual_bottom_overlap = max(0, min(tile_height, (cursor + tile_height) - next_cursor))
-        else:
-            actual_bottom_overlap = min(overlap_px, tile_height) if overlap_px > 0 else 0
-
-        top_sha = _overlap_sha(cropped, position="top", overlap_px=actual_top_overlap)
-        bottom_sha = _overlap_sha(cropped, position="bottom", overlap_px=actual_bottom_overlap)
-
-        # Exact inverse crop mapping to source screenshot pixels [0, source_height]
-        src_crop_y = 0 if cursor == 0 else min(source_height - 1, max(0, int(round(_unscale(cursor, scale_y)))))
-        if cursor + tile_height >= height:
-            src_end_y = source_height
-        else:
-            src_end_y = min(
-                source_height,
-                max(src_crop_y + 1, int(round(_unscale(cursor + tile_height, scale_y)))),
-            )
-        src_crop_height = max(1, src_end_y - src_crop_y)
-
-        source_y_offset = viewport_y_screenshot_px + src_crop_y
-        css_y_offset = int(round(viewport_y_offset + (src_crop_y / dpr)))
-        css_height = max(1, int(round(src_crop_height / dpr)))
-
+        src_y = cursor / scale_y
+        src_h = tile_height / scale_y
+        src_w = width / scale_x
+        source_y_offset = viewport_y_offset + src_y / device_scale_factor
+        src_crop_y = 0 if cursor == 0 else max(0, int(round(src_y)))
+        src_crop_height = max(1, int(round(src_h)))
+        if src_crop_y + src_crop_height > source_height:
+            src_crop_height = max(1, source_height - src_crop_y)
         tiles.append(
             TileSlice(
                 index=tile_index_offset + tile_idx,
@@ -266,35 +229,79 @@ def _slice_sync(
                 width=width,
                 height=tile_height,
                 scale=scale,
+                # Offsets are CSS document pixels; source_rect is relative to
+                # this screenshot in physical pixels. Rounded resize dimensions
+                # give separate effective axes for exact inverse crop mapping.
                 source_y_offset=source_y_offset,
                 viewport_y_offset=viewport_y_offset,
-                overlap_px=actual_top_overlap if tile_idx > 0 else actual_bottom_overlap,
-                top_overlap_sha256=top_sha,
-                bottom_overlap_sha256=bottom_sha,
+                overlap_px=0,
+                top_overlap_sha256=None,
+                bottom_overlap_sha256=None,
+                source_rect=(0.0, src_y, src_w, src_h),
                 scale_x=scale_x,
                 scale_y=scale_y,
-                device_scale_factor=dpr,
+                device_scale_factor=device_scale_factor,
                 source_crop_x=0,
                 source_crop_y=src_crop_y,
-                source_crop_width=source_width,
+                source_crop_width=int(source_width),
                 source_crop_height=src_crop_height,
-                source_width=source_width,
-                source_height=source_height,
-                css_y_offset=css_y_offset,
-                css_height=css_height,
-                top_overlap_px=actual_top_overlap,
-                bottom_overlap_px=actual_bottom_overlap,
-                coordinate_space="screenshot_px",
+                source_width=int(source_width),
+                source_height=int(source_height),
+                css_y_offset=int(round(source_y_offset)),
+                css_height=max(1, int(round(src_h / device_scale_factor))),
+                coordinate_space="CSS document offsets; screenshot physical-pixel source_rect",
             )
         )
 
+        if cursor + tile_height >= height:
+            break
+
+        cursor += step
+        tile_idx += 1
+
+    for previous, current in zip(tiles, tiles[1:]):
+        set_tile_overlap(previous, current)
     return tiles
 
 
-def _unscale(value: int, scale: float) -> float:
-    if scale == 0:
-        return float(value)
-    return value / scale
+def set_tile_overlap(previous: TileSlice, current: TileSlice) -> None:
+    """Hash actual common document rows, including shortened final sweeps."""
+    previous_scale = (previous.scale_y or previous.scale) * previous.device_scale_factor
+    current_scale = (current.scale_y or current.scale) * current.device_scale_factor
+    common_css = (
+        previous.source_y_offset + previous.height / previous_scale - current.source_y_offset
+    )
+    previous_px = min(previous.height, max(0, round(common_css * previous_scale)))
+    current_px = min(current.height, max(0, round(common_css * current_scale)))
+    previous.bottom_overlap_px = previous_px
+    current.top_overlap_px = current_px
+    current.overlap_px = current_px
+    vips = _require_pyvips()
+    previous_image = vips.Image.new_from_buffer(previous.png_bytes, "")
+    current_image = vips.Image.new_from_buffer(current.png_bytes, "")
+    previous.bottom_overlap_sha256 = _overlap_sha(
+        previous_image, position="bottom", overlap_px=previous_px
+    )
+    current.top_overlap_sha256 = _overlap_sha(current_image, position="top", overlap_px=current_px)
+
+
+def align_cross_sweep_overlap(prev_tile: TileSlice, curr_tile: TileSlice) -> None:
+    """Fill cross-sweep overlap only when set_tile_overlap has not recorded it yet.
+
+    Same-viewport pairs and pairs that already carry strip hashes are left unchanged
+    so a preceding set_tile_overlap is not hashed a second time.
+    """
+
+    if prev_tile.viewport_y_offset == curr_tile.viewport_y_offset:
+        return
+    if (
+        prev_tile.bottom_overlap_sha256
+        and curr_tile.top_overlap_sha256
+        and prev_tile.bottom_overlap_px > 0
+        and curr_tile.top_overlap_px > 0
+    ):
+        return
+    set_tile_overlap(prev_tile, curr_tile)
 
 
 def _overlap_sha(image: Any, *, position: str, overlap_px: int) -> Optional[str]:
@@ -338,48 +345,6 @@ def validate_tiles(tiles: Iterable[TileSlice]) -> None:
             )
 
 
-def align_cross_sweep_overlap(prev_tile: TileSlice, curr_tile: TileSlice) -> None:
-    """Align cross-sweep bottom/top overlap strips to the exact shared document y-range."""
-
-    if prev_tile.viewport_y_offset == curr_tile.viewport_y_offset:
-        return
-    prev_bottom_src = prev_tile.source_y_offset + prev_tile.source_crop_height
-    curr_top_src = curr_tile.source_y_offset
-    shared_src_px = prev_bottom_src - curr_top_src
-    if shared_src_px <= 0:
-        return
-
-    scale_y = (
-        curr_tile.scale_y
-        if curr_tile.scale_y > 0
-        else (curr_tile.scale if curr_tile.scale > 0 else 1.0)
-    )
-    shared_tile_px = min(
-        prev_tile.height,
-        curr_tile.height,
-        max(1, int(round(shared_src_px * scale_y))),
-    )
-    if shared_tile_px <= 0:
-        return
-
-    prev_tile.bottom_overlap_px = shared_tile_px
-    curr_tile.top_overlap_px = shared_tile_px
-
-    if _PYVIPS is None:
-        return
-    try:
-        prev_img = _PYVIPS.Image.new_from_buffer(prev_tile.png_bytes, "")
-        curr_img = _PYVIPS.Image.new_from_buffer(curr_tile.png_bytes, "")
-    except Exception:
-        return
-
-    prev_sha = _overlap_sha(prev_img, position="bottom", overlap_px=shared_tile_px)
-    curr_sha = _overlap_sha(curr_img, position="top", overlap_px=shared_tile_px)
-    if prev_sha is not None and curr_sha is not None:
-        prev_tile.bottom_overlap_sha256 = prev_sha
-        curr_tile.top_overlap_sha256 = curr_sha
-
-
 def _require_pyvips():
     if _PYVIPS is None:
         message = (
@@ -388,4 +353,3 @@ def _require_pyvips():
         )
         raise RuntimeError(message) from _PYVIPS_IMPORT_ERROR
     return _PYVIPS
-

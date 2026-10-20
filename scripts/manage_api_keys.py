@@ -15,8 +15,9 @@ from rich.table import Table
 from rich import box
 
 from app.auth import APIKey, create_api_key, revoke_api_key
+from app.settings import get_settings
 from app.store import build_store
-from sqlmodel import select
+from sqlmodel import col, select
 
 
 console = Console()
@@ -26,12 +27,13 @@ def cmd_create(
     name: str,
     rate_limit: Optional[int] = None,
     owner: Optional[str] = None,
+    is_admin: bool = False,
 ) -> None:
     """Create a new API key."""
     store = build_store()
 
     with store.session() as session:
-        plain_key, api_key = create_api_key(session, name, rate_limit, owner)
+        plain_key, api_key = create_api_key(session, name, rate_limit, owner, is_admin=is_admin)
 
         console.print("\n✅ [green]API Key created successfully![/green]\n")
 
@@ -44,6 +46,7 @@ def cmd_create(
         table.add_row("Prefix", api_key.key_prefix)
         table.add_row("Rate Limit", str(api_key.rate_limit) if api_key.rate_limit else "Unlimited")
         table.add_row("Owner", api_key.owner or "None")
+        table.add_row("Admin", "Yes" if api_key.is_admin else "No")
         table.add_row("Created", api_key.created_at.isoformat())
 
         console.print(table)
@@ -51,7 +54,8 @@ def cmd_create(
         console.print("\n🔑 [bold red]API Key (save this, it won't be shown again):[/bold red]")
         console.print(f"\n  [bold white]{plain_key}[/bold white]\n")
         console.print(
-            f"Use this key in requests with header: [cyan]X-API-Key: {plain_key}[/cyan]\n"
+            f"Use this key in requests with header: [cyan]{get_settings().API_KEY_HEADER}: "
+            "<your-key>[/cyan]\n"
         )
 
 
@@ -60,7 +64,7 @@ def cmd_list() -> None:
     store = build_store()
 
     with store.session() as session:
-        statement = select(APIKey).order_by(APIKey.created_at.desc())
+        statement = select(APIKey).order_by(col(APIKey.created_at).desc())
         api_keys = session.exec(statement).all()
 
         if not api_keys:
@@ -72,6 +76,7 @@ def cmd_list() -> None:
         table.add_column("Name", style="yellow")
         table.add_column("Prefix", style="dim")
         table.add_column("Active", style="green")
+        table.add_column("Admin", style="magenta")
         table.add_column("Rate Limit", style="magenta")
         table.add_column("Owner", style="blue")
         table.add_column("Created", style="dim")
@@ -83,6 +88,7 @@ def cmd_list() -> None:
                 key.name,
                 key.key_prefix,
                 "✅" if key.is_active else "❌",
+                "Yes" if key.is_admin else "No",
                 str(key.rate_limit) if key.rate_limit else "∞",
                 key.owner or "-",
                 key.created_at.strftime("%Y-%m-%d %H:%M"),
@@ -113,7 +119,7 @@ def cmd_show(key_id: int) -> None:
     store = build_store()
 
     with store.session() as session:
-        statement = select(APIKey).where(APIKey.id == key_id)
+        statement = select(APIKey).where(col(APIKey.id) == key_id)
         api_key = session.exec(statement).first()
 
         if not api_key:
@@ -128,6 +134,7 @@ def cmd_show(key_id: int) -> None:
         table.add_row("Name", api_key.name)
         table.add_row("Prefix", api_key.key_prefix)
         table.add_row("Active", "✅ Yes" if api_key.is_active else "❌ No")
+        table.add_row("Admin", "Yes" if api_key.is_admin else "No")
         table.add_row("Rate Limit", str(api_key.rate_limit) if api_key.rate_limit else "Unlimited")
         table.add_row("Owner", api_key.owner or "None")
         table.add_row("Created", api_key.created_at.isoformat())
@@ -153,6 +160,9 @@ Examples:
   # Create with rate limit
   python scripts/manage_api_keys.py create "My App" --rate-limit 100
 
+  # Create an operator key with administrative access
+  python scripts/manage_api_keys.py create "Ops" --admin
+
   # List all keys
   python scripts/manage_api_keys.py list
 
@@ -175,6 +185,9 @@ Examples:
         help="Rate limit in requests per minute (default: unlimited)",
     )
     create_parser.add_argument("--owner", help="Owner identifier for the key")
+    create_parser.add_argument(
+        "--admin", action="store_true", help="Grant access to administrative endpoints"
+    )
 
     # List command
     subparsers.add_parser("list", help="List all API keys")
@@ -191,7 +204,7 @@ Examples:
 
     try:
         if args.command == "create":
-            cmd_create(args.name, args.rate_limit, args.owner)
+            cmd_create(args.name, args.rate_limit, args.owner, is_admin=args.admin)
         elif args.command == "list":
             cmd_list()
         elif args.command == "show":

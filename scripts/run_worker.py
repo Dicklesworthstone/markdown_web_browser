@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Start Arq worker for processing background jobs."""
 
-import asyncio
 import logging
 import sys
 from pathlib import Path
@@ -26,7 +25,7 @@ logging.basicConfig(
 LOGGER = logging.getLogger(__name__)
 
 
-async def main():
+def main():
     """Run the Arq worker."""
     console.print("\n🚀 [bold cyan]Starting Arq Worker for Markdown Web Browser[/bold cyan]\n")
 
@@ -46,7 +45,7 @@ async def main():
 
     try:
         # Run the worker (blocks until shutdown)
-        await run_worker(WorkerSettings, redis_settings=redis_settings)
+        run_worker(dict(vars(WorkerSettings)), redis_settings=redis_settings)
     except KeyboardInterrupt:
         console.print("\n⚠️  [yellow]Worker shutdown requested[/yellow]")
     except Exception as e:
@@ -59,6 +58,6 @@ async def main():
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        main()
     except KeyboardInterrupt:
         sys.exit(0)

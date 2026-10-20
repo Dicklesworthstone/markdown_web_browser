@@ -1,4 +1,39 @@
 import { defineConfig } from '@playwright/test';
+import { execFileSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { createRequire } from 'node:module';
+
+const playwrightVersion = createRequire(import.meta.url)('@playwright/test/package.json').version;
+const versionParts = playwrightVersion.split('.').map(Number);
+if (versionParts[0] < 1 || (versionParts[0] === 1 && versionParts[1] < 50)) {
+  throw new Error(`Playwright >=1.50 is required; found ${playwrightVersion}.`);
+}
+
+// Use the application's python-decouple settings rather than a second .env parser.
+const browserSettings = JSON.parse(execFileSync('uv', [
+  'run', '--no-sync', '--python', '3.13', 'python', '-c',
+  `import json
+from app.capture import _browser_font_environment
+from app.settings import get_settings
+s = get_settings().browser
+font_environment = _browser_font_environment(s.fontconfig_file)
+print(json.dumps({
+    "channel": s.playwright_channel,
+    "transport": s.browser_transport,
+    "cft_version": s.cft_version,
+    "cft_label": s.cft_label,
+    "executable": str(s.cft_executable) if s.cft_executable else None,
+    "fontconfig_file": font_environment.get("FONTCONFIG_FILE") if font_environment else None,
+    "viewport_width": s.viewport_width,
+    "viewport_height": s.viewport_height,
+    "device_scale_factor": s.device_scale_factor,
+    "color_scheme": s.color_scheme,
+    "mask_selectors": list(s.screenshot_mask_selectors),
+    "screenshot_style_hash": s.screenshot_style_hash,
+}))`,
+], { encoding: 'utf8' }));
 
 const parseIntEnv = (name, fallback) => {
   const raw = process.env[name];
@@ -13,36 +48,46 @@ const parseListEnv = (value, fallback) =>
     .map((entry) => entry.trim())
     .filter((entry) => entry.length > 0);
 
-const viewportWidth = parseIntEnv('PLAYWRIGHT_VIEWPORT_WIDTH', 1280);
-const viewportHeight = parseIntEnv('PLAYWRIGHT_VIEWPORT_HEIGHT', 2000);
-const deviceScaleFactor = parseIntEnv('PLAYWRIGHT_DEVICE_SCALE_FACTOR', 2);
+const viewportWidth = browserSettings.viewport_width;
+const viewportHeight = browserSettings.viewport_height;
+const deviceScaleFactor = browserSettings.device_scale_factor;
 const actionTimeout = parseIntEnv('PLAYWRIGHT_ACTION_TIMEOUT_MS', 15_000);
 const navigationTimeout = parseIntEnv('PLAYWRIGHT_NAVIGATION_TIMEOUT_MS', 30_000);
-const colorScheme = process.env.PLAYWRIGHT_COLOR_SCHEME?.toLowerCase() === 'dark' ? 'dark' : 'light';
-const baseURL = process.env.PLAYWRIGHT_BASE_URL ?? process.env.API_BASE_URL ?? 'http://localhost:8007';
-const channelAliases = {
-  cft: 'chrome',
-  'chrome-for-testing': 'chrome',
-};
-const normalizeChannel = (raw) => {
-  const cleaned = (raw ?? 'chrome').trim().toLowerCase();
-  return channelAliases[cleaned] ?? cleaned;
-};
-const channelCandidates = parseListEnv(process.env.PLAYWRIGHT_CHANNEL, 'cft,chromium');
-const channel = normalizeChannel(channelCandidates[0]);
-const channelFallbacks = channelCandidates.slice(1).map(normalizeChannel);
+const colorScheme = browserSettings.color_scheme;
+const baseURL = process.env.PLAYWRIGHT_BASE_URL ?? process.env.API_BASE_URL ?? 'http://localhost:8000';
+const channelCandidates = parseListEnv(browserSettings.channel, 'cft');
+if (channelCandidates.length !== 1) {
+  throw new Error('Node smoke requires one explicit channel; fallback launch is not implemented here.');
+}
+const channel = channelCandidates[0];
 
-const transportCandidates = parseListEnv(process.env.PLAYWRIGHT_TRANSPORT, 'cdp');
-const resolvedTransport = (transportCandidates[0] ?? 'cdp').toLowerCase();
-const transportFallbacks = transportCandidates.slice(1).map((entry) => entry.toLowerCase());
-const screenshotPath = process.env.PLAYWRIGHT_SCREENSHOT_DIR ?? undefined;
-const maskSelectors = (process.env.PLAYWRIGHT_SCREENSHOT_MASKS ?? '')
-  .split(',')
-  .map((value) => value.trim())
-  .filter(Boolean);
+const transportCandidates = parseListEnv(browserSettings.transport, 'cdp')
+  .map((entry) => entry.toLowerCase());
+if (transportCandidates.some((entry) => !['cdp', 'bidi'].includes(entry)) ||
+    !transportCandidates.includes('cdp')) {
+  throw new Error('BiDi is not implemented by this smoke adapter; select cdp.');
+}
+const maskSelectors = browserSettings.mask_selectors;
+const build = browserSettings.cft_version.replace(/^chrome-/, '');
+if (channel === 'cft' && !/^\d+\.\d+\.\d+\.\d+$/.test(build)) {
+  throw new Error('CFT_VERSION must name an exact four-part Chrome build.');
+}
+const cftExecutable = resolve(browserSettings.executable ??
+  join(homedir(), '.cache/mdwb/cft', build, 'chrome-linux64/chrome'));
+if (channel === 'cft' && !existsSync(cftExecutable)) {
+  throw new Error(`Pinned CfT executable is missing: ${cftExecutable}. Install that build or set CFT_EXECUTABLE.`);
+}
+const observedBinaryBuild = channel === 'cft'
+  ? execFileSync(cftExecutable, ['--version'], { encoding: 'utf8' })
+    .match(/\b(\d+\.\d+\.\d+\.\d+)\b/)?.[1]
+  : null;
+if (channel === 'cft' && observedBinaryBuild !== build) {
+  throw new Error(`CfT pin mismatch: expected ${build}, executable reports ${observedBinaryBuild}.`);
+}
 
 const launchOptions = {
-  channel,
+  ...(channel === 'cft' ? { executablePath: cftExecutable } : { channel }),
+  ...(browserSettings.fontconfig_file ? { env: { FONTCONFIG_FILE: browserSettings.fontconfig_file } } : {}),
   args: [
     '--headless=new',
     '--no-sandbox',
@@ -51,14 +96,6 @@ const launchOptions = {
     `--window-size=${viewportWidth},${viewportHeight}`,
   ],
 };
-if (process.env.CFT_EXECUTABLE_PATH) {
-  launchOptions.executablePath = process.env.CFT_EXECUTABLE_PATH;
-}
-
-if (resolvedTransport === 'bidi') {
-  // @ts-ignore -- protocol is a documented experimental option in Playwright 1.50+
-  launchOptions.protocol = 'webDriverBiDi';
-}
 
 const sharedUse = {
   baseURL,
@@ -75,8 +112,7 @@ const sharedUse = {
     mode: 'only-on-failure',
     animations: 'disabled',
     caret: 'hide',
-    fullPage: true,
-    path: screenshotPath,
+    fullPage: false,
   },
   reducedMotion: 'reduce',
 };
@@ -88,22 +124,34 @@ export default defineConfig({
   retries: process.env.CI ? 1 : 0,
   workers: process.env.CI ? 2 : undefined,
   reporter: [['list']],
+  outputDir: process.env.PLAYWRIGHT_OUTPUT_DIR ?? 'test-results',
+  preserveOutput: 'always',
+  expect: {
+    toHaveScreenshot: {
+      animations: 'disabled',
+      caret: 'hide',
+      fullPage: false,
+    },
+  },
   metadata: {
     viewport: `${viewportWidth}x${viewportHeight}@${deviceScaleFactor}x`,
     colorScheme,
     playwrightChannel: channel,
-    playwrightChannelFallbacks: channelFallbacks,
-    playwrightTransport: resolvedTransport === 'bidi' ? 'webDriverBiDi' : 'cdp',
-    playwrightTransportFallbacks: transportFallbacks,
+    cftExpectedBuild: build,
+    cftObservedBinaryBuild: observedBinaryBuild,
+    playwrightVersion,
+    cftLabel: browserSettings.cft_label,
+    cftExecutable: channel === 'cft' ? cftExecutable : null,
+    playwrightTransport: 'cdp',
+    requestedTransports: transportCandidates,
+    screenshotStyleHash: browserSettings.screenshot_style_hash,
+    screenshotMaskSelectors: maskSelectors,
   },
   use: sharedUse,
   projects: [
     {
-      name: 'chromium',
-      use: {
-        ...sharedUse,
-        mask: maskSelectors,
-      },
+      name: channel,
+      use: sharedUse,
     },
   ],
 });

@@ -4,96 +4,40 @@ from __future__ import annotations
 
 import re
 from datetime import datetime
-from typing import Any
+from typing import Annotated, Any
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator, model_validator
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    HttpUrl,
+    field_validator,
+    model_validator,
+)
 
-from app.ocr_policy import resolve_model_profile
-
-_PROFILE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+from app.ocr_policy import validate_ocr_policy
 
 
-def validate_profile_id(profile_id: str) -> str:
-    """Validate a profile identifier, rejecting traversal, dots, and colliding characters."""
-    if not isinstance(profile_id, str):
-        raise ValueError("profile_id must be a string")
-    cleaned = profile_id.strip()
-    if not cleaned:
-        raise ValueError("profile_id cannot be empty")
-    if (
-        cleaned in {".", ".."}
-        or ".." in cleaned
-        or "/" in cleaned
-        or "\\" in cleaned
-        or "\x00" in cleaned
-        or cleaned.startswith(".")
-        or cleaned.endswith(".")
-        or not _PROFILE_ID_PATTERN.match(cleaned)
-    ):
+def validate_profile_id(value: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}", value):
         raise ValueError(
-            f"Invalid profile_id {profile_id!r}: must match ^[A-Za-z0-9][A-Za-z0-9._-]{{0,127}}$ "
-            "without path separators, '..', or leading/trailing dots"
+            "Profile IDs must start with a letter, digit, _ or - and contain only letters, digits, ., _ or - (max 128)"
         )
-    return cleaned
+    return value
 
 
-def _validate_optional_profile_id(value: str | None) -> str | None:
-    if value is None:
-        return None
-    return validate_profile_id(value)
-
-
-def _validate_optional_ocr_policy(value: str | None) -> str | None:
-    if value is None:
-        return None
-    profile = resolve_model_profile(value, allow_disabled=False)
-    return profile.policy_key
-
-
-class ViewportOverride(BaseModel):
-    """Nested viewport override payload for capture requests."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    width: int | None = Field(default=None, ge=1, le=32767)
-    height: int | None = Field(default=None, ge=1, le=32767)
-    device_scale_factor: int | None = Field(default=None, ge=1, le=10)
-    color_scheme: str | None = Field(default=None)
-
-    @field_validator("color_scheme")
-    @classmethod
-    def _validate_color_scheme(cls, value: str | None) -> str | None:
-        if value is None:
-            return value
-        cleaned = value.strip().lower()
-        if cleaned not in ("light", "dark"):
-            raise ValueError("color_scheme must be 'light' or 'dark'")
-        return cleaned
-
-
-class OCRRequestOverride(BaseModel):
-    """Nested OCR policy/model override payload for capture requests."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    policy: str | None = Field(
-        default=None, description="OCR policy key declared in docs/models.yaml"
-    )
-    model: str | None = Field(default=None, description="Explicit OCR model name")
-    use_fp8: bool | None = Field(default=None, description="Override FP8 preference")
-    long_side_px: int | None = Field(
-        default=None, ge=1, le=16384, description="Override tile longest side"
-    )
-    max_tiles_in_flight: int | None = Field(
-        default=None, ge=1, le=64, description="Override max concurrent OCR tiles"
-    )
+ProfileId = Annotated[str, AfterValidator(validate_profile_id)]
+OCRPolicyId = Annotated[str, AfterValidator(validate_ocr_policy)]
 
 
 class JobCreateRequest(BaseModel):
     """Payload clients submit to kick off a capture job."""
 
     model_config = ConfigDict(extra="forbid")
+    ocr_policy: OCRPolicyId | None = None
+    tags: list[str] = Field(default_factory=list, max_length=100)
 
     url: str = Field(description="Target URL to capture")
 
@@ -114,13 +58,7 @@ class JobCreateRequest(BaseModel):
 
         return value
 
-    profile_id: str | None = Field(default=None, description="Browser profile identifier")
-
-    @field_validator("profile_id")
-    @classmethod
-    def _validate_profile_id(cls, value: str | None) -> str | None:
-        return _validate_optional_profile_id(value)
-
+    profile_id: ProfileId | None = Field(default=None, description="Browser profile identifier")
     viewport_width: int | None = Field(
         default=None, ge=1, le=32767, description="Override viewport width"
     )
@@ -131,9 +69,6 @@ class JobCreateRequest(BaseModel):
         default=None, ge=1, le=10, description="Override device scale factor"
     )
     color_scheme: str | None = Field(default=None, description="Override color scheme (light|dark)")
-    viewport: ViewportOverride | None = Field(
-        default=None, description="Nested viewport override object"
-    )
 
     @field_validator("color_scheme")
     @classmethod
@@ -149,24 +84,6 @@ class JobCreateRequest(BaseModel):
 
     long_side_px: int | None = Field(
         default=None, ge=1, le=16384, description="Override tile longest side policy"
-    )
-    ocr_policy: str | None = Field(
-        default=None, description="OCR policy key declared in docs/models.yaml"
-    )
-    ocr_model: str | None = Field(
-        default=None, description="Explicit OCR model override"
-    )
-    ocr_use_fp8: bool | None = Field(
-        default=None, description="Override FP8 preference for OCR"
-    )
-    ocr_max_tiles_in_flight: int | None = Field(
-        default=None, ge=1, le=64, description="Override max concurrent OCR tiles in flight"
-    )
-    ocr: OCRRequestOverride | None = Field(
-        default=None, description="Nested OCR policy/model override object"
-    )
-    tags: list[str] | None = Field(
-        default=None, description="Free-form labels attached to the capture run"
     )
     reuse_cache: bool = Field(
         default=True, description="Reuse cached captures when an identical configuration exists"
@@ -186,82 +103,11 @@ class JobCreateRequest(BaseModel):
         description="Cap the Markdown characters sent to the semantic fixer (default 50000).",
     )
 
-    @model_validator(mode="after")
-    def _normalize_nested_and_validate_ocr(self) -> JobCreateRequest:
-        if self.viewport is not None:
-            if self.viewport.width is not None:
-                if self.viewport_width is not None and self.viewport_width != self.viewport.width:
-                    raise ValueError("Conflicting viewport_width and viewport.width")
-                self.viewport_width = self.viewport.width
-            if self.viewport.height is not None:
-                if self.viewport_height is not None and self.viewport_height != self.viewport.height:
-                    raise ValueError("Conflicting viewport_height and viewport.height")
-                self.viewport_height = self.viewport.height
-            if self.viewport.device_scale_factor is not None:
-                if (
-                    self.device_scale_factor is not None
-                    and self.device_scale_factor != self.viewport.device_scale_factor
-                ):
-                    raise ValueError(
-                        "Conflicting device_scale_factor and viewport.device_scale_factor"
-                    )
-                self.device_scale_factor = self.viewport.device_scale_factor
-            if self.viewport.color_scheme is not None:
-                if self.color_scheme is not None and self.color_scheme != self.viewport.color_scheme:
-                    raise ValueError("Conflicting color_scheme and viewport.color_scheme")
-                self.color_scheme = self.viewport.color_scheme
-
-        if self.ocr is not None:
-            if self.ocr.policy is not None:
-                if self.ocr_policy is not None and self.ocr_policy != self.ocr.policy:
-                    raise ValueError("Conflicting ocr_policy and ocr.policy")
-                self.ocr_policy = self.ocr.policy
-            if self.ocr.model is not None:
-                if self.ocr_model is not None and self.ocr_model != self.ocr.model:
-                    raise ValueError("Conflicting ocr_model and ocr.model")
-                self.ocr_model = self.ocr.model
-            if self.ocr.use_fp8 is not None:
-                if self.ocr_use_fp8 is not None and self.ocr_use_fp8 != self.ocr.use_fp8:
-                    raise ValueError("Conflicting ocr_use_fp8 and ocr.use_fp8")
-                self.ocr_use_fp8 = self.ocr.use_fp8
-            if self.ocr.long_side_px is not None:
-                if self.long_side_px is not None and self.long_side_px != self.ocr.long_side_px:
-                    raise ValueError("Conflicting long_side_px and ocr.long_side_px")
-                self.long_side_px = self.ocr.long_side_px
-            if self.ocr.max_tiles_in_flight is not None:
-                if (
-                    self.ocr_max_tiles_in_flight is not None
-                    and self.ocr_max_tiles_in_flight != self.ocr.max_tiles_in_flight
-                ):
-                    raise ValueError(
-                        "Conflicting ocr_max_tiles_in_flight and ocr.max_tiles_in_flight"
-                    )
-                self.ocr_max_tiles_in_flight = self.ocr.max_tiles_in_flight
-
-        policy_candidate = self.ocr_policy or self.ocr_model
-        if policy_candidate is not None:
-            profile = resolve_model_profile(policy_candidate, allow_disabled=False)
-            if self.ocr_model is not None and self.ocr_policy is not None:
-                # Ensure both refer to valid, enabled policies
-                model_profile = resolve_model_profile(self.ocr_model, allow_disabled=False)
-                self.ocr_model = model_profile.policy_key
-            else:
-                self.ocr_model = profile.policy_key
-            self.ocr_policy = profile.policy_key
-            if self.long_side_px is None:
-                self.long_side_px = profile.long_side_px
-            if self.ocr_use_fp8 is None:
-                self.ocr_use_fp8 = profile.fp8_preferred
-            if self.ocr_max_tiles_in_flight is None:
-                self.ocr_max_tiles_in_flight = profile.max_tiles_in_flight
-        return self
-
 
 class ReplayRequest(BaseModel):
     """Payload for replaying a stored manifest."""
 
     model_config = ConfigDict(extra="forbid")
-
     manifest: dict[str, Any] = Field(description="Manifest JSON to replay")
 
     @field_validator("manifest")
@@ -278,7 +124,7 @@ class ReplayRequest(BaseModel):
             validate_profile_id(profile_val)
         policy_val = value.get("ocr_policy") or value.get("selected_ocr_policy")
         if isinstance(policy_val, str) and policy_val.strip():
-            resolve_model_profile(policy_val, allow_disabled=False)
+            validate_ocr_policy(policy_val)
         return value
 
 
@@ -667,16 +513,6 @@ class ManifestMetadata(BaseModel):
         return self
 
 
-def _validate_optional_ocr_policy(value: str | None) -> str | None:
-    if value is None:
-        return None
-    stripped = value.strip()
-    if not stripped:
-        return None
-    profile = resolve_model_profile(stripped, allow_disabled=False)
-    return profile.policy_key
-
-
 class EmbeddingSearchRequest(BaseModel):
     """Payload for querying sqlite-vec section embeddings."""
 
@@ -792,27 +628,16 @@ class BatchJobRequest(BaseModel):
     """
 
     model_config = ConfigDict(extra="forbid")
-
-    urls: list[str] = Field(..., min_length=1, max_length=200, description="URLs to capture in parallel")
-    profile_id: str | None = Field(default=None)
+    urls: list[str] = Field(
+        ..., min_length=1, max_length=200, description="URLs to capture in parallel"
+    )
+    profile_id: ProfileId | None = Field(default=None)
     reuse_cache: bool = True
-    ocr_policy: str | None = None
-    ocr: OCRRequestOverride | None = None
-    viewport: ViewportOverride | None = None
+    ocr_policy: OCRPolicyId | None = None
     tags: list[str] = Field(
         default_factory=list,
         description="Free-form labels (e.g. 'dataset:2026-q1', 'team:research') for later /jobs filtering",
     )
-
-    @field_validator("profile_id")
-    @classmethod
-    def _validate_profile_id(cls, value: str | None) -> str | None:
-        return _validate_optional_profile_id(value)
-
-    @field_validator("ocr_policy")
-    @classmethod
-    def _validate_ocr_policy(cls, value: str | None) -> str | None:
-        return _validate_optional_ocr_policy(value)
 
 
 class JobTagRequest(BaseModel):
@@ -921,29 +746,26 @@ class CrawlRequest(BaseModel):
     """
 
     model_config = ConfigDict(extra="forbid")
-
     url: HttpUrl = Field(..., description="Seed URL to crawl (becomes depth 0)")
     max_pages: int = Field(default=10, ge=1, le=200, description="Hard cap on captured pages")
-    max_depth: int = Field(default=1, ge=0, le=2, description="0=seed only, 1=seed+discovered, 2=two hops")
+    max_depth: int = Field(
+        default=1, ge=0, le=2, description="0=seed only, 1=seed+discovered, 2=two hops"
+    )
     domain_allowlist: list[str] = Field(
         default_factory=list,
         description="Restrict expansion to these domains (and subdomains). Empty = follow any link.",
     )
     respect_robots_txt: bool = Field(default=True, description="Honor robots.txt Disallow rules")
-    crawl_delay_ms: int = Field(default=500, ge=0, le=60_000, description="Delay between requests (ms)")
+    crawl_delay_ms: int = Field(
+        default=500, ge=0, le=60_000, description="Delay between requests (ms)"
+    )
     reuse_cache: bool = Field(default=True, description="Reuse content-addressed captures")
-    profile_id: str | None = Field(default=None, description="Auth profile id (passed to each child job)")
-    ocr_policy: str | None = Field(default=None, description="OCR policy key for each child")
-
-    @field_validator("profile_id")
-    @classmethod
-    def _validate_profile_id(cls, value: str | None) -> str | None:
-        return _validate_optional_profile_id(value)
-
-    @field_validator("ocr_policy")
-    @classmethod
-    def _validate_ocr_policy(cls, value: str | None) -> str | None:
-        return _validate_optional_ocr_policy(value)
+    profile_id: ProfileId | None = Field(
+        default=None, description="Auth profile id (passed to each child job)"
+    )
+    ocr_policy: OCRPolicyId | None = Field(
+        default=None, description="OCR policy key for each child"
+    )
 
 
 class CrawlResponse(BaseModel):
@@ -1360,20 +1182,9 @@ class JobReplayRequest(BaseModel):
     """Request for POST /jobs/{id}/replay — re-emit as a fresh run."""
 
     model_config = ConfigDict(extra="forbid")
-
     reuse_cache: bool = True
-    profile_id: str | None = None
-    ocr_policy: str | None = None
-
-    @field_validator("profile_id")
-    @classmethod
-    def _validate_profile_id(cls, value: str | None) -> str | None:
-        return _validate_optional_profile_id(value)
-
-    @field_validator("ocr_policy")
-    @classmethod
-    def _validate_ocr_policy(cls, value: str | None) -> str | None:
-        return _validate_optional_ocr_policy(value)
+    profile_id: ProfileId | None = None
+    ocr_policy: OCRPolicyId | None = None
 
 
 class JobReplayResponse(BaseModel):
@@ -1466,9 +1277,13 @@ class AdminStatsResponse(BaseModel):
 class AdminPruneRequest(BaseModel):
     """Request for POST /admin/jobs/prune."""
 
-    older_than_days: int = Field(..., ge=1, le=365, description="Delete DONE/FAILED jobs older than N days")
+    older_than_days: int = Field(
+        ..., ge=1, le=365, description="Delete DONE/FAILED jobs older than N days"
+    )
     state: str | None = Field(default=None, description="Restrict to a given state")
-    dry_run: bool = Field(default=True, description="If true, just count candidates without deleting")
+    dry_run: bool = Field(
+        default=True, description="If true, just count candidates without deleting"
+    )
 
 
 class AdminPruneResponse(BaseModel):
@@ -1510,14 +1325,18 @@ class FollowResponse(BaseModel):
     anchor: str
     resolved_href: str | None = None
     resolved_text: str | None = None
-    candidates: list[str] = Field(default_factory=list, description="Other in-page anchors that may match")
+    candidates: list[str] = Field(
+        default_factory=list, description="Other in-page anchors that may match"
+    )
 
 
 class ExportMdQuery(BaseModel):
     """Query for /jobs/{id}/export.md — controls streaming behavior."""
 
     max_chars: int | None = Field(default=None, ge=1, le=2_000_000)
-    strip_provenance: bool = Field(default=True, description="Remove '<!-- source: ... -->' comments")
+    strip_provenance: bool = Field(
+        default=True, description="Remove '<!-- source: ... -->' comments"
+    )
 
 
 class ExportMdResponse(BaseModel):

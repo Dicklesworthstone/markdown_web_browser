@@ -21,6 +21,12 @@ REPO_URL="${MDWB_REPO_URL:-https://github.com/Dicklesworthstone/markdown_web_bro
 DEFAULT_INSTALL_DIR="./markdown_web_browser"
 PYTHON_VERSION="${MDWB_PYTHON_VERSION:-3.13}"
 APT_LOCK_WAIT_SECONDS="${MDWB_APT_LOCK_WAIT_SECONDS:-300}"
+# Verified official versioned installer bytes; changes require a fresh hash review.
+readonly UV_INSTALLER_VERSION="0.13.0"
+readonly UV_INSTALLER_SHA256="283cbef4bdaca819bd896b0dacb8a085c4c05dbc880642aa5001d97bc4db74ba"
+# Chrome for Testing build the installer fetches on Linux x86_64; same archive digest as CI.
+readonly CFT_PINNED_BUILD="130.0.6723.69"
+readonly CFT_PINNED_LINUX64_SHA256="f789d53911a50cfa4a2bc1f09cde57567247f52515436d92b1aa9de93c2787d0"
 
 # Colors for output
 RED='\033[0;31m'
@@ -232,6 +238,24 @@ detect_os() {
 }
 
 # Function to install uv
+verify_uv_installer() {
+    local installer_path="$1"
+    local observed
+    if command_exists sha256sum; then
+        observed=$(sha256sum "$installer_path") || return 1
+    elif command_exists shasum; then
+        observed=$(shasum -a 256 "$installer_path") || return 1
+    else
+        print_color "$RED" "Error: sha256sum or shasum is required to verify the uv installer."
+        return 1
+    fi
+    observed="${observed%% *}"
+    if [ "$observed" != "$UV_INSTALLER_SHA256" ]; then
+        print_color "$RED" "Error: uv installer checksum mismatch; downloaded code was not executed."
+        return 1
+    fi
+}
+
 install_uv() {
     if command_exists uv; then
         print_color "$GREEN" "✓ uv is already installed"
@@ -240,14 +264,23 @@ install_uv() {
 
     print_color "$BLUE" "Installing uv package manager..."
 
+    local download_root installer_path installer_url
+    download_root=$(mktemp -d "${TMPDIR:-/tmp}/mdwb-uv.XXXXXXXX") || return 1
+    installer_path="$download_root/install.sh"
+    installer_url="https://astral.sh/uv/$UV_INSTALLER_VERSION/install.sh"
     if command_exists curl; then
-        curl -LsSf https://astral.sh/uv/install.sh | sh
+        curl --user-agent "mdwb-installer (+https://github.com/Dicklesworthstone/markdown_web_browser)" \
+            --fail --location --proto '=https' "$installer_url" --output "$installer_path" || return 1
     elif command_exists wget; then
-        wget -qO- https://astral.sh/uv/install.sh | sh
+        wget --user-agent="mdwb-installer (+https://github.com/Dicklesworthstone/markdown_web_browser)" \
+            --https-only "$installer_url" --output-document="$installer_path" || return 1
     else
         print_color "$RED" "Error: Neither curl nor wget found. Please install one of them first."
         exit 1
     fi
+    verify_uv_installer "$installer_path" || return 1
+    print_color "$BLUE" "Verified uv $UV_INSTALLER_VERSION installer; retained at $installer_path"
+    UV_NO_MODIFY_PATH=1 sh "$installer_path" || return 1
 
     # Add uv to PATH for current session
     # uv 0.10+ installs to ~/.local/bin; older versions used ~/.cargo/bin
@@ -347,8 +380,8 @@ setup_repository() {
 
     if [ -d "$INSTALL_DIR/.git" ]; then
         print_color "$BLUE" "Updating existing repository..."
-        cd "$INSTALL_DIR"
-        git pull origin main
+        cd "$INSTALL_DIR" || return 1
+        git -c http.userAgent="mdwb-installer (+https://github.com/Dicklesworthstone/markdown_web_browser)" pull --ff-only origin main
     else
         if [ -d "$INSTALL_DIR" ]; then
             print_color "$RED" "Error: $INSTALL_DIR exists but is not a git checkout."
@@ -357,8 +390,8 @@ setup_repository() {
         fi
 
         print_color "$BLUE" "Cloning repository..."
-        git clone "$REPO_URL" "$INSTALL_DIR"
-        cd "$INSTALL_DIR"
+        git -c http.userAgent="mdwb-installer (+https://github.com/Dicklesworthstone/markdown_web_browser)" clone "$REPO_URL" "$INSTALL_DIR"
+        cd "$INSTALL_DIR" || return 1
     fi
 
     print_color "$GREEN" "✓ Repository ready"
@@ -378,41 +411,9 @@ setup_python_env() {
 
     # Sync dependencies
     print_color "$BLUE" "Installing Python dependencies..."
-    uv sync
+    uv sync --locked --python "$PYTHON_VERSION"
 
     print_color "$GREEN" "✓ Python environment ready"
-}
-
-# Function to detect Playwright Chromium version
-detect_cft_version() {
-    print_color "$BLUE" "Detecting Playwright Chromium version..."
-
-    # Try to get version info from playwright
-    local version_output
-    version_output=$(uv run playwright install chromium --dry-run 2>&1 || true)
-
-    # Extract version from output (format varies, try multiple patterns)
-    local cft_version=""
-
-    # Try to extract version like "130.0.6723.69"
-    if echo "$version_output" | grep -qE "chrome-[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+"; then
-        cft_version=$(echo "$version_output" | grep -oE "chrome-[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" | head -1)
-    elif echo "$version_output" | grep -qE "[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+"; then
-        # Sometimes it's just the version without "chrome-" prefix
-        local raw_version
-        raw_version=$(echo "$version_output" | grep -oE "[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" | head -1)
-        cft_version="chrome-${raw_version}"
-    fi
-
-    if [ -z "$cft_version" ]; then
-        # Fallback: use a reasonable default if detection fails
-        print_color "$YELLOW" "Could not auto-detect Chromium version, using default"
-        cft_version="chrome-130.0.6723.69"
-    else
-        print_color "$GREEN" "✓ Detected Playwright Chromium: $cft_version"
-    fi
-
-    echo "$cft_version"
 }
 
 # Print guidance for installing browser system dependencies manually.
@@ -453,9 +454,10 @@ print_browser_dep_notice() {
             ;;
     esac
     print_color "$YELLOW" ""
-    print_color "$YELLOW" "  Alternatively, mdwb works against system Chrome/Chromium without these:"
-    print_color "$YELLOW" "  install Google Chrome and run mdwb against it (channel=chrome), or"
-    print_color "$YELLOW" "  re-run this installer with --no-browsers."
+    print_color "$YELLOW" "  The default capture channel requires the exact Chrome for Testing build"
+    print_color "$YELLOW" "  named by CFT_VERSION. Install that build from https://googlechromelabs.github.io/chrome-for-testing/"
+    print_color "$YELLOW" "  and set CFT_EXECUTABLE to its Chrome executable, or use the documented"
+    print_color "$YELLOW" "  ~/.cache/mdwb/cft/<build>/chrome-linux64/chrome location on Linux."
     print_color "$YELLOW" "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 }
 
@@ -467,10 +469,10 @@ install_playwright_browsers() {
     fi
 
     print_color "$BLUE" "Installing Playwright Chromium..."
-    print_color "$YELLOW" "  Note: This installs Playwright's pinned Chromium build,"
-    print_color "$YELLOW" "        ensuring deterministic, reproducible screenshots."
+    print_color "$YELLOW" "  This installs Playwright's bundled Chromium for explicitly selected chromium runs."
+    print_color "$YELLOW" "  The Chrome for Testing build named by CFT_VERSION is a separate step."
 
-    # Install Chromium via Playwright (--channel=cft removed; unsupported in Playwright 1.57+)
+    # Playwright's bundled Chromium and Chrome for Testing are distinct artifacts.
     if [ "$(detect_os)" = "debian" ]; then
         wait_for_apt_locks
     fi
@@ -497,92 +499,106 @@ install_playwright_browsers() {
             print_browser_dep_notice
         else
             print_color "$YELLOW" "⚠ Playwright could not install its bundled Chromium on this host."
-            print_color "$YELLOW" "  Continuing anyway: mdwb can still run using system Chrome"
-            print_color "$YELLOW" "  (channel=chrome). See guidance below."
+            print_color "$YELLOW" "  Browser installation remains incomplete. See guidance below."
             print_browser_dep_notice
         fi
     fi
 
-    # Verify Chromium installation with fallback checks (informational; non-fatal)
-    local verify_output
-    verify_output=$(uv run playwright install chromium --dry-run 2>&1 || true)
-    if echo "$verify_output" | grep -qE "(is already installed|already exists)"; then
-        print_color "$GREEN" "✓ Playwright Chromium installed successfully"
-    elif [ -d "$HOME/.cache/ms-playwright" ] || [ -d "$HOME/Library/Caches/ms-playwright" ]; then
-        print_color "$YELLOW" "⚠ Chromium verification uncertain, but browser cache exists - proceeding"
-    else
-        print_color "$YELLOW" "⚠ Playwright Chromium was not installed on this host."
-        print_color "$YELLOW" "  The installer will continue; mdwb can still run against system Chrome"
-        print_color "$YELLOW" "  (channel=chrome), or re-run with browsers once your distro is supported."
+    return 0
+}
+
+# Fetch the pinned Chrome for Testing build into the location the capture launcher
+# reads by default. Skipped when the configuration names another build or executable.
+install_pinned_cft() {
+    if [ "$INSTALL_BROWSERS" = false ]; then
+        return 0
+    fi
+    if [ "$(uname -s)" != Linux ] || [ "$(uname -m)" != x86_64 ]; then
+        print_color "$YELLOW" "  Chrome for Testing is fetched automatically only on Linux x86_64."
+        print_color "$YELLOW" "  Install the CFT_VERSION build from https://googlechromelabs.github.io/chrome-for-testing/"
+        print_color "$YELLOW" "  and set CFT_EXECUTABLE to it; capture verifies the observed build."
+        return 0
     fi
 
-    return 0
+    local selected
+    selected=$(uv run --python 3.13 python - <<'PY'
+from app.capture import _normalize_channel
+from app.settings import get_settings
+
+browser = get_settings().browser
+channels = [_normalize_channel(value) for value in browser.playwright_channel.split(",")]
+if "cft" in channels and browser.cft_executable is None:
+    print(browser.cft_version.removeprefix("chrome-"))
+PY
+    ) || return 0
+    if [ -z "$selected" ]; then
+        return 0
+    fi
+    if [ "$selected" != "$CFT_PINNED_BUILD" ]; then
+        print_color "$YELLOW" "  CFT_VERSION names $selected; the installer only fetches the verified $CFT_PINNED_BUILD."
+        print_color "$YELLOW" "  Install that build from https://googlechromelabs.github.io/chrome-for-testing/"
+        return 0
+    fi
+
+    print_color "$BLUE" "Installing Chrome for Testing $CFT_PINNED_BUILD..."
+    if uv run --python 3.13 python -m scripts.install_helpers install-cft \
+        --build "$CFT_PINNED_BUILD" --sha256 "$CFT_PINNED_LINUX64_SHA256"; then
+        print_color "$GREEN" "✓ Chrome for Testing $CFT_PINNED_BUILD verified and in place"
+    else
+        print_color "$YELLOW" "⚠ Chrome for Testing was not installed; see the error above."
+    fi
 }
 
 # Function to setup configuration
 setup_config() {
     print_color "$BLUE" "Setting up configuration..."
 
-    # Copy example env file if it doesn't exist
-    if [ ! -f ".env" ]; then
-        if [ -f ".env.example" ]; then
-            cp .env.example .env
-            print_color "$GREEN" "✓ Created .env from .env.example"
+    if [ -e ".env" ] || [ -L ".env" ]; then
+        local repaired
+        if ! repaired=$(uv run --python 3.13 python -m scripts.install_helpers repair-legacy-env \
+            --build "$CFT_PINNED_BUILD"); then
+            print_color "$RED" "Error: installer residue in .env could not be repaired."
+            return 1
+        fi
+        if [ -n "$repaired" ]; then
+            print_color "$YELLOW" "$repaired"
         else
-            print_color "$YELLOW" "Warning: No .env.example found"
+            print_color "$GREEN" "✓ Preserved existing .env without modification"
         fi
-    else
-        print_color "$GREEN" "✓ .env file already exists"
-    fi
-
-    # Detect and update Playwright Chromium version in .env
-    if [ "$INSTALL_BROWSERS" = true ] && [ -f ".env" ]; then
-        local detected_version
-        detected_version=$(detect_cft_version)
-
-        if [ -n "$detected_version" ]; then
-            # Update CFT_VERSION in .env (safe approach: remove old line, append new)
-            if grep -q "^CFT_VERSION=" .env; then
-                # Create temp file without CFT_VERSION line, then append new value
-                grep -v "^CFT_VERSION=" .env > .env.tmp || true
-                mv .env.tmp .env
-                echo "CFT_VERSION=$detected_version" >> .env
-                print_color "$GREEN" "✓ Updated CFT_VERSION in .env to $detected_version"
-            else
-                echo "CFT_VERSION=$detected_version" >> .env
-                print_color "$GREEN" "✓ Added CFT_VERSION to .env: $detected_version"
-            fi
-
-            # Note: CFT_LABEL should be manually set based on Chrome release channel
-            # Default to "Stable" if not already set
-            if ! grep -q "^CFT_LABEL=" .env; then
-                echo "CFT_LABEL=Stable" >> .env
-                print_color "$YELLOW" "  Set CFT_LABEL=Stable (update if using specific label like Stable-1)"
-            fi
+        if [ -n "$OCR_API_KEY" ]; then
+            print_color "$YELLOW" "  --ocr-key was not applied because .env already exists."
         fi
+        return 0
     fi
+    if [ ! -f ".env.example" ]; then
+        print_color "$RED" "Error: .env.example is missing; configuration was not created."
+        return 1
+    fi
+    if [[ "$OCR_API_KEY" == *$'\n'* || "$OCR_API_KEY" == *$'\r'* ]]; then
+        print_color "$RED" "Error: OCR API key must be a single line."
+        return 1
+    fi
+    # Exclusive creation also refuses symlinks and files created after the check.
+    if ! (
+        umask 077
+        MDWB_INSTALL_OCR_API_KEY="$OCR_API_KEY" uv run --python 3.13 python - <<'PY'
+from pathlib import Path
+from app.settings import load_config
 
-    # Set OCR API key if provided
-    if [ -n "$OCR_API_KEY" ]; then
-        if [ -f ".env" ] && grep -q "^OLMOCR_API_KEY=" .env; then
-            # Safe approach: remove old line, append new (handles special chars in API key)
-            grep -v "^OLMOCR_API_KEY=" .env > .env.tmp || true
-            mv .env.tmp .env
-            echo "OLMOCR_API_KEY=$OCR_API_KEY" >> .env
-            print_color "$GREEN" "✓ OCR API key configured"
-        else
-            echo "OLMOCR_API_KEY=$OCR_API_KEY" >> .env
-            print_color "$GREEN" "✓ OCR API key added to .env"
-        fi
-    else
-        print_color "$YELLOW" "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-        print_color "$YELLOW" "⚠  IMPORTANT: OCR API key not configured"
-        print_color "$YELLOW" "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-        print_color "$YELLOW" "  The system REQUIRES an olmOCR API key to function."
-        print_color "$YELLOW" "  Add it to .env before running:"
-        print_color "$YELLOW" "    OLMOCR_API_KEY=sk-your-api-key-here"
-        print_color "$YELLOW" "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+key = load_config(".env.example")("MDWB_INSTALL_OCR_API_KEY", default="")
+template = Path(".env.example").read_text(encoding="utf-8")
+lines = template.splitlines()
+if key:
+    lines = [f"OLMOCR_API_KEY={key}" if line.startswith("OLMOCR_API_KEY=") else line for line in lines]
+with Path(".env").open("x", encoding="utf-8") as stream:
+    stream.write("\n".join(lines) + "\n")
+PY
+    ); then
+        print_color "$RED" "Error: .env could not be created exclusively; existing configuration was preserved."
+        return 1
     fi
+    print_color "$GREEN" "✓ Created private .env from .env.example"
+    print_color "$YELLOW" "  Review OCR credentials and the exact CFT_VERSION/CFT_EXECUTABLE before capture."
 }
 
 # Function to run tests
@@ -592,7 +608,7 @@ run_tests() {
     local all_passed=true
 
     # Test pyvips import
-    if uv run python -c "import pyvips; print('✓ pyvips works')" 2>/dev/null; then
+    if uv run --python 3.13 python -c "import pyvips; print('✓ pyvips works')"; then
         print_color "$GREEN" "✓ pyvips import successful"
     else
         print_color "$RED" "✗ pyvips import failed - libvips may not be installed correctly"
@@ -601,30 +617,45 @@ run_tests() {
 
     # Test Playwright
     if [ "$INSTALL_BROWSERS" = true ]; then
-        if uv run python -c "from playwright.async_api import async_playwright; print('✓ Playwright works')" 2>/dev/null; then
+        if uv run --python 3.13 python -c "from playwright.async_api import async_playwright; print('✓ Playwright works')"; then
             print_color "$GREEN" "✓ Playwright import successful"
         else
             print_color "$RED" "✗ Playwright import failed"
             all_passed=false
         fi
 
-        # Verify Playwright Chromium is actually installed
-        local cft_check
-        cft_check=$(uv run playwright install chromium --dry-run 2>&1)
-        if echo "$cft_check" | grep -qE "(is already installed|already exists)"; then
-            print_color "$GREEN" "✓ Playwright Chromium is installed and ready"
-        elif [ -d "$HOME/.cache/ms-playwright" ] || [ -d "$HOME/Library/Caches/ms-playwright" ]; then
-            # Fallback: check if Playwright browser cache exists
-            print_color "$YELLOW" "⚠ Playwright Chromium verification uncertain, but browser cache exists"
+        if uv run --python 3.13 python - <<'PY'
+import asyncio
+from playwright.async_api import async_playwright
+from app.capture import _launch_browser
+from app.settings import get_settings
+
+async def probe():
+    settings = get_settings().browser
+    async with async_playwright() as playwright:
+        browser, channel, transport = await _launch_browser(
+            playwright, settings.playwright_channel,
+            expected_build=settings.cft_version, transport=settings.browser_transport,
+            executable=settings.cft_executable, fontconfig_file=settings.fontconfig_file,
+        )
+        try:
+            print(f"Observed capture browser: {channel} {browser.version} {transport}")
+        finally:
+            await browser.close()
+
+asyncio.run(probe())
+PY
+        then
+            print_color "$GREEN" "✓ Configured browser launch, observed build, and glyph preflight passed"
         else
-            print_color "$RED" "✗ Playwright Chromium not detected"
-            print_color "$YELLOW" "  System may not work correctly - screenshots won't be deterministic"
+            print_color "$RED" "✗ Configured capture browser preflight failed"
+            print_color "$YELLOW" "  Install the exact CfT build and set CFT_EXECUTABLE; see the error above."
             all_passed=false
         fi
     fi
 
     # Test CLI
-    if uv run python -m scripts.mdwb_cli --help > /dev/null 2>&1; then
+    if uv run --python 3.13 python -m scripts.mdwb_cli --help > /dev/null; then
         print_color "$GREEN" "✓ CLI tool works"
     else
         print_color "$RED" "✗ CLI tool failed"
@@ -632,15 +663,17 @@ run_tests() {
     fi
 
     # Test environment configuration
-    if [ -f ".env" ]; then
-        # Check for non-empty OLMOCR_API_KEY value (any format)
-        local api_key_value
-        api_key_value=$(grep "^OLMOCR_API_KEY=" .env 2>/dev/null | cut -d= -f2-)
-        if [ -n "$api_key_value" ] && [ "$api_key_value" != "sk-***" ]; then
-            print_color "$GREEN" "✓ OCR API key configured in .env"
-        else
-            print_color "$YELLOW" "⚠ OCR API key not set - system will not work until configured"
-        fi
+    if uv run --python 3.13 python - <<'PY'
+from app.settings import get_settings
+ocr = get_settings().ocr
+if not ocr.local_url and (not ocr.api_key or ocr.api_key == "sk-***"):
+    raise SystemExit("Configure a local OCR URL or a hosted OCR API key before capture.")
+print("OCR configuration is present; provider admission and output quality remain unverified.")
+PY
+    then
+        print_color "$GREEN" "✓ OCR configuration is present"
+    else
+        all_passed=false
     fi
 
     if [ "$all_passed" = true ]; then
@@ -758,6 +791,10 @@ ensure_on_path() {
 
 # Main installation flow
 main() {
+    if [ "$PYTHON_VERSION" != "3.13" ]; then
+        print_color "$RED" "Error: this project requires Python 3.13."
+        return 1
+    fi
     print_color "$BLUE" "════════════════════════════════════════════════"
     print_color "$BLUE" "   Markdown Web Browser - All-in-One Installer  "
     print_color "$BLUE" "════════════════════════════════════════════════"
@@ -771,7 +808,7 @@ main() {
     print_color "$YELLOW" "  • Install browsers: $INSTALL_BROWSERS"
 
     if [ -n "$OCR_API_KEY" ]; then
-        print_color "$YELLOW" "  • OCR API key: ${OCR_API_KEY:0:10}..."
+        print_color "$YELLOW" "  • OCR API key: provided (applied only when creating a new .env)"
     fi
     echo
 
@@ -795,13 +832,15 @@ main() {
     setup_python_env
     install_playwright_browsers
     setup_config
+    install_pinned_cft
 
     # Run tests
     echo
     if run_tests; then
-        print_color "$GREEN" "✓ All tests passed"
+        print_color "$GREEN" "✓ Installation preflights passed; live capture qualification remains separate"
     else
         print_color "$YELLOW" "⚠ Some tests failed - review messages above"
+        return 1
     fi
 
     # Create launcher
@@ -822,34 +861,20 @@ main() {
     print_color "$BLUE" "Quick Start:"
     print_color "$BLUE" "  cd $abs_install_path"
 
-    if [ -z "$OCR_API_KEY" ]; then
-        print_color "$YELLOW" "  # FIRST: Add your OCR API key to .env"
-        print_color "$YELLOW" "  nano .env  # (set OLMOCR_API_KEY=sk-...)"
-        print_color "$YELLOW" ""
-        print_color "$BLUE" "  # THEN: Run your first capture"
-    fi
-
-    print_color "$BLUE" "  uv run python -m scripts.mdwb_cli fetch https://example.com"
+    print_color "$BLUE" "  # Start the API and browser UI"
+    print_color "$BLUE" "  uv run --python 3.13 python scripts/run_server.py --workers 1"
+    print_color "$BLUE" "  # In another terminal, submit your first capture"
+    print_color "$BLUE" "  uv run --python 3.13 python -m scripts.mdwb_cli fetch https://example.com --watch"
     echo
     print_color "$BLUE" "Or use the launcher:"
     print_color "$BLUE" "  $abs_install_path/mdwb fetch https://example.com"
     echo
 
     if [ "$INSTALL_BROWSERS" = true ]; then
-        print_color "$BLUE" "Playwright Chromium Information:"
-        print_color "$BLUE" "  • Pinned build ensures deterministic, reproducible screenshots"
-        print_color "$BLUE" "  • Version recorded in every manifest.json"
-        print_color "$BLUE" "  • Check your .env for CFT_VERSION and CFT_LABEL settings"
-        echo
-    fi
-
-    if [ -z "$OCR_API_KEY" ]; then
-        print_color "$RED" "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-        print_color "$RED" "  ACTION REQUIRED: Set your OCR API key in .env"
-        print_color "$RED" "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-        print_color "$YELLOW" "  Edit: $abs_install_path/.env"
-        print_color "$YELLOW" "  Set: OLMOCR_API_KEY=sk-your-actual-api-key"
-        print_color "$RED" "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        print_color "$BLUE" "Capture Browser Information:"
+        print_color "$BLUE" "  • CFT_VERSION requires an exact Chrome for Testing executable"
+        print_color "$BLUE" "  • Captures record the observed browser build and transport"
+        print_color "$BLUE" "  • Review CFT_EXECUTABLE, CFT_VERSION, and CFT_LABEL in your preserved configuration"
         echo
     fi
 
@@ -857,4 +882,6 @@ main() {
 }
 
 # Run main function
-main
+if [[ "${BASH_SOURCE[0]:-$0}" == "$0" ]]; then
+    main
+fi

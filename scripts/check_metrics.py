@@ -4,16 +4,33 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Mapping
+from typing import Mapping, NotRequired, TypeGuard, TypedDict
 
 import httpx
 import typer
 from decouple import Config as DecoupleConfig, RepositoryEnv
 
 cli = typer.Typer(help="Ping the Prometheus metrics endpoints and fail when unreachable.")
+
+
+class ProbeResult(TypedDict):
+    url: str
+    ok: bool
+    duration_ms: NotRequired[float]
+    error: NotRequired[str]
+
+
+def _is_duration(value: object) -> TypeGuard[int | float]:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and value >= 0
+    )
 
 
 def _load_config() -> DecoupleConfig:
@@ -38,16 +55,19 @@ def _default_exporter_port(cfg: DecoupleConfig) -> int:
     return cfg("PROMETHEUS_PORT", cast=int, default=9000)
 
 
-def _probe(metrics_url: str, timeout: float) -> float:
+def _probe(metrics_url: str, timeout: float, *, headers: Mapping[str, str] | None = None) -> float:
     start = time.perf_counter()
-    with httpx.Client(timeout=timeout) as client:
+    request_headers = {"User-Agent": "mdwb (+https://github.com/Dicklesworthstone/markdown_web_browser)"}
+    if headers:
+        request_headers.update(headers)
+    with httpx.Client(timeout=timeout, headers=request_headers) as client:
         response = client.get(metrics_url)
         response.raise_for_status()
     end = time.perf_counter()
     return (end - start) * 1000.0
 
 
-def _build_summary(results: list[dict[str, object]]) -> dict[str, object]:
+def _build_summary(results: list[ProbeResult]) -> dict[str, object]:
     ok_count = sum(1 for row in results if row.get("ok"))
     fail_count = len(results) - ok_count
     status = "ok" if fail_count == 0 else "error"
@@ -66,20 +86,35 @@ def _evaluate_weekly_summary(summary_path: Path) -> tuple[bool, dict[str, object
     if not summary_path.exists():
         raise FileNotFoundError(f"weekly summary not found: {summary_path}")
     data = json.loads(summary_path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("Weekly summary must be an object")
+    categories = data.get("categories")
+    if not isinstance(categories, list) or not categories:
+        raise ValueError("Weekly summary must contain a nonempty categories list")
     failures: list[str] = []
-    for entry in data.get("categories", []):
-        name = entry.get("name", "?")
-        slo = entry.get("slo") or {}
-        if not isinstance(slo, dict):
+    names: set[str] = set()
+    for index, entry in enumerate(categories):
+        if not isinstance(entry, dict):
+            raise ValueError(f"Weekly category {index} must be an object")
+        name = entry.get("name")
+        if not isinstance(name, str) or not name.strip() or name in names:
+            raise ValueError(f"Weekly category {index} has a missing or duplicate name")
+        names.add(name)
+        slo = entry.get("slo")
+        if not isinstance(slo, dict) or not slo:
+            failures.append(f"{name}: missing SLO measurements")
             continue
-        if slo.get("capture_ok") is False:
-            failures.append(
-                f"{name}: capture p99 {slo.get('capture_p99_ms')} > budget {slo.get('capture_budget_ms')}"
-            )
-        if slo.get("ocr_ok") is False:
-            failures.append(
-                f"{name}: OCR p99 {slo.get('ocr_p99_ms')} > budget {slo.get('ocr_budget_ms')}"
-            )
+        for metric in ("capture", "ocr"):
+            flag = slo.get(f"{metric}_ok")
+            measured = slo.get(f"{metric}_p99_ms")
+            budget = slo.get(f"{metric}_budget_ms")
+            if not isinstance(flag, bool) or not _is_duration(measured) or not _is_duration(budget):
+                failures.append(f"{name}: invalid or missing {metric} SLO measurements")
+                continue
+            if measured > budget:
+                failures.append(f"{name}: {metric} p99 {measured} > budget {budget}")
+            elif not flag:
+                failures.append(f"{name}: {metric} SLO marked failed")
     status = "ok" if not failures else "error"
     return status == "ok", {
         "status": status,
@@ -132,6 +167,8 @@ def run_check(
     cfg = _load_config()
     base = (api_base or _default_api_base(cfg)).rstrip("/")
     port = exporter_port if exporter_port is not None else _default_exporter_port(cfg)
+    api_key = cfg("MDWB_API_KEY", default="")
+    api_key_header = cfg("API_KEY_HEADER", default="X-API-Key")
 
     targets: list[str] = [f"{base}/metrics"]
     if include_exporter:
@@ -141,10 +178,13 @@ def run_check(
             targets.append(f"http://{exporter_host}:{port}/metrics")
 
     errors: list[str] = []
-    results: list[dict[str, object]] = []
-    for url in targets:
+    results: list[ProbeResult] = []
+    for index, url in enumerate(targets):
         try:
-            duration_ms = _probe(url, timeout)
+            if index == 0 and api_key:
+                duration_ms = _probe(url, timeout, headers={api_key_header: api_key})
+            else:
+                duration_ms = _probe(url, timeout)
             results.append({"url": url, "ok": True, "duration_ms": duration_ms})
             if not json_output:
                 typer.echo(f"[OK] {url} ({duration_ms:.1f} ms)")
@@ -188,6 +228,7 @@ def run_check(
     if errors:
         if json_output:
             payload = _build_summary(results)
+            payload["status"] = "error"
             if weekly_result is not None:
                 payload["weekly"] = weekly_result
             typer.echo(json.dumps(payload, indent=2))
