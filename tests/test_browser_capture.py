@@ -248,3 +248,72 @@ async def test_capture_fails_fast_on_pinned_version_or_missing_executable(
                 device_scale_factor=1,
             )
         )
+
+
+def test_resolve_browser_tmpdir_handles_short_long_multibyte_and_fallbacks(tmp_path: Path) -> None:
+    """Long POSIX TMPDIR values are replaced with a short writable dir to avoid Chromium SIGTRAP."""
+    short_dir = "/tmp/mdwb-short"
+    assert capture_module._resolve_browser_tmpdir(None, platform="linux") is None
+    assert capture_module._resolve_browser_tmpdir("", platform="linux") is None
+    assert capture_module._resolve_browser_tmpdir(short_dir, platform="linux") is None
+    # Standard macOS /var/folders/xx/<30 chars>/T/ is 49 chars (48 without trailing slash) -> preserved
+    macos_default = "/var/folders/aa/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/T/"
+    assert capture_module._resolve_browser_tmpdir(macos_default, platform="darwin") is None
+    # Exact boundary (52 bytes) stays untouched; 53 bytes and ACFS-style ~73-byte path are shortened
+    exact_limit = f"/{'a' * (capture_module._MAX_BROWSER_TMPDIR_BYTES - 1)}"
+    assert capture_module._resolve_browser_tmpdir(exact_limit, platform="linux") is None
+    over_limit = f"/{'a' * capture_module._MAX_BROWSER_TMPDIR_BYTES}"
+    acfs_like = f"/home/user/.cache/acfs/installer-tmp/mdwb.{'0' * 32}"
+    assert capture_module._resolve_browser_tmpdir(over_limit, platform="linux") == "/tmp"
+    assert capture_module._resolve_browser_tmpdir(acfs_like, platform="linux") == "/tmp"
+    assert capture_module._resolve_browser_tmpdir(f"{acfs_like}///", platform="darwin") == "/tmp"
+    # Multibyte UTF-8 characters are counted by filesystem byte length, not code-point count
+    multibyte_over = f"/tmp/{'é' * 25}"  # 5 + 50 = 55 UTF-8 bytes > 52
+    assert capture_module._resolve_browser_tmpdir(multibyte_over, platform="linux") == "/tmp"
+    # Windows does not use POSIX sun_path Unix sockets
+    assert capture_module._resolve_browser_tmpdir(acfs_like, platform="win32") is None
+    # Fallback selection skips missing candidates and fails open if none are writable
+    short_fallback = "/var/tmp"
+    assert (
+        capture_module._resolve_browser_tmpdir(
+            acfs_like,
+            platform="linux",
+            candidates=("/nonexistent-mdwb-tmp", short_fallback),
+        )
+        == short_fallback
+    )
+    assert (
+        capture_module._resolve_browser_tmpdir(
+            acfs_like,
+            platform="linux",
+            candidates=(str(tmp_path / "missing-a"), str(tmp_path / "missing-b")),
+        )
+        is None
+    )
+
+
+def test_browser_launch_environment_overrides_long_tmpdir_and_preserves_fontconfig(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """_browser_launch_environment shortens long TMPDIR while preserving fontconfig and env vars."""
+    long_tmpdir = f"/home/user/.cache/acfs/installer-tmp/mdwb.{'f' * 32}"
+    monkeypatch.setenv("TMPDIR", long_tmpdir)
+    monkeypatch.setenv("MDWB_TEST_KEEP_ENV", "preserved-value")
+
+    if sys.platform == "linux":
+        fontconfig = tmp_path / "fonts.conf"
+        fontconfig.write_text("<fontconfig><dir>/usr/share/fonts</dir></fontconfig>")
+        env = capture_module._browser_launch_environment(fontconfig)
+        assert env is not None
+        assert env["TMPDIR"] == "/tmp"
+        assert env["FONTCONFIG_FILE"] == str(fontconfig.resolve())
+        assert env["MDWB_TEST_KEEP_ENV"] == "preserved-value"
+    else:
+        env = capture_module._browser_launch_environment(None)
+        assert env is not None
+        assert env["TMPDIR"] == "/tmp"
+        assert env["MDWB_TEST_KEEP_ENV"] == "preserved-value"
+
+    monkeypatch.setenv("TMPDIR", "/tmp")
+    if sys.platform != "linux":
+        assert capture_module._browser_launch_environment(None) is None

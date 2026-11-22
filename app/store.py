@@ -2365,6 +2365,8 @@ def _ensure_aiosqlite_driver() -> None:
         "sqlite_version_info",
     ):
         setattr(mod, attr, getattr(sqlite3, attr))
+    setattr(mod, "Connection", _AsyncSqliteConnection)
+    setattr(mod, "Cursor", _AsyncSqliteCursor)
     setattr(
         mod,
         "connect",

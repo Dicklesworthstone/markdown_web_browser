@@ -820,6 +820,43 @@ def fontconfig_digest(path: Path | None) -> str | None:
     return hashlib.sha256(content).hexdigest()
 
 
+_MAX_BROWSER_TMPDIR_BYTES = 52
+_SHORT_TMPDIR_CANDIDATES: tuple[str, ...] = ("/tmp", "/var/tmp")
+
+
+def _resolve_browser_tmpdir(
+    tmpdir: str | None,
+    *,
+    platform: str | None = None,
+    candidates: Sequence[str] = _SHORT_TMPDIR_CANDIDATES,
+) -> str | None:
+    """Return a short POSIX temp directory when ``tmpdir`` risks Chromium's sun_path limit.
+
+    Chromium places its ProcessSingleton Unix domain socket at
+    ``$TMPDIR/.org.chromium.Chromium.XXXXXX/SingletonSocket`` (+46 bytes).
+    POSIX ``sockaddr_un.sun_path`` is limited to 108 bytes on Linux (104 bytes on
+    macOS/BSD), so caller ``TMPDIR`` paths longer than ~61 bytes (e.g. per-installer
+    temp directories) cause Chromium to abort with ``SIGTRAP``.
+    """
+    active_platform = sys.platform if platform is None else platform
+    if active_platform == "win32" or not tmpdir:
+        return None
+    stripped = tmpdir.rstrip("/") or "/"
+    effective = stripped if os.path.isabs(stripped) else os.path.abspath(stripped)
+    effective = effective.rstrip("/") or "/"
+    if len(os.fsencode(effective)) <= _MAX_BROWSER_TMPDIR_BYTES:
+        return None
+    for candidate in candidates:
+        normalized = candidate.rstrip("/") or "/"
+        if (
+            len(os.fsencode(normalized)) <= _MAX_BROWSER_TMPDIR_BYTES
+            and os.path.isdir(normalized)
+            and os.access(normalized, os.W_OK | os.X_OK)
+        ):
+            return normalized
+    return None
+
+
 def _browser_font_environment(path: Path | None) -> dict[str, str] | None:
     """Isolate Linux capture fonts from user aliases; preserve the host config."""
     if sys.platform != "linux":
@@ -839,6 +876,23 @@ def _browser_font_environment(path: Path | None) -> dict[str, str] | None:
     if not path.is_file():
         raise ValueError("Browser font configuration is unavailable")
     return {**os.environ, "FONTCONFIG_FILE": str(path.resolve())}
+
+
+def _browser_launch_environment(path: Path | None) -> dict[str, str] | None:
+    """Build browser subprocess environment with font isolation and a sun_path-safe TMPDIR."""
+    env = _browser_font_environment(path)
+    current_tmpdir = (env if env is not None else os.environ).get("TMPDIR")
+    short_tmpdir = _resolve_browser_tmpdir(current_tmpdir)
+    if short_tmpdir is None:
+        return env
+    LOGGER.info(
+        "Using short browser TMPDIR=%s instead of %d-byte caller TMPDIR to avoid Chromium socket path overflow",
+        short_tmpdir,
+        len(os.fsencode(current_tmpdir or "")),
+    )
+    merged = dict(os.environ) if env is None else dict(env)
+    merged["TMPDIR"] = short_tmpdir
+    return merged
 
 
 async def _ensure_watermark_injected(page: Page) -> None:
@@ -1156,7 +1210,7 @@ async def _launch_browser(
     }
     if not preferences or any(value not in allowed for value in preferences):
         raise ValueError("Unsupported browser channel or empty preference list")
-    browser_env = _browser_font_environment(fontconfig_file)
+    browser_env = _browser_launch_environment(fontconfig_file)
 
     launch_args = [
         "--headless=new",
@@ -1367,11 +1421,13 @@ def _normalize_channel(channel: str) -> str:
     return _CHANNEL_ALIASES.get(lowered, lowered)
 
 
-def _profile_storage_state_path(base: Path, profile_id: str) -> Path:
+def _profile_storage_state_path(
+    base: Path, profile_id: str, *, owner: str | None = None
+) -> Path:
     safe = validate_profile_id(profile_id)
     root = base.resolve()
-    owner = current_owner()
-    namespace = hashlib.sha256(owner.encode()).hexdigest() if owner else "anonymous"
+    resolved_owner = owner if owner is not None else current_owner()
+    namespace = hashlib.sha256(resolved_owner.encode()).hexdigest() if resolved_owner else "anonymous"
     target = (root / namespace / safe / "storage_state.json").resolve()
     if not target.is_relative_to(root):
         raise ValueError("Profile storage path escapes profiles root")

@@ -33,7 +33,7 @@ uv run --python 3.13 python - <<'PY'
 import asyncio
 import pyvips
 from playwright.async_api import async_playwright
-from app.capture import _launch_browser
+from app.capture import _browser_launch_environment, _launch_browser
 from app.settings import get_settings
 
 print("libvips", ".".join(str(pyvips.version(i)) for i in range(3)))
@@ -52,8 +52,11 @@ async def main():
             print("capture adapter", channel, browser.version, transport)
         finally:
             await browser.close()
+        browser_env = _browser_launch_environment(None)
         for channel in ("chromium", "chrome"):
-            browser = await playwright.chromium.launch(channel=channel, headless=True)
+            browser = await playwright.chromium.launch(
+                channel=channel, headless=True, env=browser_env
+            )
             try:
                 print(channel, browser.version)
             finally:

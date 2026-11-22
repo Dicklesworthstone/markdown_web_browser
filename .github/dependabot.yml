@@ -49,3 +49,6 @@ updates:
       - "docker"
     commit-message:
       prefix: "deps(docker):"
+    ignore:
+      - dependency-name: "python"
+        versions: [">=3.14"]

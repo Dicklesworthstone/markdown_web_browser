@@ -886,8 +886,6 @@ async def batch_create_jobs(request: BatchJobRequest, http_request: Request) -> 
                 profile_id=request.profile_id,
                 reuse_cache=request.reuse_cache,
                 ocr_policy=request.ocr_policy,
-                ocr=request.ocr,
-                viewport=request.viewport,
             )
             snapshot = await _call_create_job(job_request, tags=request.tags, owner=owner)
             cache_hit_flag = bool(snapshot.get("cache_hit"))
@@ -1001,11 +999,12 @@ async def rerun_job(
         raise HTTPException(status_code=400, detail="Original job has no URL; cannot rerun")
     profile_id = snapshot.get("profile_id")
     tags = list(snapshot.get("tags") or [])
-    manifest = snapshot.get("manifest") if isinstance(snapshot.get("manifest"), Mapping) else {}
+    raw_manifest = snapshot.get("manifest")
+    manifest: dict[str, object] = dict(raw_manifest) if isinstance(raw_manifest, Mapping) else {}
     try:
         new_request = request_from_manifest({**manifest, "url": url, "profile_id": profile_id})
         new_request.reuse_cache = reuse_cache
-        new_snapshot = await JOB_MANAGER.create_job(new_request, tags=tags)
+        new_snapshot = await _call_create_job(new_request, tags=tags, owner=owner)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     new_id = str(new_snapshot.get("job_id") or new_snapshot.get("id") or "")
@@ -2818,14 +2817,17 @@ async def job_replay(
         raise HTTPException(status_code=400, detail="Original job has no URL; cannot replay")
     profile_id = request.profile_id or snap.get("profile_id")
     tags = list(snap.get("tags") or [])
-    raw_manifest = snap.get("manifest") if isinstance(snap.get("manifest"), Mapping) else {}
+    raw_manifest_val = snap.get("manifest")
+    raw_manifest: dict[str, object] = (
+        dict(raw_manifest_val) if isinstance(raw_manifest_val, Mapping) else {}
+    )
     try:
         new_request = request_from_manifest({**raw_manifest, "url": url})
         new_request.profile_id = profile_id
         new_request.reuse_cache = request.reuse_cache
         if request.ocr_policy is not None:
             new_request.ocr_policy = request.ocr_policy
-        new_snapshot = await JOB_MANAGER.create_job(new_request, tags=tags)
+        new_snapshot = await _call_create_job(new_request, tags=tags, owner=owner)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return JobReplayResponse(

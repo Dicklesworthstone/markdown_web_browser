@@ -2,7 +2,22 @@
 
 All notable changes to [Markdown Web Browser](https://github.com/Dicklesworthstone/markdown_web_browser) are documented here.
 
-This project has no formal release tags or GitHub Releases. The changelog covers all 138 commits on the `main` branch (2025-11-07 through 2026-03-11), organized by capability rather than raw chronological order. Each entry links to the relevant commit on GitHub.
+---
+
+## [0.1.1] - 2026-11-22
+
+### Bug Fixes
+- **Browser launch under long `TMPDIR` (#27)**: Normalize browser subprocess `TMPDIR` to a short writable POSIX directory (`/tmp`, falling back to `/var/tmp`) in `app/capture.py` when the caller's `TMPDIR` exceeds 52 encoded bytes, preventing Chromium `SIGTRAP` startup crashes from `sockaddr_un.sun_path` Unix socket path overflow (e.g., under per-installer temporary directories). Preserves short `TMPDIR` paths, Linux `FONTCONFIG_FILE` isolation, and all other caller environment variables.
+- **Dockerfile Python 3.13 alignment**: Restore `python:3.13-slim` base images in `Dockerfile` (matching `pyproject.toml` `requires-python = ">=3.13,<3.14"`, `install.sh`, and `uv.lock`) and configure Dependabot to ignore Python `>=3.14` Docker base bumps.
+- **SQLAlchemy 2.1 forward-compatibility & API fixes**: Expose `Connection` and `Cursor` attributes on the in-process async SQLite driver shim (`app/store.py`); fix `POST /jobs/batch` request construction and pass request owner through `rerun_job`/`job_replay` (`app/main.py`); accept optional `owner` parameter in `_profile_storage_state_path` (`app/capture.py`).
+
+### Security & Dependencies
+- **Zero known vulnerabilities in default + dev dependency set**: Upgraded locked Python dependencies (`anyio` 4.16.0, `certifi` 2026.11.20, `pillow` 13.0.0, `pyjwt` 2.15.1, `soupsieve` 4.1.3, `playwright` 1.65.2, `pyvips` 3.2.0, `sqlmodel` 0.0.44, `sqlalchemy` 2.0.58, `starlette` 1.10.0, `pydantic` 2.14.4, `uvicorn` 0.54.0, `granian` 2.8.9, `vllm` 0.33.0, and transitive packages), eliminating all 65 advisories in the default + dev dependency set (and reducing full all-extras advisories from 179 to 32 upstream `[local-ocr]` constraints).
+- **Vendored browser UI security updates**: Updated vendored `DOMPurify` (`3.4.16` -> `3.4.18`, resolving 3 advisories) and `PrismJS` (`1.29.0` -> `1.30.0`, resolving DOM clobbering advisory `GHSA-x7hr-w5r2-h6wg`).
+
+---
+
+Earlier history (all 138 commits on `main` from 2025-11-07 through 2026-03-11, organized by capability):
 
 ---
 

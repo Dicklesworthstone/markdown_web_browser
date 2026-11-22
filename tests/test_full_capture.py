@@ -208,3 +208,42 @@ def test_effective_style_hash_binds_font_configuration(tmp_path):
     first = capture_module.effective_screenshot_hash(config, configured)
     fontconfig.write_text("<fontconfig><dir>/usr/local/share/fonts</dir></fontconfig>")
     assert capture_module.effective_screenshot_hash(config, configured) != first
+
+
+@pytest.mark.asyncio
+async def test_launch_browser_succeeds_with_long_tmpdir(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #27 regression: _launch_browser must not SIGTRAP when TMPDIR exceeds ~61 bytes."""
+    import tempfile
+    from playwright.async_api import async_playwright
+
+    long_parent = Path(tempfile.gettempdir()) / ("mdwb-long-tmpdir-" + "a" * 64)
+    long_parent.mkdir(parents=True, exist_ok=True)
+    assert len(str(long_parent).encode("utf-8")) > 75
+    monkeypatch.setenv("TMPDIR", str(long_parent))
+
+    settings = get_settings().browser
+    build = settings.cft_version.removeprefix("chrome-")
+    cft_executable = (
+        settings.cft_executable
+        or Path.home() / ".cache/mdwb/cft" / build / "chrome-linux64/chrome"
+    )
+    use_cft = cft_executable.is_file()
+    channel = "cft" if use_cft else "chromium"
+
+    async with async_playwright() as playwright:
+        browser, actual_channel, actual_transport = await capture_module._launch_browser(
+            playwright,
+            channel,
+            expected_build=settings.cft_version,
+            transport="cdp",
+            executable=cft_executable if use_cft else None,
+            fontconfig_file=settings.fontconfig_file,
+        )
+        try:
+            assert actual_channel == channel
+            assert actual_transport == "cdp"
+            assert browser.version
+        finally:
+            await browser.close()
