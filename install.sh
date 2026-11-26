@@ -381,6 +381,14 @@ setup_repository() {
     if [ -d "$INSTALL_DIR/.git" ]; then
         print_color "$BLUE" "Updating existing repository..."
         cd "$INSTALL_DIR" || return 1
+        # Launchers from older installers ran `uv run` without --frozen, so a newer uv rewrote the committed
+        # uv.lock (format revision 3 -> 5) and every later `pull --ff-only` refused the dirty tree. When
+        # uv.lock is the only modified tracked file, park that rewrite in a named stash (nothing is lost) so
+        # the update can proceed with the committed lock.
+        if ! git diff --quiet -- uv.lock 2>/dev/null && [ -z "$(git diff --name-only | grep -vx 'uv.lock')" ]; then
+            print_color "$YELLOW" "uv.lock was rewritten locally by uv; stashing it so the update can use the committed lock"
+            git stash push -q -m "mdwb-installer: uv.lock rewritten by uv $(date -u +%Y-%m-%dT%H:%MZ)" -- uv.lock || return 1
+        fi
         git -c http.userAgent="mdwb-installer (+https://github.com/Dicklesworthstone/markdown_web_browser)" pull --ff-only origin main
     else
         if [ -d "$INSTALL_DIR" ]; then
@@ -486,7 +494,7 @@ install_playwright_browsers() {
     # hard-coded) and fall back to a browser-only install so the tool still
     # works against the bundled Chromium or system Chrome. This whole step is
     # best-effort and must never abort the overall installation.
-    if uv run playwright install chromium --with-deps; then
+    if uv run --frozen playwright install chromium --with-deps; then
         print_color "$GREEN" "✓ Playwright Chromium installed (with system dependencies)"
     else
         print_color "$YELLOW" "⚠ 'playwright install chromium --with-deps' failed on this system."
@@ -494,7 +502,7 @@ install_playwright_browsers() {
         print_color "$YELLOW" "  release (common on brand-new Ubuntu versions). Falling back to a"
         print_color "$YELLOW" "  browser-only install without automatic system-dependency resolution..."
 
-        if uv run playwright install chromium; then
+        if uv run --frozen playwright install chromium; then
             print_color "$GREEN" "✓ Playwright Chromium browser installed (without system deps)"
             print_browser_dep_notice
         else
@@ -521,7 +529,7 @@ install_pinned_cft() {
     fi
 
     local selected
-    selected=$(uv run --python 3.13 python - <<'PY'
+    selected=$(uv run --frozen --python 3.13 python - <<'PY'
 from app.capture import _normalize_channel
 from app.settings import get_settings
 
@@ -541,7 +549,7 @@ PY
     fi
 
     print_color "$BLUE" "Installing Chrome for Testing $CFT_PINNED_BUILD..."
-    if uv run --python 3.13 python -m scripts.install_helpers install-cft \
+    if uv run --frozen --python 3.13 python -m scripts.install_helpers install-cft \
         --build "$CFT_PINNED_BUILD" --sha256 "$CFT_PINNED_LINUX64_SHA256"; then
         print_color "$GREEN" "✓ Chrome for Testing $CFT_PINNED_BUILD verified and in place"
     else
@@ -555,7 +563,7 @@ setup_config() {
 
     if [ -e ".env" ] || [ -L ".env" ]; then
         local repaired
-        if ! repaired=$(uv run --python 3.13 python -m scripts.install_helpers repair-legacy-env \
+        if ! repaired=$(uv run --frozen --python 3.13 python -m scripts.install_helpers repair-legacy-env \
             --build "$CFT_PINNED_BUILD"); then
             print_color "$RED" "Error: installer residue in .env could not be repaired."
             return 1
@@ -581,7 +589,7 @@ setup_config() {
     # Exclusive creation also refuses symlinks and files created after the check.
     if ! (
         umask 077
-        MDWB_INSTALL_OCR_API_KEY="$OCR_API_KEY" uv run --python 3.13 python - <<'PY'
+        MDWB_INSTALL_OCR_API_KEY="$OCR_API_KEY" uv run --frozen --python 3.13 python - <<'PY'
 from pathlib import Path
 from app.settings import load_config
 
@@ -608,7 +616,7 @@ run_tests() {
     local all_passed=true
 
     # Test pyvips import
-    if uv run --python 3.13 python -c "import pyvips; print('✓ pyvips works')"; then
+    if uv run --frozen --python 3.13 python -c "import pyvips; print('✓ pyvips works')"; then
         print_color "$GREEN" "✓ pyvips import successful"
     else
         print_color "$RED" "✗ pyvips import failed - libvips may not be installed correctly"
@@ -617,14 +625,14 @@ run_tests() {
 
     # Test Playwright
     if [ "$INSTALL_BROWSERS" = true ]; then
-        if uv run --python 3.13 python -c "from playwright.async_api import async_playwright; print('✓ Playwright works')"; then
+        if uv run --frozen --python 3.13 python -c "from playwright.async_api import async_playwright; print('✓ Playwright works')"; then
             print_color "$GREEN" "✓ Playwright import successful"
         else
             print_color "$RED" "✗ Playwright import failed"
             all_passed=false
         fi
 
-        if uv run --python 3.13 python - <<'PY'
+        if uv run --frozen --python 3.13 python - <<'PY'
 import asyncio
 from playwright.async_api import async_playwright
 from app.capture import _launch_browser
@@ -655,7 +663,7 @@ PY
     fi
 
     # Test CLI
-    if uv run --python 3.13 python -m scripts.mdwb_cli --help > /dev/null; then
+    if uv run --frozen --python 3.13 python -m scripts.mdwb_cli --help > /dev/null; then
         print_color "$GREEN" "✓ CLI tool works"
     else
         print_color "$RED" "✗ CLI tool failed"
@@ -663,7 +671,7 @@ PY
     fi
 
     # Test environment configuration
-    if uv run --python 3.13 python - <<'PY'
+    if uv run --frozen --python 3.13 python - <<'PY'
 from app.settings import get_settings
 ocr = get_settings().ocr
 if not ocr.local_url and (not ocr.api_key or ocr.api_key == "sk-***"):
@@ -707,7 +715,7 @@ SCRIPT_DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
 cd "$SCRIPT_DIR"
 
 # Ensure we're using the virtual environment
-exec uv run python -m scripts.mdwb_cli "$@"
+exec uv run --frozen python -m scripts.mdwb_cli "$@"
 EOF
 
     chmod +x "$launcher_path"
@@ -862,9 +870,9 @@ main() {
     print_color "$BLUE" "  cd $abs_install_path"
 
     print_color "$BLUE" "  # Start the API and browser UI"
-    print_color "$BLUE" "  uv run --python 3.13 python scripts/run_server.py --workers 1"
+    print_color "$BLUE" "  uv run --frozen --python 3.13 python scripts/run_server.py --workers 1"
     print_color "$BLUE" "  # In another terminal, submit your first capture"
-    print_color "$BLUE" "  uv run --python 3.13 python -m scripts.mdwb_cli fetch https://example.com --watch"
+    print_color "$BLUE" "  uv run --frozen --python 3.13 python -m scripts.mdwb_cli fetch https://example.com --watch"
     echo
     print_color "$BLUE" "Or use the launcher:"
     print_color "$BLUE" "  $abs_install_path/mdwb fetch https://example.com"
